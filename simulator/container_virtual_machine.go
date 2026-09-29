@@ -22,6 +22,42 @@ import (
 	"github.com/vmware/govmomi/vim25/types"
 )
 
+// ContainerBackingOptionKey is the ExtraConfig key that backs a VM with a
+// container. Its value is an image name, or a JSON array of an image name and
+// the command to run in it, such as ["alpine", "sleep", "infinity"]. The
+// container is created at first power-on.
+//
+// These ExtraConfig keys configure the container. Boolean values are JSON,
+// "true" or "false"; any other value leaves the default.
+//
+//   - RUN.mountdmi (default true): mount the VM's DMI data at /sys/class/dmi/id.
+//     Set false where that mount is refused, as under rootless podman.
+//   - RUN.network: the container network to join, such as "podman".
+//   - RUN.privileged (default false): run the container with --privileged, as
+//     an image with systemd as PID 1 needs.
+//   - RUN.nestedContainers (default false): let the container run containers,
+//     for example a Kubernetes node. It adds --privileged, --cgroupns=private,
+//     unconfined seccomp and apparmor, tmpfs at /tmp and /run, a volume at
+//     /var, /lib/modules read-only and /dev/fuse, adapted from kind. Without it
+//     the container shares the host's cgroup namespace.
+//   - RUN.port.<port>: publish container port <port> on the host port given as
+//     the value.
+//   - RUN.volume.<label>: add a mount, "source:destination[:options]" as for
+//     docker -v, where source is a host path or a volume name.
+//   - RUN.env.<name>: set environment variable <name> to the value.
+//   - guestinfo.<key>: when the container is created, each becomes the
+//     environment variable VMX_GUESTINFO_<KEY>, and VMX_GUESTINFO=true is set.
+//     In a container this is the only guestinfo source cloud-init's VMware
+//     datasource reads, because it detects the container and skips
+//     vmware-rpctool.
+//
+// For example, a Kubernetes node:
+//
+//	ExtraConfig: []types.BaseOptionValue{
+//		&types.OptionValue{Key: "RUN.container", Value: "my-k8s-node:latest"},
+//		&types.OptionValue{Key: "RUN.nestedContainers", Value: "true"},
+//		&types.OptionValue{Key: "guestinfo.userdata", Value: userdata},
+//	}
 const ContainerBackingOptionKey = "RUN.container"
 
 var (
@@ -277,8 +313,13 @@ func (svm *simVM) start(ctx *Context) error {
 	var env []string
 	var ports []string
 	var networks []string
+	var extraVolumes []string
+	jsonArgs := false
 	mountDMI := true
+	privileged := false
+	nestedContainers := false
 
+	// The keys are documented on ContainerBackingOptionKey.
 	for _, opt := range svm.vm.Config.ExtraConfig {
 		val := opt.GetOptionValue()
 		// Any value is accepted as its string form: a client may send one
@@ -288,21 +329,17 @@ func (svm *simVM) start(ctx *Context) error {
 
 		if val.Key == ContainerBackingOptionKey {
 			run := value
-			err := json.Unmarshal([]byte(run), &args)
-			if err != nil {
+			if err := json.Unmarshal([]byte(run), &args); err != nil {
 				args = []string{run}
+			} else {
+				jsonArgs = true
 			}
 
 			continue
 		}
 
 		if val.Key == "RUN.mountdmi" {
-			var mount bool
-			err := json.Unmarshal([]byte(value), &mount)
-			if err == nil {
-				mountDMI = mount
-			}
-
+			parseBoolOption(value, &mountDMI)
 			continue
 		}
 
@@ -310,6 +347,16 @@ func (svm *simVM) start(ctx *Context) error {
 			// Specify container network (e.g., "podman" for rootless podman bridge network)
 			// This is important for rootless podman which doesn't assign IPs without a network
 			networks = append(networks, value)
+			continue
+		}
+
+		if val.Key == "RUN.privileged" {
+			parseBoolOption(value, &privileged)
+			continue
+		}
+
+		if val.Key == "RUN.nestedContainers" {
+			parseBoolOption(value, &nestedContainers)
 			continue
 		}
 
@@ -323,10 +370,20 @@ func (svm *simVM) start(ctx *Context) error {
 			continue
 		}
 
+		if strings.HasPrefix(val.Key, "RUN.volume.") {
+			if v := strings.TrimSpace(value); v != "" {
+				extraVolumes = append(extraVolumes, v)
+			}
+
+			continue
+		}
+
 		if strings.HasPrefix(val.Key, "RUN.env.") {
 			sKey := strings.Split(val.Key, ".")
 			envKey := sKey[len(sKey)-1]
 			env = append(env, fmt.Sprintf("%s=%s", envKey, value))
+
+			continue
 		}
 
 		if strings.HasPrefix(val.Key, "guestinfo.") {
@@ -342,18 +399,27 @@ func (svm *simVM) start(ctx *Context) error {
 		return nil
 	}
 
-	if len(env) != 0 {
-		// Configure env as the data access method for cloud-init-vmware-guestinfo
-		env = append(env, "VMX_GUESTINFO=true")
-	}
+	// cloud-init's VMware datasource reads guestinfo from the environment only
+	// when VMX_GUESTINFO=true.
+	env = append(env, "VMX_GUESTINFO=true")
 
 	volumes := []string{}
 	if mountDMI {
 		volumes = append(volumes, constructVolumeName(svm.vm.Name, svm.vm.uid.String(), "dmi")+":/sys/class/dmi/id")
 	}
+	volumes = append(volumes, extraVolumes...)
 
 	var err error
-	svm.c, err = create(ctx, svm.vm.Name, svm.vm.uid.String(), networks, volumes, ports, env, args[0], args[1:])
+	svm.c, err = create(ctx, svm.vm.Name, svm.vm.uid.String(), args[0], args[1:], createOptions{
+		Networks:          networks,
+		Volumes:           volumes,
+		Ports:             ports,
+		Env:               env,
+		Privileged:        privileged,
+		NestedContainers:  nestedContainers,
+		QuoteImageAndArgs: jsonArgs,
+		RecreateIfExists:  true,
+	})
 	if err != nil {
 		return err
 	}
@@ -510,6 +576,15 @@ func (svm *simVM) remove(ctx *Context) error {
 	}
 
 	return nil
+}
+
+// parseBoolOption sets *dst from a JSON boolean, leaving it unchanged when
+// value is not one.
+func parseBoolOption(value string, dst *bool) {
+	var b bool
+	if json.Unmarshal([]byte(value), &b) == nil {
+		*dst = b
+	}
 }
 
 func (svm *simVM) exec(ctx *Context, auth types.BaseGuestAuthentication, args []string) (string, types.BaseMethodFault) {

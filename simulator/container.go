@@ -29,6 +29,11 @@ var (
 	eventWatch eventWatcher
 )
 
+// shellQuote quotes s as one word for bash, for create()'s bash -c string.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 const (
 	deleteWithContainer = "lifecycle=container"
 	createdByVcsim      = "createdBy=vcsim"
@@ -40,12 +45,19 @@ func init() {
 	}
 }
 
+// exitErrStderr returns the trimmed stderr of a failed command, or "" if err
+// carries none.
+func exitErrStderr(err error) string {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return ""
+	}
+	return strings.TrimSpace(string(exitErr.Stderr))
+}
+
 // commandError logs and returns an error from a command execution failure, including stderr if available.
 func commandError(operation string, args []string, err error) error {
-	stderr := ""
-	if xerr, ok := err.(*exec.ExitError); ok {
-		stderr = strings.TrimSpace(string(xerr.Stderr))
-	}
+	stderr := exitErrStderr(err)
 	var cmdErr error
 	if stderr != "" {
 		cmdErr = fmt.Errorf("%s %v failed: %w: %s", operation, args, err, stderr)
@@ -228,9 +240,15 @@ func createVolume(volumeName string, labels []string, files []tarEntry) (uid str
 		cmd := exec.Command("docker", run...)
 		out, err := cmd.Output()
 		if err != nil {
-			return "", commandError("volume create", cmd.Args, err)
+			// Podman rejects volume create when the volume already exists; Docker is idempotent.
+			// Named volumes can be implicitly created by "docker create -v name:/path" so treat "already exists" as success.
+			if !strings.Contains(exitErrStderr(err), "already exists") {
+				return "", commandError("volume create", cmd.Args, err)
+			}
+			uid = name // volume already exists; provided name is the uid
+		} else {
+			uid = strings.TrimSpace(string(out))
 		}
-		uid = strings.TrimSpace(string(out))
 
 		if name == "" {
 			name = uid
@@ -371,15 +389,43 @@ func createBridge(bridgeName string, labels ...string) (string, error) {
 	return id, nil
 }
 
-// create
+// createOptions is the docker create configuration for create(). The
+// ExtraConfig keys that set it for a VM are documented on
+// ContainerBackingOptionKey.
+type createOptions struct {
+	// Networks are the bridges to connect the container to.
+	Networks []string
+	// Volumes are docker -v arguments, "source:destination[:options]".
+	Volumes []string
+	// Ports are docker -p arguments, "hostPort:containerPort".
+	Ports []string
+	// Env are environment variables in name=value form.
+	Env []string
+
+	// Privileged adds --privileged.
+	Privileged bool
+	// NestedContainers adds the flags a container needs to run containers
+	// itself, --privileged among them.
+	NestedContainers bool
+
+	// QuoteImageAndArgs shell-quotes the image and each arg, for a command
+	// given as a JSON array, whose elements may contain shell metacharacters.
+	// Otherwise the image is a raw string of docker create arguments ending in
+	// the image, such as "-v '/path:/dst:ro' nginx", and is left for bash to
+	// split.
+	QuoteImageAndArgs bool
+	// RecreateIfExists removes any container with the same name first. A test
+	// killed by a timeout runs no cleanup and leaves its containers behind.
+	RecreateIfExists bool
+}
+
+// create allocates a container for the simulated VM.
 //   - name - pretty name, eg. vm name
 //   - id - uuid or similar - this is merged into container name rather than dictating containerID
-//   - networks - set of bridges to connect the container to
-//   - volumes - colon separated tuple of volume name to mount path. Passed directly to docker via -v so mount options can be postfixed.
-//   - env - array of environment vairables in name=value form
-//   - optsAndImage - pass-though options and must include at least the container image to use, including tag if necessary
+//   - image - the container image to use, including tag if necessary
 //   - args - the command+args to pass to the container
-func create(ctx *Context, name string, id string, networks []string, volumes []string, ports []string, env []string, image string, args []string) (*container, error) {
+//   - opts - see createOptions
+func create(ctx *Context, name string, id string, image string, args []string, opts createOptions) (*container, error) {
 	if len(image) == 0 {
 		return nil, errors.New("cannot create container backing without an image")
 	}
@@ -388,10 +434,19 @@ func create(ctx *Context, name string, id string, networks []string, volumes []s
 	c.name = constructContainerName(name, id)
 	c.changes = make(chan struct{})
 
-	for i := range volumes {
-		// we'll pre-create anonymous volumes, simply for labelling consistency
-		volName := strings.Split(volumes[i], ":")
-		createVolume(volName[0], []string{deleteWithContainer, "container=" + c.name}, nil)
+	if opts.RecreateIfExists {
+		if _, preRmErr := exec.Command("docker", "rm", "-f", c.name).Output(); preRmErr == nil {
+			log.Printf("container create: removed stale container %q before create", c.name)
+		}
+	}
+
+	for i := range opts.Volumes {
+		// Pre-create named Docker volumes for labelling consistency.
+		// Skip bind mounts (host paths starting with "/") — those already exist.
+		volName := strings.Split(opts.Volumes[i], ":")
+		if !strings.HasPrefix(volName[0], "/") {
+			createVolume(volName[0], []string{deleteWithContainer, "container=" + c.name}, nil)
+		}
 	}
 
 	// assemble env
@@ -400,29 +455,67 @@ func create(ctx *Context, name string, id string, networks []string, volumes []s
 	var dockerPort []string
 	var dockerEnv []string
 
-	for i := range env {
-		dockerEnv = append(dockerEnv, "--env", env[i])
+	for i := range opts.Env {
+		dockerEnv = append(dockerEnv, "--env", opts.Env[i])
 	}
 
-	for i := range volumes {
-		dockerVol = append(dockerVol, "-v", volumes[i])
+	for i := range opts.Volumes {
+		dockerVol = append(dockerVol, "-v", opts.Volumes[i])
 	}
 
-	for i := range ports {
-		dockerPort = append(dockerPort, "-p", ports[i])
+	for i := range opts.Ports {
+		dockerPort = append(dockerPort, "-p", opts.Ports[i])
 	}
 
-	for i := range networks {
-		dockerNet = append(dockerNet, "--network", networks[i])
+	for i := range opts.Networks {
+		dockerNet = append(dockerNet, "--network", opts.Networks[i])
 	}
 
 	run := []string{"docker", "create", "--name", c.name}
+
+	if opts.Privileged || opts.NestedContainers {
+		run = append(run, "--privileged")
+	}
+
+	if opts.NestedContainers {
+		// Adapted from kind, which runs Kubernetes nodes as containers:
+		// https://github.com/kubernetes-sigs/kind/blob/main/pkg/cluster/internal/providers/docker/provision.go
+		run = append(run,
+			// a private cgroup namespace, so cgroup v2 can be delegated to nested containers
+			"--cgroupns=private",
+			// the syscalls systemd and containerd need
+			"--security-opt", "seccomp=unconfined",
+			"--security-opt", "apparmor=unconfined",
+			// systemd expects /tmp and /run to be tmpfs
+			"--tmpfs", "/tmp",
+			"--tmpfs", "/run",
+			// containerd and kubelet state, off the overlay filesystem
+			"--volume", "/var",
+			// kernel modules, for iptables
+			"--volume", "/lib/modules:/lib/modules:ro",
+			// the fuse-overlayfs snapshotter
+			"--device", "/dev/fuse",
+		)
+	} else {
+		// the host cgroup namespace gives access to every controller, cpuset included
+		run = append(run, "--cgroupns=host")
+	}
+
 	run = append(run, dockerNet...)
 	run = append(run, dockerVol...)
 	run = append(run, dockerPort...)
 	run = append(run, dockerEnv...)
-	run = append(run, image)
-	run = append(run, args...)
+	if opts.QuoteImageAndArgs {
+		// each element is one word, whatever shell metacharacters it holds
+		run = append(run, shellQuote(image))
+		for _, arg := range args {
+			run = append(run, shellQuote(arg))
+		}
+	} else {
+		// image is a raw string of docker arguments for bash to split, e.g. "-v '/path:/dst:ro' nginx"
+		run = append(run, image)
+		run = append(run, args...)
+	}
 
 	// this combines all the run options into a single string that's passed to /bin/bash -c as the single argument to force bash parsing.
 	// TODO: make this configurable behaviour so users also have the option of not escaping everything for bash
@@ -464,10 +557,8 @@ func (c *container) inspect() (out []byte, detail containerDetails, err error) {
 
 	cmd := exec.Command("docker", "inspect", c.id)
 	out, err = cmd.Output()
-	if eErr, ok := err.(*exec.ExitError); ok {
-		if strings.Contains(string(eErr.Stderr), "No such object") {
-			err = uninitializedContainer{errors.New("inspect of uninitialized container")}
-		}
+	if strings.Contains(exitErrStderr(err), "No such object") {
+		err = uninitializedContainer{errors.New("inspect of uninitialized container")}
 	}
 
 	if err != nil {
