@@ -11,3 +11,6 @@ dist/
 # Ignore editor temp files
 *~
 .vscode/
+
+# toolbox binary built by the simulator for RUN.vmci
+/simulator/bin/
