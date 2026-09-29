@@ -56,6 +56,11 @@ import (
 //     datasource reads, because it detects the container and skips
 //     vmware-rpctool.
 //
+// The container's primary interface is eth0 with the MAC of the VM's first
+// virtual Ethernet card, as a guest on a real VM sees it, so a guest that
+// configures its network by that MAC, as cloud-init does, finds its NIC. See
+// networkArgs for how each container runtime is asked for it.
+//
 // With RUN.vmci=true the guest can also read and write guestinfo while it runs.
 // vcsim serves GuestRPC on a Unix socket mounted at /run/vmware/rpc.sock, names
 // it in $VMX_RPC_SOCK, and mounts the govmomi toolbox binary at
@@ -465,6 +470,7 @@ func (svm *simVM) start(ctx *Context) error {
 	var err error
 	svm.c, err = create(ctx, svm.vm.Name, svm.vm.uid.String(), args[0], args[1:], createOptions{
 		Networks:          networks,
+		MacAddress:        firstNICMacAddress(svm.vm),
 		Volumes:           volumes,
 		Ports:             ports,
 		Env:               env,
@@ -796,4 +802,15 @@ func productUUID(id uuid.UUID) string {
 	hex.Encode(dst[24:], id[10:])
 
 	return strings.ToUpper(string(dst[:]))
+}
+
+// firstNICMacAddress returns the MAC address of vm's first virtual Ethernet
+// card, or "" if it has none.
+func firstNICMacAddress(vm *VirtualMachine) string {
+	for _, d := range vm.Config.Hardware.Device {
+		if eth, ok := d.(types.BaseVirtualEthernetCard); ok {
+			return eth.GetVirtualEthernetCard().MacAddress
+		}
+	}
+	return ""
 }

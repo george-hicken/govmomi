@@ -395,6 +395,9 @@ func createBridge(bridgeName string, labels ...string) (string, error) {
 type createOptions struct {
 	// Networks are the bridges to connect the container to.
 	Networks []string
+	// MacAddress, when set, is given to the container's primary interface,
+	// named eth0; see networkArgs.
+	MacAddress string
 	// Volumes are docker -v arguments, "source:destination[:options]".
 	Volumes []string
 	// Ports are docker -p arguments, "hostPort:containerPort".
@@ -467,9 +470,7 @@ func create(ctx *Context, name string, id string, image string, args []string, o
 		dockerPort = append(dockerPort, "-p", opts.Ports[i])
 	}
 
-	for i := range opts.Networks {
-		dockerNet = append(dockerNet, "--network", opts.Networks[i])
-	}
+	dockerNet = networkArgs(opts.Networks, opts.MacAddress, runtimeNetwork())
 
 	run := []string{"docker", "create", "--name", c.name}
 
@@ -939,4 +940,61 @@ func (w *eventWatcher) stop() {
 		w.stdout = nil
 	}
 	w.process.Kill()
+}
+
+// containerNetwork is what the container runtime can do for a container's
+// primary interface.
+type containerNetwork struct {
+	// rootlessPodman is true under rootless podman, whose default network
+	// cannot take --mac-address.
+	rootlessPodman bool
+	// pasta is true when podman's pasta network mode is installed.
+	pasta bool
+}
+
+var (
+	runtimeNetworkOnce sync.Once
+	runtimeNetworkInfo containerNetwork
+)
+
+// runtimeNetwork reports, once per process, what the docker CLI's runtime can
+// do for a container's primary interface.
+func runtimeNetwork() containerNetwork {
+	runtimeNetworkOnce.Do(func() {
+		// Docker's info has no such fields, so the template fails there.
+		out, err := exec.Command("docker", "info", "--format", "{{.Host.Security.Rootless}}").Output()
+		if err != nil || strings.TrimSpace(string(out)) != "true" {
+			return
+		}
+		runtimeNetworkInfo.rootlessPodman = true
+		out, err = exec.Command("docker", "info", "--format", "{{.Host.Pasta.Executable}}").Output()
+		runtimeNetworkInfo.pasta = err == nil && strings.TrimSpace(string(out)) != ""
+	})
+	return runtimeNetworkInfo
+}
+
+// networkArgs returns the docker create arguments that join networks and give
+// the primary interface mac, when mac is set.
+//
+// A named network's interface is already eth0, and takes --mac-address, as
+// does the default bridge of rootful docker or podman. Rootless podman's
+// default network cannot: slirp4netns has no MAC option, and pasta names the
+// interface after the host's and picks a random MAC. So with no named network
+// pasta is selected with both set. That is podman 5's default rootless network;
+// on podman 4 it replaces slirp4netns.
+func networkArgs(networks []string, mac string, rt containerNetwork) []string {
+	var args []string
+	for _, n := range networks {
+		args = append(args, "--network", n)
+	}
+	switch {
+	case mac == "":
+	case len(networks) > 0 || !rt.rootlessPodman:
+		args = append(args, "--mac-address", mac)
+	case rt.pasta:
+		args = append(args, "--network", "pasta:--ns-ifname,eth0,--ns-mac-addr,"+mac)
+	default:
+		log.Printf("rootless podman without pasta: the container's primary interface cannot be given MAC %s", mac)
+	}
+	return args
 }
