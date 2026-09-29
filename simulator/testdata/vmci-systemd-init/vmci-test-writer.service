@@ -1,0 +1,15 @@
+[Unit]
+Description=Write guestinfo through vcsim's GuestRPC socket
+After=basic.target
+DefaultDependencies=no
+
+# The unit does not inherit the container's environment, so VMX_RPC_SOCK is
+# unset and vmware-rpctool must find the socket at /run/vmware/rpc.sock.
+[Service]
+Type=oneshot
+# sh -c keeps the command as vmware-rpctool's single argument
+ExecStart=/bin/sh -c "/usr/bin/vmware-rpctool 'info-set guestinfo.vmci-systemd-test pass'"
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

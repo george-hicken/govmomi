@@ -12,12 +12,16 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/vmware/govmomi/toolbox"
 	"github.com/vmware/govmomi/vim25/methods"
 	"github.com/vmware/govmomi/vim25/types"
 )
@@ -40,6 +44,7 @@ import (
 //     unconfined seccomp and apparmor, tmpfs at /tmp and /run, a volume at
 //     /var, /lib/modules read-only and /dev/fuse, adapted from kind. Without it
 //     the container shares the host's cgroup namespace.
+//   - RUN.vmci (default false): serve GuestRPC to the guest, described below.
 //   - RUN.port.<port>: publish container port <port> on the host port given as
 //     the value.
 //   - RUN.volume.<label>: add a mount, "source:destination[:options]" as for
@@ -51,11 +56,30 @@ import (
 //     datasource reads, because it detects the container and skips
 //     vmware-rpctool.
 //
-// For example, a Kubernetes node:
+// With RUN.vmci=true the guest can also read and write guestinfo while it runs.
+// vcsim serves GuestRPC on a Unix socket mounted at /run/vmware/rpc.sock, names
+// it in $VMX_RPC_SOCK, and mounts the govmomi toolbox binary at
+// /usr/bin/vmware-rpctool unless a RUN.volume already targets that path; see
+// VmciToolboxBinaryPath to mount it as vmtoolsd as well. The guest may read
+// guestinfo.* keys and write those without "/". A write changes
+// config.extraConfig at once and is reported by PropertyCollector.
+//
+// Not simulated:
+//
+//   - AF_VSOCK and the x86 backdoor. Neither exists in the container, so stock
+//     open-vm-tools vmtoolsd and vmware-rpctool cannot reach vcsim; only the
+//     govmomi toolbox binary can.
+//   - Host-to-guest GuestRPC (TCLO). There are no tools-mediated power
+//     operations or tools heartbeats, and guest.toolsRunningStatus follows the
+//     container's state. Guest operations are served with docker exec, not
+//     through tools.
+//
+// For example, a Kubernetes node that reports its status through guestinfo:
 //
 //	ExtraConfig: []types.BaseOptionValue{
 //		&types.OptionValue{Key: "RUN.container", Value: "my-k8s-node:latest"},
 //		&types.OptionValue{Key: "RUN.nestedContainers", Value: "true"},
+//		&types.OptionValue{Key: "RUN.vmci", Value: "true"},
 //		&types.OptionValue{Key: "guestinfo.userdata", Value: userdata},
 //	}
 const ContainerBackingOptionKey = "RUN.container"
@@ -75,6 +99,13 @@ var (
 type simVM struct {
 	vm *VirtualMachine
 	c  *container
+
+	// guestRPCDir is the host directory mounted at /run/vmware when RUN.vmci
+	// is true. It lives as long as the container, so a restarted container
+	// finds its mount source; guestRPC serves the socket in it while the VM is
+	// powered on.
+	guestRPCDir string
+	guestRPC    *guestRPCServer
 }
 
 // createSimulationVM inspects the provided VirtualMachine and creates a simVM binding for it if
@@ -299,9 +330,14 @@ func (svm *simVM) start(ctx *Context) error {
 	}
 
 	if svm.c != nil && svm.c.id != "" {
+		if err := svm.startGuestRPC(ctx); err != nil {
+			return err
+		}
+
 		err := svm.c.start(ctx)
 		if err != nil {
 			log.Printf("%s %s: %s", svm.vm.Name, "start", err)
+			svm.stopGuestRPC()
 		} else {
 			ctx.Update(svm.vm, toolsRunning)
 		}
@@ -318,6 +354,7 @@ func (svm *simVM) start(ctx *Context) error {
 	mountDMI := true
 	privileged := false
 	nestedContainers := false
+	vmci := false
 
 	// The keys are documented on ContainerBackingOptionKey.
 	for _, opt := range svm.vm.Config.ExtraConfig {
@@ -357,6 +394,11 @@ func (svm *simVM) start(ctx *Context) error {
 
 		if val.Key == "RUN.nestedContainers" {
 			parseBoolOption(value, &nestedContainers)
+			continue
+		}
+
+		if val.Key == "RUN.vmci" {
+			parseBoolOption(value, &vmci)
 			continue
 		}
 
@@ -409,6 +451,28 @@ func (svm *simVM) start(ctx *Context) error {
 	}
 	volumes = append(volumes, extraVolumes...)
 
+	if vmci {
+		dir, err := os.MkdirTemp("", "vcsim-rpc-")
+		if err != nil {
+			return fmt.Errorf("guestrpc: %w", err)
+		}
+		svm.guestRPCDir = dir
+
+		// The directory is mounted, not the socket, because a file mount
+		// target cannot be created inside the fresh tmpfs that
+		// RUN.nestedContainers puts at /run.
+		volumes = append(volumes, dir+":"+path.Dir(toolbox.UnixSocketPath))
+		env = append(env, toolbox.UnixSocketEnv+"="+toolbox.UnixSocketPath)
+
+		if !hasVolumeDest(svm.vm.Config.ExtraConfig, rpctoolPath) {
+			if bin, err := buildToolbox(); err != nil {
+				log.Printf("%s: %s not mounted: %s", svm.vm.Name, rpctoolPath, err)
+			} else {
+				volumes = append(volumes, bin+":"+rpctoolPath+":ro")
+			}
+		}
+	}
+
 	var err error
 	svm.c, err = create(ctx, svm.vm.Name, svm.vm.uid.String(), args[0], args[1:], createOptions{
 		Networks:          networks,
@@ -421,6 +485,7 @@ func (svm *simVM) start(ctx *Context) error {
 		RecreateIfExists:  true,
 	})
 	if err != nil {
+		svm.removeGuestRPC()
 		return err
 	}
 
@@ -434,9 +499,14 @@ func (svm *simVM) start(ctx *Context) error {
 		}
 	}
 
+	if err = svm.startGuestRPC(ctx); err != nil {
+		return err
+	}
+
 	err = svm.c.start(ctx)
 	if err != nil {
 		log.Printf("%s %s: %s %s", svm.vm.Name, "start", args, err)
+		svm.stopGuestRPC()
 		return err
 	}
 
@@ -514,6 +584,8 @@ func (svm *simVM) stop(ctx *Context) error {
 		return nil
 	}
 
+	defer svm.stopGuestRPC()
+
 	err := svm.c.stop(ctx)
 	if err != nil {
 		log.Printf("%s %s: %s", svm.vm.Name, "stop", err)
@@ -568,6 +640,8 @@ func (svm *simVM) remove(ctx *Context) error {
 		return nil
 	}
 
+	defer svm.removeGuestRPC()
+
 	err := svm.c.remove(ctx)
 	if err != nil {
 		log.Printf("%s %s: %s", svm.vm.Name, "remove", err)
@@ -576,6 +650,58 @@ func (svm *simVM) remove(ctx *Context) error {
 	}
 
 	return nil
+}
+
+// startGuestRPC serves GuestRPC in svm.guestRPCDir, if the VM has one and it
+// is not already served.
+func (svm *simVM) startGuestRPC(ctx *Context) error {
+	if svm.guestRPCDir == "" || svm.guestRPC != nil {
+		return nil
+	}
+
+	srv := newGuestRPCServer(svm.vm, filepath.Join(svm.guestRPCDir, path.Base(toolbox.UnixSocketPath)))
+	if err := srv.start(ctx); err != nil {
+		return err
+	}
+	svm.guestRPC = srv
+
+	return nil
+}
+
+// stopGuestRPC stops serving GuestRPC, keeping svm.guestRPCDir for a restart.
+func (svm *simVM) stopGuestRPC() {
+	if svm.guestRPC != nil {
+		svm.guestRPC.stop()
+		svm.guestRPC = nil
+	}
+}
+
+// removeGuestRPC stops serving GuestRPC and removes svm.guestRPCDir.
+func (svm *simVM) removeGuestRPC() {
+	svm.stopGuestRPC()
+
+	if svm.guestRPCDir != "" {
+		_ = os.RemoveAll(svm.guestRPCDir)
+		svm.guestRPCDir = ""
+	}
+}
+
+// rpctoolPath is where vcsim mounts the toolbox binary for RUN.vmci.
+const rpctoolPath = "/usr/bin/vmware-rpctool"
+
+// hasVolumeDest reports whether a RUN.volume.* key in extraConfig mounts
+// something at dest.
+func hasVolumeDest(extraConfig []types.BaseOptionValue, dest string) bool {
+	for _, opt := range extraConfig {
+		v := opt.GetOptionValue()
+		if !strings.HasPrefix(v.Key, "RUN.volume.") {
+			continue
+		}
+		if parts := strings.SplitN(fmt.Sprint(v.Value), ":", 3); len(parts) >= 2 && parts[1] == dest {
+			return true
+		}
+	}
+	return false
 }
 
 // parseBoolOption sets *dst from a JSON boolean, leaving it unchanged when
