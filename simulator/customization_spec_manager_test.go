@@ -6,6 +6,7 @@ package simulator
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
 	"github.com/vmware/govmomi/vim25"
@@ -43,6 +44,36 @@ func TestIsGuestOsCustomizable(t *testing.T) {
 			if res.Returnval != expect {
 				t.Errorf("%q: got %t, want %t", id, res.Returnval, expect)
 			}
+		}
+	})
+}
+
+// collidingIsGuestOsCustomizable stands in for a same-named request type that another
+// package, such as govmomi-internal's vim25/types, registers over the govmomi one.
+type collidingIsGuestOsCustomizable struct {
+	This    types.ManagedObjectReference `xml:"_this"`
+	GuestId string                       `xml:"guestId"`
+}
+
+func TestIsGuestOsCustomizableRegistryCollision(t *testing.T) {
+	name := "IsGuestOsCustomizable"
+	orig, ok := types.TypeFunc()(name)
+	if !ok {
+		t.Fatalf("%s is not registered", name)
+	}
+	types.Add(name, reflect.TypeOf((*collidingIsGuestOsCustomizable)(nil)).Elem())
+	t.Cleanup(func() { types.Add(name, orig) })
+
+	Test(func(ctx context.Context, c *vim25.Client) {
+		res, err := methods.IsGuestOsCustomizable(ctx, c, &types.IsGuestOsCustomizable{
+			This:    *c.ServiceContent.CustomizationSpecManager,
+			GuestId: string(types.VirtualMachineGuestOsIdentifierVmwarePhoton64Guest),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !res.Returnval {
+			t.Error("vmwarePhoton64Guest: got false, want true")
 		}
 	})
 }
