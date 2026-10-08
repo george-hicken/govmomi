@@ -100,6 +100,7 @@ type handler struct {
 	Policies     []library.ContentSecurityPoliciesInfo
 	Trust        map[string]library.TrustedCertificate
 	LibraryUsage map[string]map[string]library.Usage
+	Changes      changeLog
 }
 
 func init() {
@@ -185,10 +186,12 @@ func New(u *url.URL, r *simulator.Registry) ([]string, http.Handler) {
 		h := handlers[i]
 		s.HandleFunc(h.p, h.m)
 	}
+	s.ServeMux.HandleFunc(CLSPath, s.cls)
 
 	return []string{
 		rest.Path, rest.Path + "/",
 		vapi.Path, vapi.Path + "/",
+		CLSPath,
 	}, s
 }
 
@@ -1100,6 +1103,7 @@ func (s *handler) library(w http.ResponseWriter, r *http.Request) {
 				}).String()
 			}
 
+			s.libraryChanged(changeCreate, &spec.Library)
 			s.syncSubLib(s.Library[id])
 
 			spec.Library.StateInfo = &library.StateInfo{State: "ACTIVE"}
@@ -1193,6 +1197,7 @@ func (s *handler) syncSubLib(dstLib *content) error {
 
 		// Add the new item to the subscribed library.
 		dstLib.Item[dstItem.ID] = dstItem
+		s.itemChanged(changeCreate, dstItem.Item)
 
 		// Synchronize the item.
 		if err := s.syncItem(
@@ -1262,6 +1267,7 @@ func (s *handler) syncItem(
 	if !ok {
 		// The source item is no more, so delete the destination item.
 		delete(dstLib.Item, dstItem.ID)
+		s.itemChanged(changeDelete, dstItem.Item)
 
 		// Clean up the destination item's files as well.
 		os.RemoveAll(dstItemPath)
@@ -1539,6 +1545,7 @@ func (s *handler) libraryID(w http.ResponseWriter, r *http.Request) {
 		}
 		delete(s.Library, id)
 		delete(s.LibraryUsage, id)
+		s.libraryChanged(changeDelete, l.Library)
 		OK(w)
 	case http.MethodPatch:
 		var spec struct {
@@ -1550,6 +1557,7 @@ func (s *handler) libraryID(w http.ResponseWriter, r *http.Request) {
 			version := l.Version
 			l.Patch(&spec.Library)
 			l.Version = getVersionString(version)
+			s.libraryChanged(changeUpdate, l.Library, libraryProperties(&spec.Library)...)
 			OK(w)
 		}
 	case http.MethodPost:
@@ -1997,6 +2005,7 @@ func (s *handler) libraryItem(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			l.Item[id] = &item{Item: &spec.Item}
+			s.itemChanged(changeCreate, &spec.Item)
 			OK(w, id)
 		}
 	case http.MethodGet:
@@ -2051,6 +2060,7 @@ func (s *handler) libraryItemID(w http.ResponseWriter, r *http.Request) {
 		}
 		s.deleteVM(l.Item[item.ID].Template)
 		delete(l.Item, item.ID)
+		s.itemChanged(changeDelete, item.Item)
 		OK(w)
 	case http.MethodPatch:
 		var spec struct {
@@ -2058,6 +2068,7 @@ func (s *handler) libraryItemID(w http.ResponseWriter, r *http.Request) {
 		}
 		if s.decode(r, w, &spec) {
 			item.Patch(&spec.Item)
+			s.itemChanged(changeUpdate, item.Item, itemProperties(&spec.Item)...)
 			OK(w)
 		}
 	case http.MethodPost:
@@ -2085,6 +2096,7 @@ func (s *handler) libraryItemID(w http.ResponseWriter, r *http.Request) {
 			nitem.ID = id
 			nitem.LibraryID = spec.LibraryID
 			l.Item[id] = nitem
+			s.itemChanged(changeCreate, nitem.Item)
 
 			OK(w, id)
 		case "sync":
@@ -2305,6 +2317,7 @@ func (s *handler) libraryItemUpdateSessionID(w http.ResponseWriter, r *http.Requ
 			go func() {
 				up.Wait() // wait for any PULL sources to complete
 				done("DONE")
+				s.itemChanged(changeUpdate, &library.Item{ID: session.LibraryItemID, LibraryID: up.Library.ID})
 			}()
 		case "fail":
 			done("ERROR")
@@ -3138,6 +3151,7 @@ func (s *handler) libraryItemOVF(w http.ResponseWriter, r *http.Request) {
 				LastModifiedTime: types.NewTime(time.Now()),
 			},
 		}
+		s.itemChanged(changeCreate, l.Item[id].Item)
 
 		res := vcenter.CreateResult{
 			Succeeded: true,
@@ -3326,6 +3340,7 @@ func (s *handler) libraryItemCreateTemplate(w http.ResponseWriter, r *http.Reque
 		},
 		Template: ref,
 	}
+	s.itemChanged(changeCreate, l.Item[id].Item)
 
 	OK(w, id)
 }
