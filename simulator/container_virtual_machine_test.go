@@ -21,6 +21,7 @@ import (
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/test"
 	"github.com/vmware/govmomi/vim25"
+	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 )
 
@@ -253,4 +254,34 @@ func TestUpdateVMAddContainerBacking(t *testing.T) {
 		task, _ = vm.Destroy(ctx)
 		_ = task.Wait(ctx)
 	})
+}
+
+// TestContainerVMToolsStatus checks that guest and summary.guest report the
+// tools state of the container backing the VM.
+func TestContainerVMToolsStatus(t *testing.T) {
+	if !test.HasDocker() {
+		t.Skip("requires docker or podman (aliased as docker) on linux")
+	}
+
+	env := newVCSIMEnv(t)
+	vm, _ := powerOnContainerVM(t, env, "tools-status-test",
+		&types.OptionValue{Key: ContainerBackingOptionKey, Value: `["alpine","sh","-c","` + sleepForever + `"]`},
+	)
+
+	requireTools := func(t *testing.T, status types.VirtualMachineToolsStatus, running types.VirtualMachineToolsRunningStatus) {
+		t.Helper()
+
+		var props mo.VirtualMachine
+		require.NoError(t, vm.Properties(env.goCtx, vm.Reference(), []string{"guest", "summary.guest"}, &props))
+
+		require.Equal(t, status, props.Guest.ToolsStatus)
+		require.Equal(t, string(running), props.Guest.ToolsRunningStatus)
+		require.Equal(t, status, props.Summary.Guest.ToolsStatus)
+		require.Equal(t, string(running), props.Summary.Guest.ToolsRunningStatus)
+	}
+
+	requireTools(t, types.VirtualMachineToolsStatusToolsOk, types.VirtualMachineToolsRunningStatusGuestToolsRunning)
+
+	powerOff(t, env, vm)
+	requireTools(t, types.VirtualMachineToolsStatusToolsNotRunning, types.VirtualMachineToolsRunningStatusGuestToolsNotRunning)
 }
