@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vmware/govmomi/internal"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/vim25/methods"
 	"github.com/vmware/govmomi/vim25/mo"
@@ -186,33 +187,72 @@ func (f *Folder) AddStandaloneHostTask(ctx *Context, a *types.AddStandaloneHost_
 func (f *Folder) CreateFolder(ctx *Context, c *types.CreateFolder) soap.HasFault {
 	r := &methods.CreateFolderBody{}
 
-	if folderHasChildType(&f.Folder, "Folder") {
-		name := escapeSpecialCharacters(c.Name)
-
-		if obj := ctx.Map.FindByName(name, f.ChildEntity); obj != nil {
-			r.Fault_ = Fault("", &types.DuplicateName{
-				Name:   name,
-				Object: obj.Reference(),
-			})
-
-			return r
-		}
-
-		folder := &Folder{}
-
-		folder.Name = name
-		folder.ChildType = f.ChildType
-
-		folderPutChild(ctx, &f.Folder, folder)
-
-		r.Res = &types.CreateFolderResponse{
-			Returnval: folder.Self,
-		}
-	} else {
+	if !folderHasChildType(&f.Folder, "Folder") {
 		r.Fault_ = f.typeNotSupported()
+		return r
+	}
+
+	ref, fault := f.createFolder(ctx, c.Name, nil)
+	if fault != nil {
+		r.Fault_ = fault
+		return r
+	}
+
+	r.Res = &types.CreateFolderResponse{
+		Returnval: ref,
 	}
 
 	return r
+}
+
+// CreateNamespaceFolder is the internal vCenter method wcpsvc and
+// wcp-namespace-operator use to create a Supervisor Namespace folder. It
+// behaves as CreateFolder and additionally sets the folder's namespace
+// property, which supervisor-authz-service requires before it honours
+// permissions on the folder.
+func (f *Folder) CreateNamespaceFolder(ctx *Context, c *internal.CreateNamespaceFolderRequest) soap.HasFault {
+	r := &internal.CreateNamespaceFolderBody{}
+
+	if !folderHasChildType(&f.Folder, "Folder") {
+		r.Fault_ = f.typeNotSupported()
+		return r
+	}
+
+	ref, fault := f.createFolder(ctx, c.Name, &c.NamespaceId)
+	if fault != nil {
+		r.Fault_ = fault
+		return r
+	}
+
+	r.Res = &internal.CreateNamespaceFolderResponse{
+		Returnval: ref,
+	}
+
+	return r
+}
+
+// createFolder creates a child folder of f with f's child types, faulting
+// with DuplicateName (carrying the existing object) if a child of that name
+// already exists.
+func (f *Folder) createFolder(ctx *Context, name string, namespace *string) (types.ManagedObjectReference, *soap.Fault) {
+	name = escapeSpecialCharacters(name)
+
+	if obj := ctx.Map.FindByName(name, f.ChildEntity); obj != nil {
+		return types.ManagedObjectReference{}, Fault("", &types.DuplicateName{
+			Name:   name,
+			Object: obj.Reference(),
+		})
+	}
+
+	folder := &Folder{}
+
+	folder.Name = name
+	folder.ChildType = f.ChildType
+	folder.Namespace = namespace
+
+	folderPutChild(ctx, &f.Folder, folder)
+
+	return folder.Self, nil
 }
 
 func escapeSpecialCharacters(name string) string {
