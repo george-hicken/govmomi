@@ -91,3 +91,55 @@ func TestLibraryVersion(t *testing.T) {
 		version("2")
 	})
 }
+
+func TestLibraryItemSecurityCompliance(t *testing.T) {
+	simulator.Test(func(ctx context.Context, vc *vim25.Client) {
+		m, id := newLibrary(ctx, t, vc)
+
+		policy, err := m.DefaultOvfSecurityPolicy(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		l, err := m.GetLibraryByID(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		secure, err := m.CreateLibrary(ctx, library.Library{
+			Name:             "secure",
+			Type:             "LOCAL",
+			Storage:          l.Storage,
+			SecurityPolicyID: policy,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		tests := []struct {
+			name      string
+			libraryID string
+			compliant bool
+			cert      bool
+		}{
+			{"no policy", id, true, false},
+			{"policy", secure, false, true},
+		}
+		for _, test := range tests {
+			t.Run(test.name, func(t *testing.T) {
+				itemID, err := m.CreateLibraryItem(ctx, library.Item{Name: "item", Type: library.ItemTypeOVF, LibraryID: test.libraryID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				item, err := m.GetLibraryItem(ctx, itemID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if item.SecurityCompliance == nil || *item.SecurityCompliance != test.compliant {
+					t.Errorf("SecurityCompliance=%v, expected %t", item.SecurityCompliance, test.compliant)
+				}
+				if (item.CertificateVerification != nil) != test.cert {
+					t.Errorf("CertificateVerification=%v, expected present=%t", item.CertificateVerification, test.cert)
+				}
+			})
+		}
+	})
+}
