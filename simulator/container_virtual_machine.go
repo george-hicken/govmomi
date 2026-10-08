@@ -93,11 +93,15 @@ var (
 	toolsRunning = []types.PropertyChange{
 		{Name: "guest.toolsStatus", Val: types.VirtualMachineToolsStatusToolsOk},
 		{Name: "guest.toolsRunningStatus", Val: string(types.VirtualMachineToolsRunningStatusGuestToolsRunning)},
+		{Name: "summary.guest.toolsStatus", Val: types.VirtualMachineToolsStatusToolsOk},
+		{Name: "summary.guest.toolsRunningStatus", Val: string(types.VirtualMachineToolsRunningStatusGuestToolsRunning)},
 	}
 
 	toolsNotRunning = []types.PropertyChange{
 		{Name: "guest.toolsStatus", Val: types.VirtualMachineToolsStatusToolsNotRunning},
 		{Name: "guest.toolsRunningStatus", Val: string(types.VirtualMachineToolsRunningStatusGuestToolsNotRunning)},
+		{Name: "summary.guest.toolsStatus", Val: types.VirtualMachineToolsStatusToolsNotRunning},
+		{Name: "summary.guest.toolsRunningStatus", Val: string(types.VirtualMachineToolsRunningStatusGuestToolsNotRunning)},
 	}
 )
 
