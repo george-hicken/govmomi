@@ -323,3 +323,17 @@ type CreateNamespaceFolderResponse struct {
 func init() {
 	types.Add("CreateNamespaceFolder", reflect.TypeOf((*CreateNamespaceFolderRequest)(nil)).Elem())
 }
+
+type CreateExternallyManagedFolderRequest struct {
+	This types.ManagedObjectReference            `xml:"_this"`
+	Name string                                  `xml:"name"`
+	Info types.FolderExternallyManagedFolderInfo `xml:"info"`
+}
+
+type CreateExternallyManagedFolderResponse struct {
+	Returnval types.ManagedObjectReference `xml:"returnval"`
+}
+
+func init() {
+	types.Add("CreateExternallyManagedFolder", reflect.TypeOf((*CreateExternallyManagedFolderRequest)(nil)).Elem())
+}
