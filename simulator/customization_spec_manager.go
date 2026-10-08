@@ -7,6 +7,8 @@ package simulator
 import (
 	"encoding/pem"
 	"fmt"
+	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -333,6 +335,39 @@ func (m *CustomizationSpecManager) OverwriteCustomizationSpec(ctx *Context, req 
 	body.Fault_ = Fault("", new(types.NotFound))
 
 	return body
+}
+
+// customizableLinuxGuestPrefixes are the guest ID prefixes of the Linux distributions
+// that vSphere guest OS customization supports. Generic IDs ("other*", "generic*") and
+// non-Linux families (Darwin, Solaris, FreeBSD, NetWare, OS/2, DOS) are not customizable.
+var customizableLinuxGuestPrefixes = []string{
+	"almalinux", "amazonlinux", "asianux", "centos", "debian", "fedora", "fusionos",
+	"kylinlinux", "mandrake", "mandriva", "miraclelinux", "nld", "oes", "opensuse",
+	"oracleLinux", "prolinux", "redhat", "rhel", "rockylinux", "sles", "suse",
+	"turboLinux", "ubuntu", "vmkernel", "vmwarePhoton",
+}
+
+// nonCustomizableWindowsGuests are the DOS-based Windows releases, which predate Sysprep.
+var nonCustomizableWindowsGuests = []string{"win31Guest", "win95Guest", "win98Guest", "winMeGuest"}
+
+// isGuestOsCustomizable reports whether vSphere can customize a guest with the given ID:
+// the Windows NT family and the supported Linux distributions.
+func isGuestOsCustomizable(id string) bool {
+	if strings.HasPrefix(id, "win") {
+		return !slices.Contains(nonCustomizableWindowsGuests, id)
+	}
+
+	return slices.ContainsFunc(customizableLinuxGuestPrefixes, func(prefix string) bool {
+		return strings.HasPrefix(id, prefix)
+	})
+}
+
+func (m *CustomizationSpecManager) IsGuestOsCustomizable(ctx *Context, req *types.IsGuestOsCustomizable) soap.HasFault {
+	return &methods.IsGuestOsCustomizableBody{
+		Res: &types.IsGuestOsCustomizableResponse{
+			Returnval: isGuestOsCustomizable(req.GuestId),
+		},
+	}
 }
 
 func (m *CustomizationSpecManager) Get() mo.Reference {
