@@ -309,3 +309,17 @@ type QueryVirtualDiskInfoTaskRequest struct {
 type QueryVirtualDiskInfo_TaskResponse struct {
 	Returnval types.ManagedObjectReference `xml:"returnval"`
 }
+
+type CreateNamespaceFolderRequest struct {
+	This        types.ManagedObjectReference `xml:"_this"`
+	Name        string                       `xml:"name"`
+	NamespaceId string                       `xml:"namespaceId"`
+}
+
+type CreateNamespaceFolderResponse struct {
+	Returnval types.ManagedObjectReference `xml:"returnval"`
+}
+
+func init() {
+	types.Add("CreateNamespaceFolder", reflect.TypeOf((*CreateNamespaceFolderRequest)(nil)).Elem())
+}

@@ -134,3 +134,23 @@ func QueryVirtualDiskInfoTask(ctx context.Context, r soap.RoundTripper, req *Que
 
 	return resBody.InternalRes, nil
 }
+
+type CreateNamespaceFolderBody struct {
+	Req    *CreateNamespaceFolderRequest  `xml:"urn:vim25 CreateNamespaceFolder,omitempty"`
+	Res    *CreateNamespaceFolderResponse `xml:"urn:vim25 CreateNamespaceFolderResponse,omitempty"`
+	Fault_ *soap.Fault                    `xml:"http://schemas.xmlsoap.org/soap/envelope/ Fault,omitempty"`
+}
+
+func (b *CreateNamespaceFolderBody) Fault() *soap.Fault { return b.Fault_ }
+
+func CreateNamespaceFolder(ctx context.Context, r soap.RoundTripper, req *CreateNamespaceFolderRequest) (*CreateNamespaceFolderResponse, error) {
+	var reqBody, resBody CreateNamespaceFolderBody
+
+	reqBody.Req = req
+
+	if err := r.RoundTrip(ctx, &reqBody, &resBody); err != nil {
+		return nil, err
+	}
+
+	return resBody.Res, nil
+}
