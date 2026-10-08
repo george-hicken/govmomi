@@ -1075,6 +1075,8 @@ func (s *handler) library(w http.ResponseWriter, r *http.Request) {
 			spec.Library.ServerGUID = uuid.New().String()
 			spec.Library.CreationTime = types.NewTime(time.Now())
 			spec.Library.LastModifiedTime = types.NewTime(time.Now())
+			// The version is server-assigned; a create spec's version is ignored.
+			spec.Library.Version = getVersionString("")
 			spec.Library.UnsetSecurityPolicyID = spec.Library.SecurityPolicyID == ""
 			dir := s.libraryPath(&spec.Library, "")
 			if err := os.Mkdir(dir, 0750); err != nil {
@@ -1543,7 +1545,11 @@ func (s *handler) libraryID(w http.ResponseWriter, r *http.Request) {
 			Library library.Library `json:"update_spec"`
 		}
 		if s.decode(r, w, &spec) {
+			// As on vCenter, the version is incremented by an update of the library's own
+			// properties; adding, updating or removing its items leaves it unchanged.
+			version := l.Version
 			l.Patch(&spec.Library)
+			l.Version = getVersionString(version)
 			OK(w)
 		}
 	case http.MethodPost:
