@@ -76,8 +76,10 @@ import (
 //     govmomi toolbox binary can.
 //   - Host-to-guest GuestRPC (TCLO). There are no tools-mediated power
 //     operations or tools heartbeats, and guest.toolsRunningStatus follows the
-//     container's state. Guest operations are served with docker exec, not
-//     through tools.
+//     container's state. Once its container has started, the VM reports
+//     open-vm-tools (guest-managed, version openVMToolsVersion) as installed,
+//     whether or not the image contains it. Guest operations are served with
+//     docker exec, not through tools.
 //
 // For example, a Kubernetes node that reports its status through guestinfo:
 //
@@ -89,8 +91,21 @@ import (
 //	}
 const ContainerBackingOptionKey = "RUN.container"
 
+// openVMToolsVersion is guest.toolsVersion for open-vm-tools 13.0.0, the
+// version Photon OS 5 ships, encoded as major<<10 | minor<<5 | patch.
+const openVMToolsVersion = "13312"
+
 var (
+	// toolsRunning also reports open-vm-tools as installed. toolsNotRunning
+	// leaves that in place, as vCenter keeps reporting the installed tools
+	// version of a powered-off VM.
 	toolsRunning = []types.PropertyChange{
+		{Name: "guest.toolsVersion", Val: openVMToolsVersion},
+		{Name: "guest.toolsInstallType", Val: string(types.VirtualMachineToolsInstallTypeGuestToolsTypeOpenVMTools)},
+		{Name: "guest.toolsVersionStatus", Val: string(types.VirtualMachineToolsVersionStatusGuestToolsUnmanaged)},
+		{Name: "guest.toolsVersionStatus2", Val: string(types.VirtualMachineToolsVersionStatusGuestToolsUnmanaged)},
+		{Name: "summary.guest.toolsVersionStatus", Val: string(types.VirtualMachineToolsVersionStatusGuestToolsUnmanaged)},
+		{Name: "summary.guest.toolsVersionStatus2", Val: string(types.VirtualMachineToolsVersionStatusGuestToolsUnmanaged)},
 		{Name: "guest.toolsStatus", Val: types.VirtualMachineToolsStatusToolsOk},
 		{Name: "guest.toolsRunningStatus", Val: string(types.VirtualMachineToolsRunningStatusGuestToolsRunning)},
 		{Name: "summary.guest.toolsStatus", Val: types.VirtualMachineToolsStatusToolsOk},

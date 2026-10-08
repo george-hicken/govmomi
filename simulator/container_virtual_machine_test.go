@@ -257,7 +257,8 @@ func TestUpdateVMAddContainerBacking(t *testing.T) {
 }
 
 // TestContainerVMToolsStatus checks that guest and summary.guest report the
-// tools state of the container backing the VM.
+// tools state of the container backing the VM, and that open-vm-tools stays
+// reported as installed after the container stops.
 func TestContainerVMToolsStatus(t *testing.T) {
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
@@ -278,6 +279,14 @@ func TestContainerVMToolsStatus(t *testing.T) {
 		require.Equal(t, string(running), props.Guest.ToolsRunningStatus)
 		require.Equal(t, status, props.Summary.Guest.ToolsStatus)
 		require.Equal(t, string(running), props.Summary.Guest.ToolsRunningStatus)
+
+		unmanaged := string(types.VirtualMachineToolsVersionStatusGuestToolsUnmanaged)
+		require.Equal(t, openVMToolsVersion, props.Guest.ToolsVersion)
+		require.Equal(t, string(types.VirtualMachineToolsInstallTypeGuestToolsTypeOpenVMTools), props.Guest.ToolsInstallType)
+		require.Equal(t, unmanaged, props.Guest.ToolsVersionStatus)
+		require.Equal(t, unmanaged, props.Guest.ToolsVersionStatus2)
+		require.Equal(t, unmanaged, props.Summary.Guest.ToolsVersionStatus)
+		require.Equal(t, unmanaged, props.Summary.Guest.ToolsVersionStatus2)
 	}
 
 	requireTools(t, types.VirtualMachineToolsStatusToolsOk, types.VirtualMachineToolsRunningStatusGuestToolsRunning)
