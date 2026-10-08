@@ -72,6 +72,24 @@ type content struct {
 	VMTX map[string]*types.ManagedObjectReference
 }
 
+// setSecurityCompliance sets the security fields that vCenter reports on every item of l. The
+// vSphere Automation API documents security_compliance as present in every item get and list, and
+// certificate_verification_info only for items in a library with a security policy. An item in a
+// library without a policy is compliant; an item in a library with one is non-compliant, because
+// the simulator does not verify signatures.
+func (l *content) setSecurityCompliance(i *library.Item) {
+	if l.SecurityPolicyID == "" {
+		i.SecurityCompliance = types.NewBool(true)
+		i.CertificateVerification = nil
+		return
+	}
+	// TODO: verify signed items
+	i.SecurityCompliance = types.NewBool(false)
+	i.CertificateVerification = &library.ItemCertificateVerification{
+		Status: "NOT_AVAILABLE",
+	}
+}
+
 type update struct {
 	*sync.WaitGroup
 	*library.Session
@@ -1195,6 +1213,8 @@ func (s *handler) syncSubLib(dstLib *content) error {
 			},
 		}
 
+		dstLib.setSecurityCompliance(dstItem.Item)
+
 		// Add the new item to the subscribed library.
 		dstLib.Item[dstItem.ID] = dstItem
 		s.itemChanged(changeCreate, dstItem.Item)
@@ -1997,13 +2017,7 @@ func (s *handler) libraryItem(w http.ResponseWriter, r *http.Request) {
 			spec.Item.ContentVersion = getVersionString("")
 			spec.Item.MetadataVersion = getVersionString("")
 
-			if l.SecurityPolicyID != "" {
-				// TODO: verify signed items
-				spec.Item.SecurityCompliance = types.NewBool(false)
-				spec.Item.CertificateVerification = &library.ItemCertificateVerification{
-					Status: "NOT_AVAILABLE",
-				}
-			}
+			l.setSecurityCompliance(&spec.Item)
 			l.Item[id] = &item{Item: &spec.Item}
 			s.itemChanged(changeCreate, &spec.Item)
 			OK(w, id)
@@ -2095,6 +2109,7 @@ func (s *handler) libraryItemID(w http.ResponseWriter, r *http.Request) {
 			nitem := item.cp()
 			nitem.ID = id
 			nitem.LibraryID = spec.LibraryID
+			l.setSecurityCompliance(nitem.Item)
 			l.Item[id] = nitem
 			s.itemChanged(changeCreate, nitem.Item)
 
@@ -3151,6 +3166,7 @@ func (s *handler) libraryItemOVF(w http.ResponseWriter, r *http.Request) {
 				LastModifiedTime: types.NewTime(time.Now()),
 			},
 		}
+		l.setSecurityCompliance(l.Item[id].Item)
 		s.itemChanged(changeCreate, l.Item[id].Item)
 
 		res := vcenter.CreateResult{
@@ -3340,6 +3356,7 @@ func (s *handler) libraryItemCreateTemplate(w http.ResponseWriter, r *http.Reque
 		},
 		Template: ref,
 	}
+	l.setSecurityCompliance(l.Item[id].Item)
 	s.itemChanged(changeCreate, l.Item[id].Item)
 
 	OK(w, id)
