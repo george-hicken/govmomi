@@ -3117,6 +3117,7 @@ func (s *handler) libraryItemOVF(w http.ResponseWriter, r *http.Request) {
 		l, ok := s.Library[req.Target.LibraryID]
 		if !ok {
 			http.NotFound(w, r)
+			return
 		}
 
 		id := uuid.New().String()
