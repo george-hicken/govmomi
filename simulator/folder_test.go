@@ -291,6 +291,74 @@ func TestFolderFaults(t *testing.T) {
 	if f.CreateNamespaceFolder(nil, nil).Fault() == nil {
 		t.Error("expected fault")
 	}
+
+	if f.CreateExternallyManagedFolder(nil, nil).Fault() == nil {
+		t.Error("expected fault")
+	}
+}
+
+func TestFolderCreateExternallyManagedFolder(t *testing.T) {
+	Test(func(ctx context.Context, c *vim25.Client) {
+		finder := find.NewFinder(c)
+		dc, err := finder.DefaultDatacenter(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		folders, err := dc.Folders(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ns, err := folders.VmFolder.CreateFolder(ctx, "ns1")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// As wcp-namespace-operator creates the vSphere Pod folder.
+		info := types.FolderExternallyManagedFolderInfo{
+			Id:   ns.Reference().Value + ":" + c.ServiceContent.About.InstanceUuid,
+			Type: string(types.FolderExternallyManagedFolderTypeVSPHERE_POD),
+		}
+		create := func() (types.ManagedObjectReference, error) {
+			res, err := internal.CreateExternallyManagedFolder(ctx, c, &internal.CreateExternallyManagedFolderRequest{
+				This: ns.Reference(),
+				Name: "vSphere Pods",
+				Info: info,
+			})
+			if err != nil {
+				return types.ManagedObjectReference{}, err
+			}
+			return res.Returnval, nil
+		}
+
+		ref, err := create()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		folder := Map(ctx).Get(ref).(*Folder)
+		if folder.Name != "vSphere Pods" {
+			t.Errorf("name = %q, want vSphere Pods", folder.Name)
+		}
+		if folder.externallyManaged == nil || *folder.externallyManaged != info {
+			t.Errorf("externallyManaged = %v, want %v", folder.externallyManaged, info)
+		}
+		if folder.Parent == nil || *folder.Parent != ns.Reference() {
+			t.Errorf("parent = %v, want %v", folder.Parent, ns.Reference())
+		}
+
+		_, err = create()
+		if !soap.IsSoapFault(err) {
+			t.Fatalf("expected SOAP fault, got %v", err)
+		}
+		dup, ok := soap.ToSoapFault(err).VimFault().(types.DuplicateName)
+		if !ok {
+			t.Fatalf("expected DuplicateName, got %#v", soap.ToSoapFault(err).VimFault())
+		}
+		if dup.Object != ref {
+			t.Errorf("DuplicateName.Object = %v, want %v", dup.Object, ref)
+		}
+	})
 }
 
 func TestFolderCreateNamespaceFolder(t *testing.T) {

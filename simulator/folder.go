@@ -26,6 +26,11 @@ import (
 
 type Folder struct {
 	mo.Folder
+
+	// externallyManaged is the info a CreateExternallyManagedFolder call
+	// recorded. mo.Folder has no property for it, so it is not visible to
+	// the property collector.
+	externallyManaged *types.FolderExternallyManagedFolderInfo
 }
 
 func asFolderMO(obj mo.Reference) (*mo.Folder, bool) {
@@ -218,7 +223,9 @@ func (f *Folder) CreateNamespaceFolder(ctx *Context, c *internal.CreateNamespace
 		return r
 	}
 
-	ref, fault := f.createFolder(ctx, c.Name, &c.NamespaceId)
+	ref, fault := f.createFolder(ctx, c.Name, func(folder *Folder) {
+		folder.Namespace = &c.NamespaceId
+	})
 	if fault != nil {
 		r.Fault_ = fault
 		return r
@@ -231,10 +238,39 @@ func (f *Folder) CreateNamespaceFolder(ctx *Context, c *internal.CreateNamespace
 	return r
 }
 
+// CreateExternallyManagedFolder is the internal vCenter method used to create
+// a folder that represents an object in an external system, such as the
+// vSphere Pod folder wcp-namespace-operator creates under each namespace
+// folder. It behaves as CreateFolder and records the external ID and type.
+func (f *Folder) CreateExternallyManagedFolder(ctx *Context, c *internal.CreateExternallyManagedFolderRequest) soap.HasFault {
+	r := &internal.CreateExternallyManagedFolderBody{}
+
+	if !folderHasChildType(&f.Folder, "Folder") {
+		r.Fault_ = f.typeNotSupported()
+		return r
+	}
+
+	ref, fault := f.createFolder(ctx, c.Name, func(folder *Folder) {
+		info := c.Info
+		folder.externallyManaged = &info
+	})
+	if fault != nil {
+		r.Fault_ = fault
+		return r
+	}
+
+	r.Res = &internal.CreateExternallyManagedFolderResponse{
+		Returnval: ref,
+	}
+
+	return r
+}
+
 // createFolder creates a child folder of f with f's child types, faulting
 // with DuplicateName (carrying the existing object) if a child of that name
-// already exists.
-func (f *Folder) createFolder(ctx *Context, name string, namespace *string) (types.ManagedObjectReference, *soap.Fault) {
+// already exists. init, if not nil, sets method-specific state on the new
+// folder before it is added to the inventory.
+func (f *Folder) createFolder(ctx *Context, name string, init func(*Folder)) (types.ManagedObjectReference, *soap.Fault) {
 	name = escapeSpecialCharacters(name)
 
 	if obj := ctx.Map.FindByName(name, f.ChildEntity); obj != nil {
@@ -248,7 +284,9 @@ func (f *Folder) createFolder(ctx *Context, name string, namespace *string) (typ
 
 	folder.Name = name
 	folder.ChildType = f.ChildType
-	folder.Namespace = namespace
+	if init != nil {
+		init(folder)
+	}
 
 	folderPutChild(ctx, &f.Folder, folder)
 
