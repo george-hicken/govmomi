@@ -22,6 +22,10 @@ const (
 
 	// RPCIN_MAX_DELAY as defined in rpcChannelInt.h:
 	maxDelay = 10
+
+	// DefaultGuestInfoInterval is vmtoolsd's guest info poll interval
+	// (guestInfoServer.c GUESTINFO_POLL_INTERVAL).
+	DefaultGuestInfoInterval = 30 * time.Second
 )
 
 var (
@@ -57,6 +61,18 @@ type Service struct {
 	Power   *PowerCommandHandler
 
 	PrimaryIP func() string
+
+	// GuestInfoInterval, when positive, makes the Service push guest info to
+	// the VMX as vmtoolsd's guestInfo plugin does: the DNS name and the NIC
+	// info, when the Service starts and then at this interval. Each is sent
+	// only when it differs from the last value the VMX accepted, or after a
+	// TCLO reset. When zero, the default, guest info is sent only in reply to
+	// reset and broadcastIP.
+	GuestInfoInterval time.Duration
+
+	// guestInfo holds the last guest info payload the VMX accepted, by
+	// GuestInfoType. It is used only from the Start goroutine.
+	guestInfo map[int][]byte
 }
 
 // NewService initializes a Service instance
@@ -149,11 +165,23 @@ func (s *Service) Start() error {
 		// Note we Send(response) even when nil, to let the VMX know we are here
 		var response []byte
 
+		// Guest info is gathered on this goroutine, as vmtoolsd gathers on
+		// its main loop, so that requests on s.out are never concurrent.
+		var gather <-chan time.Time
+		if s.GuestInfoInterval > 0 {
+			ticker := time.NewTicker(s.GuestInfoInterval)
+			defer ticker.Stop()
+			gather = ticker.C
+			s.gatherGuestInfo()
+		}
+
 		for {
 			select {
 			case <-s.stop:
 				s.stopChannel()
 				return
+			case <-gather:
+				s.gatherGuestInfo()
 			case <-time.After(time.Millisecond * 10 * s.delay):
 				if err = s.checkReset(); err != nil {
 					continue
@@ -234,6 +262,10 @@ func (s *Service) Dispatch(request []byte) []byte {
 
 // Reset is the default Handler for reset requests
 func (s *Service) Reset([]byte) ([]byte, error) {
+	// As guestInfoServer.c GuestInfoServerReset does, so that the next
+	// gather resends everything to a VMX that may have been restarted.
+	s.guestInfo = nil
+
 	s.SendGuestInfo() // Send the IP info ASAP
 
 	return []byte("ATR " + s.name), nil
@@ -321,4 +353,41 @@ func (s *Service) SendGuestInfo() {
 			log.Printf("SendGuestInfo %d: %s", i, err)
 		}
 	}
+}
+
+// gatherGuestInfo sends each guest info value that has changed since the VMX
+// last accepted it, as guestInfoServer.c GuestInfoGather and
+// GuestInfoUpdateVMX do. A value the VMX does not accept is retried at the
+// next gather.
+func (s *Service) gatherGuestInfo() {
+	if name, err := hostname(); err != nil {
+		log.Printf("gather guest info: hostname: %s", err)
+	} else {
+		// A text value, sent with its NUL terminator as vmtoolsd's
+		// SetGuestInfo does.
+		s.updateGuestInfo(GuestInfoDNSName, append([]byte(name), 0))
+	}
+
+	nics, err := EncodeXDR(DefaultGuestNicInfo())
+	if err != nil {
+		log.Printf("gather guest info: nicinfo: %s", err)
+		return
+	}
+	s.updateGuestInfo(GuestInfoIPAddressV2, nics)
+}
+
+func (s *Service) updateGuestInfo(kind int, value []byte) {
+	if last, ok := s.guestInfo[kind]; ok && bytes.Equal(last, value) {
+		return
+	}
+
+	if _, err := s.out.Request(GuestInfoCommand(kind, value)); err != nil {
+		log.Printf("SetGuestInfo %d: %s", kind, err)
+		return
+	}
+
+	if s.guestInfo == nil {
+		s.guestInfo = make(map[int][]byte)
+	}
+	s.guestInfo[kind] = value
 }
