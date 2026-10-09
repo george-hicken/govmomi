@@ -37,6 +37,13 @@ import (
 //
 //   - RUN.mountdmi (default true): mount the VM's DMI data at /sys/class/dmi/id.
 //     Set false where that mount is refused, as under rootless podman.
+//   - RUN.machineId (default true): mount a file holding config.uuid, the
+//     VM's BIOS UUID, as 32 lowercase hex digits read-only at /etc/machine-id
+//     and /var/lib/dbus/machine-id, except where a RUN.volume targets that
+//     path. A guest that has no DMI data, such as one under rootless podman,
+//     then still identifies itself by its BIOS UUID, as the kubelet does for
+//     its node's systemUUID, and no two VMs share the machine ID baked into
+//     an image.
 //   - RUN.network: the container network to join, such as "podman".
 //   - RUN.privileged (default false): run the container with --privileged, as
 //     an image with systemd as PID 1 needs.
@@ -125,6 +132,11 @@ type simVM struct {
 	// powered on.
 	guestRPCDir string
 	guestRPC    *guestRPCServer
+
+	// machineIDDir is the host directory holding the machine-id file mounted
+	// at machineIDPaths when RUN.machineId is true. Like guestRPCDir it lives
+	// as long as the container.
+	machineIDDir string
 
 	// toolsNicInfo is set while the guest's tools have reported its NIC info
 	// in this power-on, which then takes precedence over the container's
@@ -363,6 +375,11 @@ func (svm *simVM) start(ctx *Context) error {
 	}
 
 	if svm.c != nil && svm.c.id != "" {
+		// config.uuid may have been reconfigured while the VM was off.
+		if err := svm.writeMachineID(); err != nil {
+			return err
+		}
+
 		if err := svm.startGuestRPC(ctx); err != nil {
 			return err
 		}
@@ -385,6 +402,7 @@ func (svm *simVM) start(ctx *Context) error {
 	var extraVolumes []string
 	jsonArgs := false
 	mountDMI := true
+	mountMachineID := true
 	privileged := false
 	nestedContainers := false
 	vmci := false
@@ -410,6 +428,11 @@ func (svm *simVM) start(ctx *Context) error {
 
 		if val.Key == "RUN.mountdmi" {
 			parseBoolOption(value, &mountDMI)
+			continue
+		}
+
+		if val.Key == "RUN.machineId" {
+			parseBoolOption(value, &mountMachineID)
 			continue
 		}
 
@@ -484,9 +507,20 @@ func (svm *simVM) start(ctx *Context) error {
 	}
 	volumes = append(volumes, extraVolumes...)
 
+	if mountMachineID {
+		mounts, err := svm.carryBIOSUUID(selectBIOSUUIDCarrier())
+		if err != nil {
+			return err
+		}
+		volumes = append(volumes, mounts...)
+	} else {
+		log.Printf("%s: BIOS UUID carrier none: RUN.machineId is false", svm.vm.Name)
+	}
+
 	if vmci {
 		dir, err := os.MkdirTemp("", "vcsim-rpc-")
 		if err != nil {
+			svm.removeMachineID()
 			return fmt.Errorf("guestrpc: %w", err)
 		}
 		svm.guestRPCDir = dir
@@ -520,6 +554,7 @@ func (svm *simVM) start(ctx *Context) error {
 	})
 	if err != nil {
 		svm.removeGuestRPC()
+		svm.removeMachineID()
 		return err
 	}
 
@@ -681,6 +716,7 @@ func (svm *simVM) remove(ctx *Context) error {
 	}
 
 	defer svm.removeGuestRPC()
+	defer svm.removeMachineID()
 
 	err := svm.c.remove(ctx)
 	if err != nil {
@@ -738,6 +774,122 @@ func (svm *simVM) removeGuestRPC() {
 	if svm.guestRPCDir != "" {
 		_ = os.RemoveAll(svm.guestRPCDir)
 		svm.guestRPCDir = ""
+	}
+}
+
+// biosUUIDCarrier is how a container VM's guest is given its BIOS UUID, for
+// RUN.machineId, where it has no DMI data from RUN.mountdmi.
+type biosUUIDCarrier string
+
+// carrierMachineID mounts the BIOS UUID as the guest's machine ID; see
+// createMachineID.
+const carrierMachineID biosUUIDCarrier = "machine-id"
+
+// selectBIOSUUIDCarrier picks the BIOS UUID carrier for this host. Only
+// machine-id is implemented. A DMI carrier, bind-mounting product_uuid and
+// the related files at /sys/class/dmi/id, is to be chosen here on hosts that
+// have /sys/class/dmi/id (spec 95 D-95-32); WSL2 has none.
+func selectBIOSUUIDCarrier() biosUUIDCarrier {
+	return carrierMachineID
+}
+
+// carryBIOSUUID prepares carrier for the VM and returns the mounts that give
+// the guest its BIOS UUID. It logs the carrier, so that one is never chosen
+// silently.
+func (svm *simVM) carryBIOSUUID(carrier biosUUIDCarrier) ([]string, error) {
+	var mounts []string
+	var err error
+
+	switch carrier {
+	case carrierMachineID:
+		mounts, err = svm.createMachineID()
+	default:
+		return nil, fmt.Errorf("unknown BIOS UUID carrier %q", carrier)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if len(mounts) == 0 {
+		log.Printf("%s: BIOS UUID carrier %s: none mounted, RUN.volume targets every path", svm.vm.Name, carrier)
+	} else {
+		log.Printf("%s: BIOS UUID carrier %s: %s", svm.vm.Name, carrier, strings.Join(mounts, " "))
+	}
+
+	return mounts, nil
+}
+
+// machineIDPaths are where vcsim mounts the machine ID for RUN.machineId:
+// systemd's and D-Bus's (machine-id(5)).
+var machineIDPaths = []string{"/etc/machine-id", "/var/lib/dbus/machine-id"}
+
+// createMachineID creates svm.machineIDDir holding the VM's machine ID and
+// returns the read-only mounts of it at each of machineIDPaths that no
+// RUN.volume targets. It returns no mounts, and creates nothing, if every
+// path is taken.
+//
+// A host file is bind-mounted, as for GuestRPC, because a volume cannot be
+// mounted at a file, and the file must be in place before the container
+// starts, since systemd and D-Bus read the machine ID at boot.
+func (svm *simVM) createMachineID() ([]string, error) {
+	var dests []string
+	for _, p := range machineIDPaths {
+		if !hasVolumeDest(svm.vm.Config.ExtraConfig, p) {
+			dests = append(dests, p)
+		}
+	}
+	if len(dests) == 0 {
+		return nil, nil
+	}
+
+	dir, err := os.MkdirTemp("", "vcsim-machine-id-")
+	if err != nil {
+		return nil, fmt.Errorf("machine-id: %w", err)
+	}
+	// MkdirTemp creates the directory 0700, which a container user that is
+	// not the host user, as under rootless podman, could not traverse.
+	if err = os.Chmod(dir, 0755); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("machine-id: %w", err)
+	}
+	svm.machineIDDir = dir
+
+	if err = svm.writeMachineID(); err != nil {
+		svm.removeMachineID()
+		return nil, err
+	}
+
+	file := filepath.Join(dir, "machine-id")
+	mounts := make([]string, len(dests))
+	for i, p := range dests {
+		mounts[i] = file + ":" + p + ":ro"
+	}
+
+	return mounts, nil
+}
+
+// writeMachineID writes the VM's machine ID, its BIOS UUID as machine-id(5)
+// formats it, to the file in svm.machineIDDir, if there is one. The file is
+// rewritten in place, so a mount of it sees the change.
+func (svm *simVM) writeMachineID() error {
+	if svm.machineIDDir == "" {
+		return nil
+	}
+
+	id := svm.biosUUID()
+	data := hex.EncodeToString(id[:]) + "\n"
+	if err := os.WriteFile(filepath.Join(svm.machineIDDir, "machine-id"), []byte(data), 0644); err != nil {
+		return fmt.Errorf("machine-id: %w", err)
+	}
+
+	return nil
+}
+
+// removeMachineID removes svm.machineIDDir.
+func (svm *simVM) removeMachineID() {
+	if svm.machineIDDir != "" {
+		_ = os.RemoveAll(svm.machineIDDir)
+		svm.machineIDDir = ""
 	}
 }
 
