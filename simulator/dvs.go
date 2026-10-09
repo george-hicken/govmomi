@@ -59,6 +59,7 @@ func (s *VmwareDistributedVirtualSwitch) addDVPortgroups(ctx *Context, specs []t
 
 	portgroups := s.Portgroup
 	portgroupNames := s.Summary.PortgroupName
+	uplinkChanged := false
 
 	for _, spec := range specs {
 		pg := &DistributedVirtualPortgroup{}
@@ -156,6 +157,17 @@ func (s *VmwareDistributedVirtualSwitch) addDVPortgroups(ctx *Context, specs []t
 			pg.PortKeys = append(pg.PortKeys, strconv.Itoa(i))
 		}
 
+		// The portgroup CreateDVSTask adds is the switch's uplink portgroup, which
+		// vCenter flags in its config and tags, and lists in the switch's config.
+		uplink := pg.Name == s.uplinkPortgroupName()
+		pg.Config.Uplink = types.NewBool(uplink)
+		if uplink {
+			pg.Tag = append(pg.Tag, types.Tag{Key: uplinkPortgroupTag})
+			config := s.Config.GetDVSConfigInfo()
+			config.UplinkPortgroup = append(config.UplinkPortgroup, pg.Self)
+			uplinkChanged = true
+		}
+
 		portgroups = append(portgroups, pg.Self)
 		portgroupNames = append(portgroupNames, pg.Name)
 
@@ -177,10 +189,14 @@ func (s *VmwareDistributedVirtualSwitch) addDVPortgroups(ctx *Context, specs []t
 		})
 	}
 
-	ctx.Update(s, []types.PropertyChange{
+	changes := []types.PropertyChange{
 		{Name: "portgroup", Val: portgroups},
 		{Name: "summary.portgroupName", Val: portgroupNames},
-	})
+	}
+	if uplinkChanged {
+		changes = append(changes, types.PropertyChange{Name: "config", Val: s.Config})
+	}
+	ctx.Update(s, changes)
 
 	return nil
 }
@@ -421,14 +437,22 @@ func (s *VmwareDistributedVirtualSwitch) dvPortgroups(ctx *Context, criteria *ty
 	return res
 }
 
-// uplinkPortgroup returns the DVS's auto-created uplink portgroup. It's
+// uplinkPortgroupTag is the system tag vCenter sets on a DVS's uplink portgroup.
+const uplinkPortgroupTag = "SYSTEM/DVS.UPLINKPG"
+
+// uplinkPortgroupName returns the name vCenter gives the uplink portgroup it creates with a DVS.
+func (s *VmwareDistributedVirtualSwitch) uplinkPortgroupName() string {
+	return s.Name + "-DVUplinks" + strings.TrimPrefix(s.Self.Value, "dvs")
+}
+
+// uplinkPortgroup returns the DVS's auto-created uplink portgroup. It'"'"'s
 // identified by name rather than a stored reference: CreateDVSTask (folder.go)
 // creates it via a nested AddDVPortgroupTask, which -- like all vcsim tasks --
 // completes asynchronously in its own goroutine after the creating task's
 // lock is released, so there's no point during DVS creation itself where the
 // new portgroup's reference is reliably available yet to store.
 func (s *VmwareDistributedVirtualSwitch) uplinkPortgroup(ctx *Context) *DistributedVirtualPortgroup {
-	name := s.Name + "-DVUplinks" + strings.TrimPrefix(s.Self.Value, "dvs")
+	name := s.uplinkPortgroupName()
 
 	for _, ref := range s.Portgroup {
 		if pg, ok := ctx.Map.Get(ref).(*DistributedVirtualPortgroup); ok && pg.Name == name {
