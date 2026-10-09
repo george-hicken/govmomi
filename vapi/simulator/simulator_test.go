@@ -6,6 +6,7 @@ package simulator_test
 
 import (
 	"context"
+	"net/http"
 	"net/url"
 	"os"
 	"slices"
@@ -15,9 +16,11 @@ import (
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/property"
+	"github.com/vmware/govmomi/session"
 	"github.com/vmware/govmomi/simulator"
 	"github.com/vmware/govmomi/vapi/library"
 	"github.com/vmware/govmomi/vapi/rest"
+	"github.com/vmware/govmomi/vapi/tags"
 	"github.com/vmware/govmomi/vapi/vcenter"
 	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/mo"
@@ -260,6 +263,48 @@ func TestLibraryItemOVFFilterAndDeployNetwork(t *testing.T) {
 		}
 		if backing.Port.PortgroupKey != dvpg.Reference().Value {
 			t.Errorf("NIC portgroup key = %q, want %q", backing.Port.PortgroupKey, dvpg.Reference().Value)
+		}
+	})
+}
+
+// TestSOAPSessionSharedWithREST checks that a SOAP session ID presented as
+// vmware-api-session-id authorizes vAPI calls without a vAPI login, as vCenter
+// 8.0U3 and later allow; that an unknown ID is rejected; and that a SOAP logout
+// ends the shared session.
+func TestSOAPSessionSharedWithREST(t *testing.T) {
+	simulator.Test(func(ctx context.Context, vc *vim25.Client) {
+		cookie := vc.SessionCookie()
+		if cookie == nil {
+			t.Fatal("no SOAP session cookie")
+		}
+
+		c := rest.NewClient(vc)
+		c.SessionID(cookie.Value)
+
+		vm := simulator.Map(ctx).Any("VirtualMachine").Reference()
+		m := tags.NewManager(c)
+		if _, err := m.ListAttachedTags(ctx, vm); err != nil {
+			t.Fatalf("ListAttachedTags with the SOAP session ID: %s", err)
+		}
+		s, err := c.Session(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s == nil || s.User != simulator.DefaultLogin.Username() {
+			t.Errorf("session = %+v, want user %q", s, simulator.DefaultLogin.Username())
+		}
+
+		unknown := rest.NewClient(vc)
+		unknown.SessionID("not-a-session")
+		if _, err := tags.NewManager(unknown).ListAttachedTags(ctx, vm); !rest.IsStatusError(err, http.StatusUnauthorized) {
+			t.Errorf("ListAttachedTags with an unknown session ID: err = %v, want 401", err)
+		}
+
+		if err := session.NewManager(vc).Logout(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.ListAttachedTags(ctx, vm); !rest.IsStatusError(err, http.StatusUnauthorized) {
+			t.Errorf("ListAttachedTags after SOAP logout: err = %v, want 401", err)
 		}
 	})
 }

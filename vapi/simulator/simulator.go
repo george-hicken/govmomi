@@ -318,7 +318,34 @@ func (s *handler) isAuthorized(r *http.Request) bool {
 	} else {
 		_, ok = s.Update[id]
 	}
+	if !ok {
+		_, ok = s.soapSession(id)
+	}
 	return ok
+}
+
+// soapSession returns the vAPI view of the live SOAP session with the given ID.
+// vCenter 8.0U3 and later accept a SOAP session ID as vmware-api-session-id, so a
+// client can share one session across both endpoints without a vAPI login. The
+// session is not copied into s.Session: each request looks it up again, so a SOAP
+// logout or expiry ends it here too.
+func (s *handler) soapSession(id string) (*rest.Session, bool) {
+	if id == "" {
+		return nil, false
+	}
+	us, ok := s.Map.SessionManager().ActiveSession(id)
+	if !ok {
+		return nil, false
+	}
+	return &rest.Session{User: us.UserName, Created: us.LoginTime, LastAccessed: us.LastActiveTime}, true
+}
+
+// sessionInfo returns the vAPI session with the given ID, created by a vAPI login or shared from SOAP.
+func (s *handler) sessionInfo(id string) (*rest.Session, bool) {
+	if session, ok := s.Session[id]; ok {
+		return session, true
+	}
+	return s.soapSession(id)
 }
 
 func (s *handler) hasAuthorization(r *http.Request) (string, bool) {
@@ -604,7 +631,7 @@ func (s *handler) session(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		if s.action(r) != "" {
-			if session, ok := s.Session[id]; ok {
+			if session, ok := s.sessionInfo(id); ok {
 				OK(w, session)
 			} else {
 				w.WriteHeader(http.StatusUnauthorized)
@@ -632,7 +659,8 @@ func (s *handler) session(w http.ResponseWriter, r *http.Request) {
 		delete(s.Session, id)
 		OK(w)
 	case http.MethodGet:
-		OK(w, s.Session[id])
+		session, _ := s.sessionInfo(id)
+		OK(w, session)
 	}
 }
 
