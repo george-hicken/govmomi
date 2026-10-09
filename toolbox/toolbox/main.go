@@ -59,6 +59,7 @@ func main() {
 
 	in, out := daemonChannels()
 	service := toolbox.NewService(in, out)
+	service.GuestInfoInterval = toolbox.DefaultGuestInfoInterval
 
 	if os.Getuid() == 0 {
 		service.Power.Halt.Handler = toolbox.Halt
