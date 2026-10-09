@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -130,6 +131,11 @@ type simVM struct {
 	// powered on.
 	guestRPCDir string
 	guestRPC    *guestRPCServer
+
+	// toolsNicInfo is set while the guest's tools have reported its NIC info
+	// in this power-on, which then takes precedence over the container's
+	// observed network settings (spec 95 D-95-31).
+	toolsNicInfo atomic.Bool
 }
 
 // createSimulationVM inspects the provided VirtualMachine and creates a simVM binding for it if
@@ -154,6 +160,8 @@ func createSimulationVM(vm *VirtualMachine) *simVM {
 
 // syncNetworkConfigToVMGuestProperties applies container network settings to
 // vm.Guest properties and triggers granular property-change notifications.
+// Once the guest has reported its NIC info over GuestRPC, only the power
+// state is applied.
 //
 // out and detail are an optional docker/podman inspect result (e.g.
 // from watchContainer's update loop, which must inspect anyway to detect
@@ -198,6 +206,13 @@ func (svm *simVM) syncNetworkConfigToVMGuestProperties(ctx *Context, out []byte,
 			svm.vm.Runtime.PowerState = types.VirtualMachinePowerStatePoweredOn
 		} else {
 			svm.vm.Runtime.PowerState = types.VirtualMachinePowerStatePoweredOff
+		}
+
+		// The container's network settings are the address observed from
+		// outside the guest, reported only while the guest's own tools have
+		// not reported its NICs (spec 95 D-95-31).
+		if svm.toolsNicInfo.Load() {
+			return
 		}
 
 		svm.vm.Guest.IpAddress = primaryNet.IPAddress
@@ -685,6 +700,8 @@ func (svm *simVM) startGuestRPC(ctx *Context) error {
 	}
 
 	srv := newGuestRPCServer(svm.vm, filepath.Join(svm.guestRPCDir, path.Base(toolbox.UnixSocketPath)))
+	svm.toolsNicInfo.Store(false)
+	srv.reported = &svm.toolsNicInfo
 	if err := srv.start(ctx); err != nil {
 		return err
 	}

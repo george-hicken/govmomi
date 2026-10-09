@@ -13,6 +13,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/vmware/govmomi/toolbox"
 	"github.com/vmware/govmomi/vim25/types"
@@ -49,6 +50,10 @@ type guestRPCServer struct {
 	accepted sync.WaitGroup
 	mu       sync.Mutex
 	conns    map[net.Conn]struct{}
+
+	// reported, if set, is set once the guest has reported its NIC info,
+	// so that the container's observed network settings no longer apply.
+	reported *atomic.Bool
 }
 
 func newGuestRPCServer(vm *VirtualMachine, path string) *guestRPCServer {
@@ -165,7 +170,7 @@ func (s *guestRPCServer) serveConn(conn net.Conn) {
 			return
 		}
 
-		cmd := strings.TrimRight(string(payload), "\x00")
+		cmd := string(payload)
 		if Trace {
 			// The command's value is guest-supplied and often carries
 			// cloud-init userdata, so only the verb and key are logged.
@@ -195,8 +200,15 @@ func (s *guestRPCServer) connContext() *Context {
 	}
 }
 
-// dispatch executes one RPCI command and returns its reply.
+// dispatch executes one RPCI command and returns its reply. A text command
+// may carry a NUL terminator; a SetGuestInfo value may be binary, so it is
+// passed on untrimmed.
 func (s *guestRPCServer) dispatch(ctx *Context, cmd string) string {
+	if args, ok := strings.CutPrefix(cmd, "SetGuestInfo "); ok {
+		return s.setGuestInfo(ctx, args)
+	}
+	cmd = strings.TrimRight(cmd, "\x00")
+
 	switch {
 	case strings.HasPrefix(cmd, "info-get "):
 		return s.infoGet(ctx, strings.TrimPrefix(cmd, "info-get "))
