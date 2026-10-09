@@ -6,13 +6,23 @@ package simulator_test
 
 import (
 	"context"
+	"net/url"
+	"os"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/vmware/govmomi/find"
+	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/simulator"
 	"github.com/vmware/govmomi/vapi/library"
 	"github.com/vmware/govmomi/vapi/rest"
+	"github.com/vmware/govmomi/vapi/vcenter"
 	"github.com/vmware/govmomi/vim25"
+	"github.com/vmware/govmomi/vim25/mo"
+	"github.com/vmware/govmomi/vim25/soap"
+	"github.com/vmware/govmomi/vim25/types"
 
 	_ "github.com/vmware/govmomi/vapi/simulator"
 )
@@ -140,6 +150,116 @@ func TestLibraryItemSecurityCompliance(t *testing.T) {
 					t.Errorf("CertificateVerification=%v, expected present=%t", item.CertificateVerification, test.cert)
 				}
 			})
+		}
+	})
+}
+
+// TestLibraryItemOVFFilterAndDeployNetwork checks that the ovf_summary of an OVF item
+// lists the descriptor's networks and annotation, and that a deploy mapping that
+// network to a distributed portgroup backs the VM's NIC with that portgroup.
+func TestLibraryItemOVFFilterAndDeployNetwork(t *testing.T) {
+	simulator.Test(func(ctx context.Context, vc *vim25.Client) {
+		m, libID := newLibrary(ctx, t, vc)
+
+		b, err := os.ReadFile("../../ovf/fixtures/ttylinux.ovf")
+		if err != nil {
+			t.Fatal(err)
+		}
+		desc := strings.ReplaceAll(string(b), `ovf:name="nat"`, `ovf:name="Management Network"`)
+		desc = strings.ReplaceAll(desc, "<rasd:Connection>nat</rasd:Connection>", "<rasd:Connection>Management Network</rasd:Connection>")
+		desc = strings.Replace(desc, "<Name>ttylinux-pc_i486-16.1</Name>",
+			"<Name>ttylinux-pc_i486-16.1</Name>\n<AnnotationSection><Info>A human-readable annotation</Info><Annotation>tiny linux</Annotation></AnnotationSection>", 1)
+
+		itemID, err := m.CreateLibraryItem(ctx, library.Item{Name: "ttylinux", Type: library.ItemTypeOVF, LibraryID: libID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		session, err := m.CreateLibraryItemUpdateSession(ctx, library.Session{LibraryItemID: itemID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		update, err := m.AddLibraryItemFile(ctx, session, library.UpdateFile{
+			Name:       "ttylinux.ovf",
+			SourceType: "PUSH",
+			Size:       int64(len(desc)),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		u, err := url.Parse(update.UploadEndpoint.URI)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := soap.DefaultUpload
+		p.ContentLength = int64(len(desc))
+		if err = m.Client.Upload(ctx, strings.NewReader(desc), u, &p); err != nil {
+			t.Fatal(err)
+		}
+		if err = m.CompleteLibraryItemUpdateSession(ctx, session); err != nil {
+			t.Fatal(err)
+		}
+
+		vm := vcenter.NewManager(m.Client)
+		filter, err := vm.FilterLibraryItem(ctx, itemID, vcenter.FilterRequest{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(filter.Networks, []string{"Management Network"}) {
+			t.Errorf("Networks = %q, want [Management Network]", filter.Networks)
+		}
+		if filter.Annotation != "tiny linux" {
+			t.Errorf("Annotation = %q, want %q", filter.Annotation, "tiny linux")
+		}
+		if filter.Name != "ttylinux" {
+			t.Errorf("Name = %q, want ttylinux", filter.Name)
+		}
+
+		finder := find.NewFinder(vc)
+		dc, err := finder.DefaultDatacenter(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		finder.SetDatacenter(dc)
+		pool, err := finder.ResourcePool(ctx, "DC0_C0/Resources")
+		if err != nil {
+			t.Fatal(err)
+		}
+		dvpg, err := finder.Network(ctx, "DC0_DVPG0")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ref, err := vm.DeployLibraryItem(ctx, itemID, vcenter.Deploy{
+			DeploymentSpec: vcenter.DeploymentSpec{
+				Name: "ttylinux-dvpg",
+				NetworkMappings: []vcenter.NetworkMapping{{
+					Key:   filter.Networks[0],
+					Value: dvpg.Reference().Value,
+				}},
+			},
+			Target: vcenter.Target{ResourcePoolID: pool.Reference().Value},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var obj mo.VirtualMachine
+		if err = property.DefaultCollector(vc).RetrieveOne(ctx, *ref, []string{"config.hardware.device", "network"}, &obj); err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Contains(obj.Network, dvpg.Reference()) {
+			t.Errorf("VM network = %v, want it to include %s", obj.Network, dvpg.Reference())
+		}
+		nics := object.VirtualDeviceList(obj.Config.Hardware.Device).SelectByType((*types.VirtualEthernetCard)(nil))
+		if len(nics) != 1 {
+			t.Fatalf("got %d NICs, want 1", len(nics))
+		}
+		backing, ok := nics[0].GetVirtualDevice().Backing.(*types.VirtualEthernetCardDistributedVirtualPortBackingInfo)
+		if !ok {
+			t.Fatalf("NIC backing = %T, want a distributed port backing", nics[0].GetVirtualDevice().Backing)
+		}
+		if backing.Port.PortgroupKey != dvpg.Reference().Value {
+			t.Errorf("NIC portgroup key = %q, want %q", backing.Port.PortgroupKey, dvpg.Reference().Value)
 		}
 	})
 }
