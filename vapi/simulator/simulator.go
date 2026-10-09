@@ -3243,13 +3243,53 @@ func (s *handler) libraryItemOVFID(w http.ResponseWriter, r *http.Request) {
 		}
 		OK(w, d)
 	case "filter":
-		res := vcenter.FilterResponse{
-			Name: item.Name,
-		}
-		OK(w, res)
+		OK(w, s.libraryItemFilter(lib, item))
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// libraryItemFilter returns the ovf_summary of an OVF item: the networks of its
+// NetworkSection, which clients map to target networks in a deploy, along with the
+// annotation and EULAs of its VirtualSystem. An item without a readable descriptor
+// reports its name only.
+func (s *handler) libraryItemFilter(lib *library.Library, item *item) vcenter.FilterResponse {
+	res := vcenter.FilterResponse{
+		Name: item.Name,
+	}
+
+	name := item.ovf()
+	if name == "" {
+		return res
+	}
+	f, err := os.Open(filepath.Join(s.libraryPath(lib, item.ID), name))
+	if err != nil {
+		log.Printf("library item %s filter: %s", item.ID, err)
+		return res
+	}
+	defer f.Close()
+
+	e, err := ovf.Unmarshal(f)
+	if err != nil {
+		log.Printf("library item %s filter: %s", item.ID, err)
+		return res
+	}
+
+	if e.Network != nil {
+		for _, n := range e.Network.Networks {
+			res.Networks = append(res.Networks, n.Name)
+		}
+	}
+	if vs := e.VirtualSystem; vs != nil {
+		if vs.Annotation != nil {
+			res.Annotation = vs.Annotation.Annotation
+		}
+		for _, eula := range vs.Eula {
+			res.EULAs = append(res.EULAs, eula.License)
+		}
+	}
+
+	return res
 }
 
 func (s *handler) deleteVM(ref *types.ManagedObjectReference) {
