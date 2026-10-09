@@ -158,7 +158,7 @@ func TestServiceGuestInfoInterval(t *testing.T) {
 	name := setHostname(t, "guest")
 
 	out := &recordingChannelOut{reply: rpciOK, sent: make(chan struct{}, 16)}
-	s := NewService(NewNoopChannelIn(), out)
+	s := NewService(new(mockChannelIn), out)
 	s.GuestInfoInterval = 10 * time.Millisecond
 
 	wait := func(what string) {
@@ -190,7 +190,7 @@ func TestServiceGuestInfoInterval(t *testing.T) {
 
 func TestServiceGuestInfoIntervalZero(t *testing.T) {
 	out := &recordingChannelOut{reply: rpciOK}
-	s := NewService(NewNoopChannelIn(), out)
+	s := NewService(new(mockChannelIn), out)
 
 	if err := s.Start(); err != nil {
 		t.Fatal(err)
@@ -201,6 +201,61 @@ func TestServiceGuestInfoIntervalZero(t *testing.T) {
 
 	if r := out.take(); len(r) != 0 {
 		t.Errorf("sent %q with GuestInfoInterval 0", r)
+	}
+}
+
+// TestServiceStartReports checks what a Service sends unprompted when it
+// starts: its version, if ReportVersion is set, and, on a transport without
+// TCLO, its capabilities.
+func TestServiceStartReports(t *testing.T) {
+	version := []string{
+		"info-set guestinfo.vmtools.description " + ToolsDescription + " ",
+		"info-set guestinfo.vmtools.versionString ",
+		"info-set guestinfo.vmtools.versionNumber 2147483647",
+		"info-set guestinfo.vmtools.buildNumber 0",
+	}
+
+	tests := []struct {
+		name          string
+		in            Channel
+		reportVersion bool
+		want          []string
+	}{
+		{"TCLO", new(mockChannelIn), false, nil},
+		{"TCLO with version", new(mockChannelIn), true, version},
+		{"no TCLO", NewNoopChannelIn(), false, capabilities},
+		{"no TCLO with version", NewNoopChannelIn(), true, append(append([]string(nil), version...), capabilities...)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := &recordingChannelOut{reply: rpciOK, sent: make(chan struct{}, 16)}
+			s := NewService(tt.in, out)
+			s.ReportVersion = tt.reportVersion
+
+			if err := s.Start(); err != nil {
+				t.Fatal(err)
+			}
+			for range tt.want {
+				select {
+				case <-out.sent:
+				case <-time.After(5 * time.Second):
+					t.Fatal("timeout")
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+			s.Stop()
+			s.Wait()
+
+			got := out.take()
+			if len(got) != len(tt.want) {
+				t.Fatalf("sent %q, want %q", got, tt.want)
+			}
+			for i, w := range tt.want {
+				if !strings.HasPrefix(string(got[i]), w) {
+					t.Errorf("request %d: %q, want prefix %q", i, got[i], w)
+				}
+			}
+		})
 	}
 }
 
@@ -291,4 +346,23 @@ func TestExcludedNic(t *testing.T) {
 
 func nativeUint32(b [4]byte) uint32 {
 	return binary.NativeEndian.Uint32(b[:])
+}
+
+func TestGuestRPCPing(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteGuestRPCPing(&buf); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteDataMapPacket(&buf, []byte("ping"), true); err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := ReadGuestRPCPacket(&buf)
+	if err != nil || p.Type != GuestRPCPacketPing || p.Payload != nil || p.FastClose {
+		t.Errorf("ping read as %+v, %v", p, err)
+	}
+	p, err = ReadGuestRPCPacket(&buf)
+	if err != nil || p.Type != GuestRPCPacketData || string(p.Payload) != "ping" || !p.FastClose {
+		t.Errorf("data read as %+v, %v", p, err)
+	}
 }

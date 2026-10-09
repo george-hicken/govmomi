@@ -51,6 +51,10 @@ type guestRPCServer struct {
 	mu       sync.Mutex
 	conns    map[net.Conn]struct{}
 
+	// tools is the state of the guest's tools, from which
+	// guest.toolsRunningStatus is derived; see guestrpc_tools.go.
+	tools guestTools
+
 	// reported, if set, is set once the guest has reported its NIC info,
 	// so that the container's observed network settings no longer apply.
 	reported *atomic.Bool
@@ -95,6 +99,7 @@ func (s *guestRPCServer) start(ctx *Context) error {
 func (s *guestRPCServer) stop() {
 	s.once.Do(func() {
 		close(s.done)
+		s.stopHeartbeat()
 		if s.ln != nil {
 			_ = s.ln.Close()
 		}
@@ -164,13 +169,34 @@ func (s *guestRPCServer) serveConn(conn net.Conn) {
 
 	ctx := s.connContext()
 
+	// daemon is set once the peer has identified itself as a tools daemon
+	// without a heartbeat, which then counts as running while conn is open.
+	daemon := false
+	defer func() {
+		if daemon {
+			s.tools.daemons.Add(-1)
+			s.syncToolsStatus(ctx)
+		}
+	}()
+
 	for {
-		payload, fastClose, err := toolbox.ReadDataMapPacket(conn)
+		packet, err := toolbox.ReadGuestRPCPacket(conn)
 		if err != nil {
 			return
 		}
 
-		cmd := string(payload)
+		if packet.Type == toolbox.GuestRPCPacketPing {
+			// vmtoolsd's TCLO heartbeat, which has no reply.
+			s.heartbeat(ctx)
+			continue
+		}
+
+		cmd := string(packet.Payload)
+		if !daemon && isToolboxDescription(cmd) {
+			daemon = true
+			s.tools.daemons.Add(1)
+			s.syncToolsStatus(ctx)
+		}
 		if Trace {
 			// The command's value is guest-supplied and often carries
 			// cloud-init userdata, so only the verb and key are logged.
@@ -183,7 +209,7 @@ func (s *guestRPCServer) serveConn(conn net.Conn) {
 			return
 		}
 
-		if fastClose {
+		if packet.FastClose {
 			return
 		}
 	}
@@ -220,9 +246,14 @@ func (s *guestRPCServer) dispatch(ctx *Context, cmd string) string {
 		}
 		return s.infoSet(ctx, key, value)
 
+	case strings.HasPrefix(cmd, "tools.set.versiontype "):
+		return s.setToolsVersion(ctx, strings.TrimPrefix(cmd, "tools.set.versiontype "))
+
+	case strings.HasPrefix(cmd, "tools.set.version "):
+		return s.setToolsVersion(ctx, strings.TrimPrefix(cmd, "tools.set.version "))
+
 	case strings.HasPrefix(cmd, "tools.capability."),
 		strings.HasPrefix(cmd, "tools.set-state"),
-		strings.HasPrefix(cmd, "tools.set.version"),
 		strings.HasPrefix(cmd, "Capabilities_Register"):
 		return "1 "
 

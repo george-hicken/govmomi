@@ -76,11 +76,16 @@ import (
 //     open-vm-tools vmtoolsd and vmware-rpctool cannot reach vcsim; only the
 //     govmomi toolbox binary can.
 //   - Host-to-guest GuestRPC (TCLO). There are no tools-mediated power
-//     operations or tools heartbeats, and guest.toolsRunningStatus follows the
-//     container's state. Once its container has started, the VM reports
-//     open-vm-tools (guest-managed, version openVMToolsVersion) as installed,
-//     whether or not the image contains it. Guest operations are served with
-//     docker exec, not through tools.
+//     operations. Guest operations are served with docker exec, not through
+//     tools.
+//
+// With RUN.vmci=true, guest.toolsRunningStatus and the tools version follow
+// what the guest reports over GuestRPC, as they do on a real VM: the govmomi
+// toolbox daemon is running while its connection is open, and vmtoolsd while
+// its TCLO heartbeat continues (see guestTools). The guest also reports its
+// own network identity, which then replaces the container's observed address.
+// Without RUN.vmci there is no tools channel, and guest.toolsRunningStatus
+// follows the container's state.
 //
 // For example, a Kubernetes node that reports its status through guestinfo:
 //
@@ -92,21 +97,10 @@ import (
 //	}
 const ContainerBackingOptionKey = "RUN.container"
 
-// openVMToolsVersion is guest.toolsVersion for open-vm-tools 13.0.0, the
-// version Photon OS 5 ships, encoded as major<<10 | minor<<5 | patch.
-const openVMToolsVersion = "13312"
-
 var (
-	// toolsRunning also reports open-vm-tools as installed. toolsNotRunning
-	// leaves that in place, as vCenter keeps reporting the installed tools
-	// version of a powered-off VM.
+	// toolsRunning and toolsNotRunning leave the tools version in place, as
+	// vCenter keeps reporting the installed tools of a powered-off VM.
 	toolsRunning = []types.PropertyChange{
-		{Name: "guest.toolsVersion", Val: openVMToolsVersion},
-		{Name: "guest.toolsInstallType", Val: string(types.VirtualMachineToolsInstallTypeGuestToolsTypeOpenVMTools)},
-		{Name: "guest.toolsVersionStatus", Val: string(types.VirtualMachineToolsVersionStatusGuestToolsUnmanaged)},
-		{Name: "guest.toolsVersionStatus2", Val: string(types.VirtualMachineToolsVersionStatusGuestToolsUnmanaged)},
-		{Name: "summary.guest.toolsVersionStatus", Val: string(types.VirtualMachineToolsVersionStatusGuestToolsUnmanaged)},
-		{Name: "summary.guest.toolsVersionStatus2", Val: string(types.VirtualMachineToolsVersionStatusGuestToolsUnmanaged)},
 		{Name: "guest.toolsStatus", Val: types.VirtualMachineToolsStatusToolsOk},
 		{Name: "guest.toolsRunningStatus", Val: string(types.VirtualMachineToolsRunningStatusGuestToolsRunning)},
 		{Name: "summary.guest.toolsStatus", Val: types.VirtualMachineToolsStatusToolsOk},
@@ -378,7 +372,7 @@ func (svm *simVM) start(ctx *Context) error {
 			log.Printf("%s %s: %s", svm.vm.Name, "start", err)
 			svm.stopGuestRPC()
 		} else {
-			ctx.Update(svm.vm, toolsRunning)
+			svm.updateToolsStatus(ctx, false)
 		}
 
 		return err
@@ -550,7 +544,7 @@ func (svm *simVM) start(ctx *Context) error {
 		return err
 	}
 
-	ctx.Update(svm.vm, toolsRunning)
+	svm.updateToolsStatus(ctx, false)
 
 	svm.vm.logPrintf("%s: %s", args, svm.c.id)
 
@@ -651,7 +645,7 @@ func (svm *simVM) pause(ctx *Context) error {
 		return err
 	}
 
-	ctx.Update(svm.vm, toolsNotRunning)
+	svm.updateToolsStatus(ctx, true)
 
 	return nil
 }
@@ -669,7 +663,13 @@ func (svm *simVM) restart(ctx *Context) error {
 		return err
 	}
 
-	ctx.Update(svm.vm, toolsRunning)
+	if svm.guestRPC != nil {
+		// The guest's tools restart with it, and report again once they
+		// have; until then they are not running.
+		ctx.Update(svm.vm, toolsNotRunning)
+	} else {
+		ctx.Update(svm.vm, toolsRunning)
+	}
 
 	return nil
 }
@@ -708,6 +708,19 @@ func (svm *simVM) startGuestRPC(ctx *Context) error {
 	svm.guestRPC = srv
 
 	return nil
+}
+
+// updateToolsStatus reports the tools status after the container has started
+// or resumed (paused false) or has been paused (paused true). With a GuestRPC
+// channel the status is what the guest's tools have reported, which survives
+// a pause; without one it follows the container.
+func (svm *simVM) updateToolsStatus(ctx *Context, paused bool) {
+	if svm.guestRPC == nil {
+		ctx.Update(svm.vm, toolsStatusChanges(!paused))
+		return
+	}
+	svm.guestRPC.setPaused(paused)
+	ctx.Update(svm.vm, toolsStatusChanges(svm.guestRPC.tools.running()))
 }
 
 // stopGuestRPC stops serving GuestRPC, keeping svm.guestRPCDir for a restart.
