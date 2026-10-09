@@ -8,6 +8,7 @@ import (
 	"context"
 	"reflect"
 	"regexp"
+	"slices"
 	"testing"
 
 	"github.com/vmware/govmomi/find"
@@ -682,6 +683,48 @@ func TestDVSReconfigureKeepsConfigType(t *testing.T) {
 		}
 		if len(config.Host) == 0 {
 			t.Error("config.host is empty, want the hosts the model added")
+		}
+	})
+}
+
+// TestDVSUplinkPortgroup checks that the uplink portgroup created with a DVS is
+// marked as vCenter marks it: config.uplink, the SYSTEM/DVS.UPLINKPG tag, and the
+// switch's config.uplinkPortgroup. Other portgroups have config.uplink false.
+func TestDVSUplinkPortgroup(t *testing.T) {
+	Test(func(ctx context.Context, c *vim25.Client) {
+		pc := property.DefaultCollector(c)
+
+		var dvs mo.VmwareDistributedVirtualSwitch
+		ref := Map(ctx).Any("VmwareDistributedVirtualSwitch").Reference()
+		if err := pc.RetrieveOne(ctx, ref, []string{"name", "config", "portgroup"}, &dvs); err != nil {
+			t.Fatal(err)
+		}
+
+		uplinks := dvs.Config.GetDVSConfigInfo().UplinkPortgroup
+		if len(uplinks) != 1 {
+			t.Fatalf("config.uplinkPortgroup = %v, want 1 portgroup", uplinks)
+		}
+
+		var pgs []mo.DistributedVirtualPortgroup
+		if err := pc.Retrieve(ctx, dvs.Portgroup, []string{"name", "config", "tag"}, &pgs); err != nil {
+			t.Fatal(err)
+		}
+		if len(pgs) < 2 {
+			t.Fatalf("got %d portgroups, want the uplink portgroup and at least one other", len(pgs))
+		}
+
+		for _, pg := range pgs {
+			isUplink := pg.Self == uplinks[0]
+			if isUplink && !regexp.MustCompile(`^`+dvs.Name+`-DVUplinks-\d+$`).MatchString(pg.Name) {
+				t.Errorf("uplink portgroup name = %q", pg.Name)
+			}
+			if pg.Config.Uplink == nil || *pg.Config.Uplink != isUplink {
+				t.Errorf("%s config.uplink = %v, want %t", pg.Name, pg.Config.Uplink, isUplink)
+			}
+			tagged := slices.ContainsFunc(pg.Tag, func(tag types.Tag) bool { return tag.Key == "SYSTEM/DVS.UPLINKPG" })
+			if tagged != isUplink {
+				t.Errorf("%s tag = %v, want SYSTEM/DVS.UPLINKPG present=%t", pg.Name, pg.Tag, isUplink)
+			}
 		}
 	})
 }
