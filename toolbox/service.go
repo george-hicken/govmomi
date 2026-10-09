@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vmware/govmomi/internal/version"
 	"github.com/vmware/govmomi/toolbox/hgfs"
 )
 
@@ -22,6 +23,10 @@ const (
 
 	// RPCIN_MAX_DELAY as defined in rpcChannelInt.h:
 	maxDelay = 10
+
+	// ToolsDescription starts the guestinfo.vmtools.description the toolbox
+	// reports, where vmtoolsd reports "open-vm-tools" or "VMware Tools".
+	ToolsDescription = "govmomi toolbox"
 
 	// DefaultGuestInfoInterval is vmtoolsd's guest info poll interval
 	// (guestInfoServer.c GUESTINFO_POLL_INTERVAL).
@@ -70,14 +75,28 @@ type Service struct {
 	// reset and broadcastIP.
 	GuestInfoInterval time.Duration
 
+	// ReportVersion makes the Service report its version as guest variables
+	// when it starts, as vmtoolsd's ToolsCoreReportVersionData does:
+	// guestinfo.vmtools.description, versionString, versionNumber and
+	// buildNumber. The description starts with ToolsDescription, which lets
+	// the host tell the toolbox from vmtoolsd.
+	ReportVersion bool
+
 	// guestInfo holds the last guest info payload the VMX accepted, by
 	// GuestInfoType. It is used only from the Start goroutine.
 	guestInfo map[int][]byte
+
+	// noTCLO is set when the in-channel is the no-op channel, on which the
+	// VMX's Capabilities_Register can never arrive.
+	noTCLO bool
 }
 
 // NewService initializes a Service instance
 func NewService(rpcIn Channel, rpcOut Channel) *Service {
+	_, noTCLO := rpcIn.(*noopChannel)
+
 	s := &Service{
+		noTCLO:   noTCLO,
 		name:     "toolbox", // Same name used by vmtoolsd
 		in:       NewTraceChannel(rpcIn),
 		out:      &ChannelOut{NewTraceChannel(rpcOut)},
@@ -164,6 +183,16 @@ func (s *Service) Start() error {
 
 		// Note we Send(response) even when nil, to let the VMX know we are here
 		var response []byte
+
+		if s.ReportVersion {
+			s.reportVersion()
+		}
+		if s.noTCLO {
+			// vmtoolsd registers its capabilities, the tools version among
+			// them, when the VMX asks. Without a TCLO channel the VMX
+			// cannot ask, so register them now.
+			_, _ = s.CapabilitiesRegister(nil)
+		}
 
 		// Guest info is gathered on this goroutine, as vmtoolsd gathers on
 		// its main loop, so that requests on s.out are never concurrent.
@@ -390,4 +419,21 @@ func (s *Service) updateGuestInfo(kind int, value []byte) {
 		s.guestInfo = make(map[int][]byte)
 	}
 	s.guestInfo[kind] = value
+}
+
+// reportVersion sends the version guest variables vmtoolsd sends when it
+// starts (services/vmtoolsd/mainLoop.c ToolsCoreReportVersionData). A failure
+// is logged and not retried, as there.
+func (s *Service) reportVersion() {
+	vars := []string{
+		"description " + ToolsDescription + " " + version.ClientVersion,
+		"versionString " + version.ClientVersion,
+		fmt.Sprintf("versionNumber %d", toolsVersionUnmanaged),
+		"buildNumber 0",
+	}
+	for _, v := range vars {
+		if _, err := s.out.Request([]byte("info-set guestinfo.vmtools." + v)); err != nil {
+			log.Printf("report version: %s", err)
+		}
+	}
 }

@@ -25,6 +25,20 @@ const (
 	guestRPCTypeData = 1
 )
 
+// GuestRPC packet types (GUESTRPCPKT_TYPE_* in open-vm-tools
+// lib/include/vmware/guestrpc/tclodefs.h).
+const (
+	GuestRPCPacketData = 1 // GUESTRPCPKT_TYPE_DATA: a request or reply
+	GuestRPCPacketPing = 2 // GUESTRPCPKT_TYPE_PING: vmtoolsd's TCLO heartbeat
+)
+
+// GuestRPCPacket is one DataMap-framed GuestRPC packet.
+type GuestRPCPacket struct {
+	Type      int64  // GUESTRPCPKT_FIELD_TYPE; 0 if absent
+	Payload   []byte // GUESTRPCPKT_FIELD_PAYLOAD
+	FastClose bool   // GUESTRPCPKT_FIELD_FAST_CLOSE
+}
+
 // maxDataMapEntries bounds the entries section ReadDataMapPacket will accept.
 //
 // The length prefix is supplied by the peer. govmomi/simulator bind-mounts the
@@ -45,16 +59,23 @@ const maxDataMapEntries = 1 << 20
 //	int64 value:  low32(4B) high32(4B)
 //	string value: strLen(4B) bytes(strLen)
 func ReadDataMapPacket(r io.Reader) (payload []byte, fastClose bool, err error) {
+	p, err := ReadGuestRPCPacket(r)
+	return p.Payload, p.FastClose, err
+}
+
+// ReadGuestRPCPacket reads one DataMap-framed packet from r, as
+// ReadDataMapPacket does, and also returns its type.
+func ReadGuestRPCPacket(r io.Reader) (p GuestRPCPacket, err error) {
 	var hdr [4]byte
 	if _, err = io.ReadFull(r, hdr[:]); err != nil {
 		return
 	}
 	entriesLen := binary.BigEndian.Uint32(hdr[:])
 	if entriesLen == 0 {
-		return nil, false, nil
+		return p, nil
 	}
 	if entriesLen > maxDataMapEntries {
-		return nil, false, fmt.Errorf(
+		return p, fmt.Errorf(
 			"DataMap packet too large: %d bytes (max %d)", entriesLen, maxDataMapEntries)
 	}
 
@@ -79,8 +100,11 @@ func ReadDataMapPacket(r io.Reader) (payload []byte, fastClose bool, err error) 
 			// high32 (buf[4:8]) is intentionally ignored: all DataMap int64
 			// fields we care about (FIELD_TYPE, FIELD_FAST_CLOSE) fit in uint32.
 			buf = buf[8:]
-			if fieldID == guestRPCFieldFastClose && low != 0 {
-				fastClose = true
+			switch fieldID {
+			case guestRPCFieldType:
+				p.Type = int64(low)
+			case guestRPCFieldFastClose:
+				p.FastClose = low != 0
 			}
 
 		case dmFieldTypeString:
@@ -96,7 +120,7 @@ func ReadDataMapPacket(r io.Reader) (payload []byte, fastClose bool, err error) 
 				return
 			}
 			if fieldID == guestRPCFieldPayload {
-				payload = buf[:strLen]
+				p.Payload = buf[:strLen]
 			}
 			buf = buf[strLen:]
 
@@ -153,5 +177,18 @@ func WriteDataMapPacket(w io.Writer, payload []byte, fastClose bool) error {
 	}
 
 	_, err := w.Write(buf)
+	return err
+}
+
+// WriteGuestRPCPing writes the payload-less GUESTRPCPKT_TYPE_PING packet that
+// vmtoolsd sends on its TCLO connection every second as its heartbeat
+// (lib/rpcIn/rpcin.c RpcInHeartbeatCallback).
+func WriteGuestRPCPing(w io.Writer) error {
+	var buf [4 + 16]byte
+	binary.BigEndian.PutUint32(buf[0:], 16)
+	binary.BigEndian.PutUint32(buf[4:], dmFieldTypeInt64)
+	binary.BigEndian.PutUint32(buf[8:], guestRPCFieldType)
+	binary.BigEndian.PutUint32(buf[12:], GuestRPCPacketPing)
+	_, err := w.Write(buf[:])
 	return err
 }
