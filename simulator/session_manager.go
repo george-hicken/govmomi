@@ -100,6 +100,22 @@ func (m *SessionManager) getSession(id string) (Session, bool) {
 	return s, ok
 }
 
+// ActiveSession returns the live session with the given key and marks it active.
+// vCenter 8.0U3 and later accept a session created on one API endpoint at the
+// others, so the vAPI simulator uses this to honour a SOAP session ID; a call that
+// presents the session keeps it alive, as a SOAP call does.
+func (m *SessionManager) ActiveSession(key string) (types.UserSession, bool) {
+	sessionMutex.Lock()
+	defer sessionMutex.Unlock()
+	s, ok := m.sessions[key]
+	if !ok {
+		return types.UserSession{}, false
+	}
+	s.LastActiveTime = time.Now()
+	m.sessions[key] = s
+	return s.UserSession, true
+}
+
 func (m *SessionManager) findSession(user string) (Session, bool) {
 	sessionMutex.Lock()
 	defer sessionMutex.Unlock()
