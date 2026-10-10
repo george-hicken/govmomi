@@ -55,6 +55,14 @@ var (
 )
 
 func main() {
+	// The underlay runtime re-executes this binary inside a router namespace as a netns helper.
+	if served, err := simulator.ServeNetnsHelperFromEnv(); served {
+		if err != nil {
+			log.Fatal(err)
+		}
+		os.Exit(0)
+	}
+
 	model := simulator.VPX()
 
 	flag.IntVar(&model.Datacenter, "dc", model.Datacenter, "Number of datacenters")
@@ -72,6 +80,7 @@ func main() {
 	flag.IntVar(&model.Folder, "folder", model.Folder, "Number of folders")
 	hostIPBase := flag.String("host-ip-base", "", "Base IPv4 address to assign HostSystems from, incrementing by one per host (e.g. 10.20.8.0)")
 	flag.BoolVar(&model.Autostart, "autostart", model.Autostart, "Autostart model created VMs")
+	topologyFile := flag.String("topology", "", "Underlay topology file, YAML or JSON")
 	v := &model.ServiceContent.About.ApiVersion
 	flag.StringVar(v, "api-version", *v, "API version")
 	pv := &model.ServiceContent.About.Version
@@ -96,6 +105,14 @@ func main() {
 	flag.Float64Var(&model.DelayConfig.DelayJitter, "delay-jitter", model.DelayConfig.DelayJitter, "Delay jitter coefficient of variation (tip: 0.5 is a good starting value)")
 
 	flag.Parse()
+
+	if *topologyFile != "" {
+		topo, err := simulator.LoadTopology(*topologyFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		model.Topology = topo
+	}
 
 	if *trace != "" {
 		var err error
