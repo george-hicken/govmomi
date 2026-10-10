@@ -225,6 +225,36 @@ func (u *underlayRuntime) Dial(router, addr string) (net.Conn, error) {
 	return h.Dial(addr)
 }
 
+// ErrNoTopology is returned by Model.ListenRouter and Model.DialRouter when the Model has no Topology.
+var ErrNoTopology = errors.New("no underlay topology loaded")
+
+// ListenRouter returns a listener on addr in the namespace of the named router of the Model's Topology. It is how
+// an endpoint on a router's domain, such as vCenter on the management subnet, is served; see Listen.
+func (m *Model) ListenRouter(router, addr string) (net.Listener, error) {
+	u, err := m.underlay()
+	if err != nil {
+		return nil, err
+	}
+	return u.Listen(router, addr)
+}
+
+// DialRouter returns a connection from the named router's namespace to addr; see Dial.
+func (m *Model) DialRouter(router, addr string) (net.Conn, error) {
+	u, err := m.underlay()
+	if err != nil {
+		return nil, err
+	}
+	return u.Dial(router, addr)
+}
+
+// underlay returns the Model's underlay runtime, or ErrNoTopology before Create has realised a Topology.
+func (m *Model) underlay() (*underlayRuntime, error) {
+	if m.Service == nil || m.Service.Context == nil || m.Service.Context.Map.underlay == nil {
+		return nil, ErrNoTopology
+	}
+	return m.Service.Context.Map.underlay, nil
+}
+
 // helperFor returns the router's netns helper, starting it on first use.
 func (u *underlayRuntime) helperFor(router string) (*netnsHelper, error) {
 	u.mu.Lock()
