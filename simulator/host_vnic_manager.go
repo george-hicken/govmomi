@@ -76,6 +76,7 @@ func (m *HostVirtualNicManager) SelectVnicForNicType(req *types.SelectVnicForNic
 	if !slices.Contains(cfg.SelectedVnic, key) {
 		cfg.SelectedVnic = append(cfg.SelectedVnic, key)
 	}
+	m.syncHost(req.NicType)
 
 	body.Res = &types.SelectVnicForNicTypeResponse{}
 	return body
@@ -92,6 +93,7 @@ func (m *HostVirtualNicManager) DeselectVnicForNicType(req *types.DeselectVnicFo
 	}
 
 	cfg.SelectedVnic = slices.DeleteFunc(slices.Clone(cfg.SelectedVnic), func(k string) bool { return k == key })
+	m.syncHost(req.NicType)
 
 	body.Res = &types.DeselectVnicForNicTypeResponse{}
 	return body
@@ -113,4 +115,23 @@ func (m *HostVirtualNicManager) candidate(nicType, device string) (*types.Virtua
 	}
 
 	return nil, "", errors.New("no NetConfig for nicType " + nicType)
+}
+
+// syncHost copies nicType's selection into the host's own NetConfig, which the rest of the simulator reads, so
+// that the host and its vNIC manager agree.
+func (m *HostVirtualNicManager) syncHost(nicType string) {
+	if m.Host == nil || m.Host.Config == nil {
+		return
+	}
+	var selected []string
+	for _, c := range m.Info.NetConfig {
+		if c.NicType == nicType {
+			selected = c.SelectedVnic
+		}
+	}
+	for i := range m.Host.Config.VirtualNicManagerInfo.NetConfig {
+		if c := &m.Host.Config.VirtualNicManagerInfo.NetConfig[i]; c.NicType == nicType {
+			c.SelectedVnic = slices.Clone(selected)
+		}
+	}
 }
