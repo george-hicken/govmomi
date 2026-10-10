@@ -440,6 +440,9 @@ func create(ctx *Context, name string, id string, image string, args []string, o
 	if err := ctx.Map.holdRun(); err != nil {
 		return nil, err
 	}
+	if err := sweepContainers(); err != nil {
+		log.Printf("container create: sweep stale containers: %s", err)
+	}
 
 	var c container
 	c.name = ctx.Map.containerName(name, id)

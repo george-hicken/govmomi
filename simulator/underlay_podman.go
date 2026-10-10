@@ -41,6 +41,8 @@ type underlayRuntime struct {
 	topo *Topology
 	run  string
 	pid  int
+	// lock is held for the runtime's life, so other processes' sweeps leave the run's objects alone.
+	lock *runLock
 
 	networks map[string]bool // podman network names created or found by this runtime
 	routers  map[string]*routerInstance
@@ -70,10 +72,17 @@ func newUnderlayRuntime(t *Topology) (*underlayRuntime, error) {
 		return nil, fmt.Errorf("sweep stale underlay objects: %w", err)
 	}
 
+	// Taken after the sweep, so this run's own leftovers from an earlier incarnation are swept.
+	lock, err := acquireRunLock(t.Run)
+	if err != nil {
+		return nil, fmt.Errorf("underlay run: %w", err)
+	}
+
 	return &underlayRuntime{
 		topo:     t,
 		run:      t.Run,
 		pid:      os.Getpid(),
+		lock:     lock,
 		networks: make(map[string]bool),
 		routers:  make(map[string]*routerInstance),
 	}, nil
@@ -417,8 +426,9 @@ func (u *underlayRuntime) Close() error {
 	}
 	u.routers = make(map[string]*routerInstance)
 
-	errs = append(errs, removeLabelled("label="+u.runLabel(), func(map[string]string) bool { return true }))
+	errs = append(errs, removeLabelled("label="+u.runLabel()))
 	u.networks = make(map[string]bool)
+	u.lock.release()
 	return errors.Join(errs...)
 }
 
@@ -441,13 +451,34 @@ func (u *underlayRuntime) underlayMTU(name string) int {
 	return 0
 }
 
-// sweepStale removes labelled containers and networks whose owning process is no longer running.
-// Live objects, including those of other runs on this host, are left alone.
+// sweepStale removes the podman containers and networks of every run whose lock is free. A run that holds its
+// lock is live, in this process, another process or another PID namespace, and its objects are left alone. PIDs
+// are not consulted: kill(pid, 0) cannot see a process in another PID namespace, so it reports live owners as dead.
 func sweepStale() error {
-	return removeLabelled("label="+labelRun, func(labels map[string]string) bool {
-		pid, err := strconv.Atoi(labels[labelPID])
-		return err != nil || !pidAlive(pid)
-	})
+	containers, networks, err := listLabelled("label=" + labelRun)
+	if err != nil {
+		return err
+	}
+
+	runs := make(map[string]bool)
+	for _, o := range append(containers, networks...) {
+		runs[o.Labels[labelRun]] = true
+	}
+
+	var errs []error
+	for run := range runs {
+		if !nameRx.MatchString(run) {
+			continue
+		}
+		err := withRunLock(run, func() error {
+			return removeLabelled("label=" + labelRun + "=" + run)
+		})
+		if errors.Is(err, errRunLocked) {
+			continue
+		}
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 // labelledObject is the subset of `podman ps` and `podman network ls` JSON that removal needs.
@@ -458,45 +489,48 @@ type labelledObject struct {
 	Labels map[string]string `json:"Labels"`
 }
 
-// removeLabelled removes containers, then networks, matching the podman filter and the predicate.
-func removeLabelled(filter string, match func(labels map[string]string) bool) error {
+// listLabelled lists the containers and networks matching a podman filter.
+func listLabelled(filter string) (containers, networks []labelledObject, err error) {
 	out, err := podmanOutput("ps", "-a", "--filter", filter, "--format", "json")
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	var containers []labelledObject
 	if out != "" {
 		if err := json.Unmarshal([]byte(out), &containers); err != nil {
-			return fmt.Errorf("podman ps: %w", err)
-		}
-	}
-	var errs []error
-	for _, c := range containers {
-		if match(c.Labels) {
-			if _, err := podmanOutput("rm", "-f", "-t", "0", c.ID); err != nil {
-				errs = append(errs, err)
-			}
+			return nil, nil, fmt.Errorf("podman ps: %w", err)
 		}
 	}
 
 	out, err = podmanOutput("network", "ls", "--filter", filter, "--format", "json")
 	if err != nil {
-		return errors.Join(append(errs, err)...)
+		return nil, nil, err
 	}
-	var networks []labelledObject
 	if out != "" {
 		if err := json.Unmarshal([]byte(out), &networks); err != nil {
-			return errors.Join(append(errs, fmt.Errorf("podman network ls: %w", err))...)
+			return nil, nil, fmt.Errorf("podman network ls: %w", err)
+		}
+	}
+	return containers, networks, nil
+}
+
+// removeLabelled removes the containers, then the networks, matching the podman filter.
+func removeLabelled(filter string) error {
+	containers, networks, err := listLabelled(filter)
+	if err != nil {
+		return err
+	}
+
+	var errs []error
+	for _, c := range containers {
+		if _, err := podmanOutput("rm", "-f", "-t", "0", c.ID); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	for _, n := range networks {
-		if match(n.Labels) {
-			if _, err := podmanOutput("network", "rm", "-f", n.Name); err != nil {
-				errs = append(errs, err)
-			}
+		if _, err := podmanOutput("network", "rm", "-f", n.Name); err != nil {
+			errs = append(errs, err)
 		}
 	}
-
 	return errors.Join(errs...)
 }
 
