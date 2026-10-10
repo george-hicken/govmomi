@@ -510,6 +510,9 @@ func (m *Model) startUnderlay(ctx *Context) error {
 		return nil
 	}
 
+	if err := ctx.Map.setRun(m.Topology.Run); err != nil {
+		return err
+	}
 	u, err := newUnderlayRuntime(m.Topology)
 	if err != nil {
 		return err
@@ -971,6 +974,7 @@ func (m *Model) Remove() {
 		}
 		ctx.Map.underlay = nil
 	}
+	ctx.Map.releaseRun()
 
 	_ = os.RemoveAll(m.dir)
 }

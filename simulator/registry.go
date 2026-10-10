@@ -84,6 +84,11 @@ type Registry struct {
 
 	// underlay realises the Model's Topology. It is nil when no topology is loaded.
 	underlay *underlayRuntime
+
+	// run labels the containers this Registry creates, and lock is held for its life once it creates any.
+	runMu sync.Mutex
+	run   string
+	lock  *runLock
 }
 
 // tagManager is an interface to simplify internal interaction with the vapi tag manager simulator.

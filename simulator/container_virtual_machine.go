@@ -521,7 +521,7 @@ func (svm *simVM) start(ctx *Context) error {
 
 	volumes := []string{}
 	if mountDMI {
-		volumes = append(volumes, constructVolumeName(svm.vm.Name, svm.vm.uid.String(), "dmi")+":/sys/class/dmi/id")
+		volumes = append(volumes, constructVolumeName(ctx.Map.containerName(svm.vm.Name, svm.vm.uid.String()), "dmi")+":/sys/class/dmi/id")
 	}
 	volumes = append(volumes, extraVolumes...)
 
