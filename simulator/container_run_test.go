@@ -155,3 +155,34 @@ func TestContainerRunChild(t *testing.T) {
 
 	waitForFile(t, filepath.Join(dir, "done"), 2*time.Minute)
 }
+
+// TestContainerRunSweepStale checks that a container of a run whose lock is free is swept, and that a container
+// of a run whose lock is held is kept.
+func TestContainerRunSweepStale(t *testing.T) {
+	if !test.HasDocker() {
+		t.Skip("requires docker or podman (aliased as docker) on linux")
+	}
+
+	start := func(run, name string) {
+		t.Helper()
+		out, err := exec.Command("docker", "run", "-d", "--pull=never", "--name", name,
+			"--label", labelRun+"="+run, "--label", labelPID+"=1", "alpine:3.20.3", "sleep", "infinity").CombinedOutput()
+		require.NoError(t, err, string(out))
+		t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", name).Run() })
+	}
+	exists := func(name string) bool {
+		return exec.Command("docker", "inspect", name).Run() == nil
+	}
+
+	stale, live := newRunID(), newRunID()
+	start(stale, "vcsim-"+stale+"-sweep-vm")
+	start(live, "vcsim-"+live+"-sweep-vm")
+
+	held, err := acquireRunLock(live)
+	require.NoError(t, err)
+	t.Cleanup(held.release)
+
+	require.NoError(t, sweepContainers())
+	require.False(t, exists("vcsim-"+stale+"-sweep-vm"))
+	require.True(t, exists("vcsim-"+live+"-sweep-vm"))
+}

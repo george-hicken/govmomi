@@ -170,3 +170,54 @@ func (r *Registry) removeExistingContainer(name string) error {
 		return err
 	}
 }
+
+// adoptRunLock makes the Registry hold l, the lock of a run that another component already took.
+func (r *Registry) adoptRunLock(l *runLock) {
+	r.runMu.Lock()
+	defer r.runMu.Unlock()
+
+	r.lock = l
+}
+
+// sweepContainers removes docker containers of runs whose lock is free. Containers of a live run are left alone.
+func sweepContainers() error {
+	out, err := exec.Command("docker", "ps", "-a", "-q", "--filter", "label="+labelRun).Output()
+	if err != nil {
+		return fmt.Errorf("docker ps: %w", err)
+	}
+	ids := strings.Fields(string(out))
+	if len(ids) == 0 {
+		return nil
+	}
+
+	out, err = exec.Command("docker", append([]string{"inspect", "--format",
+		`{{index .Config.Labels "` + labelRun + `"}}`}, ids...)...).Output()
+	if err != nil {
+		return fmt.Errorf("docker inspect: %w", err)
+	}
+	runs := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(runs) != len(ids) {
+		return fmt.Errorf("docker inspect: %d run labels for %d containers", len(runs), len(ids))
+	}
+
+	byRun := make(map[string][]string)
+	for i, run := range runs {
+		run = strings.TrimSpace(run)
+		if nameRx.MatchString(run) {
+			byRun[run] = append(byRun[run], ids[i])
+		}
+	}
+
+	var errs []error
+	for run, cs := range byRun {
+		err := withRunLock(run, func() error {
+			_, err := exec.Command("docker", append([]string{"rm", "-f", "-v"}, cs...)...).Output()
+			return err
+		})
+		if errors.Is(err, errRunLocked) {
+			continue
+		}
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}

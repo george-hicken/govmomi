@@ -517,6 +517,7 @@ func (m *Model) startUnderlay(ctx *Context) error {
 	if err != nil {
 		return err
 	}
+	ctx.Map.adoptRunLock(u.lock)
 	for _, r := range m.Topology.Routers {
 		if err := u.StartRouter(r.Name); err != nil {
 			_ = u.Close()
