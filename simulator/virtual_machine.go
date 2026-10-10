@@ -2067,6 +2067,30 @@ func (vm *VirtualMachine) configureDevice(
 	return nil
 }
 
+// liveNICState returns card's container-side state for a device change on vm, or the zero state when the change
+// does not reach a container.
+func (vm *VirtualMachine) liveNICState(ctx *Context, card *types.VirtualEthernetCard) (nicState, types.BaseMethodFault) {
+	if !vm.svm.live(ctx) {
+		return nicState{}, nil
+	}
+	st, err := vm.svm.nicStateOf(ctx, card)
+	if err != nil {
+		return nicState{}, newInvalidStateFault("%s: %s", vm.Name, err)
+	}
+	return st, nil
+}
+
+// applyLiveNIC moves a running container's interface between two states; see svm.applyNIC.
+func (vm *VirtualMachine) applyLiveNIC(ctx *Context, before, after nicState) types.BaseMethodFault {
+	if before == after || !vm.svm.live(ctx) {
+		return nil
+	}
+	if err := vm.svm.applyNIC(before, after); err != nil {
+		return newInvalidStateFault("%s: %s", vm.Name, err)
+	}
+	return nil
+}
+
 func (vm *VirtualMachine) removeDevice(ctx *Context, devices object.VirtualDeviceList, spec *types.VirtualDeviceConfigSpec) object.VirtualDeviceList {
 	key := spec.Device.GetVirtualDevice().Key
 
@@ -2373,6 +2397,8 @@ func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMach
 	devices := object.VirtualDeviceList(vm.Config.Hardware.Device)
 
 	var err types.BaseMethodFault
+	// netChanged is set when a vNIC was added, removed or edited, so guest.net is rebuilt once at the end.
+	netChanged := false
 	for i, change := range spec.DeviceChange {
 		dspec := change.GetVirtualDeviceConfigSpec()
 		device := dspec.Device.GetVirtualDevice()
@@ -2419,6 +2445,16 @@ func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMach
 
 			devices = append(devices, dspec.Device)
 			change.Val = dspec.Device
+			if card, ok := dspec.Device.(types.BaseVirtualEthernetCard); ok {
+				after, fault := vm.liveNICState(ctx, card.GetVirtualEthernetCard())
+				if fault != nil {
+					return fault
+				}
+				if fault := vm.applyLiveNIC(ctx, nicState{}, after); fault != nil {
+					return fault
+				}
+				netChanged = true
+			}
 			if key != device.Key {
 				// Update ControllerKey refs
 				for i := range spec.DeviceChange {
@@ -2435,6 +2471,14 @@ func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMach
 				return invalid
 			}
 			rspec.Device = oldDevice
+			var before nicState
+			if card, ok := oldDevice.(types.BaseVirtualEthernetCard); ok {
+				st, fault := vm.liveNICState(ctx, card.GetVirtualEthernetCard())
+				if fault != nil {
+					return fault
+				}
+				before = st
+			}
 			devices = vm.removeDevice(ctx, devices, &rspec)
 			if device.DeviceInfo != nil {
 				device.DeviceInfo.GetDescription().Summary = "" // regenerate summary
@@ -2447,10 +2491,34 @@ func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMach
 
 			devices = append(devices, dspec.Device)
 			change.Val = dspec.Device
+			if card, ok := dspec.Device.(types.BaseVirtualEthernetCard); ok {
+				after, fault := vm.liveNICState(ctx, card.GetVirtualEthernetCard())
+				if fault != nil {
+					return fault
+				}
+				if fault := vm.applyLiveNIC(ctx, before, after); fault != nil {
+					return fault
+				}
+				netChanged = true
+			}
 		case types.VirtualDeviceConfigSpecOperationRemove:
 			change.Op = types.PropertyChangeOpRemove
 
+			var before nicState
+			if card, ok := devices.FindByKey(device.Key).(types.BaseVirtualEthernetCard); ok {
+				st, fault := vm.liveNICState(ctx, card.GetVirtualEthernetCard())
+				if fault != nil {
+					return fault
+				}
+				before = st
+			}
 			devices = vm.removeDevice(ctx, devices, dspec)
+			if _, ok := dspec.Device.(types.BaseVirtualEthernetCard); ok {
+				if fault := vm.applyLiveNIC(ctx, before, nicState{}); fault != nil {
+					return fault
+				}
+				netChanged = true
+			}
 		}
 
 		field.Key = device.Key
@@ -2461,6 +2529,12 @@ func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMach
 	if len(changes) != 0 {
 		change := types.PropertyChange{Name: field.Path, Val: []types.BaseVirtualDevice(devices)}
 		ctx.Update(vm, append(changes, change))
+	}
+
+	if netChanged && vm.svm.live(ctx) {
+		if err := vm.svm.syncNetworkConfigToVMGuestProperties(ctx, nil, nil); err != nil {
+			log.Printf("%s: guest.net after vNIC change: %s", vm.Name, err)
+		}
 	}
 
 	err = vm.updateDiskLayouts(ctx)

@@ -64,10 +64,12 @@ import (
 //     datasource reads, because it detects the container and skips
 //     vmware-rpctool.
 //
-// The container's primary interface is eth0 with the MAC of the VM's first
-// virtual Ethernet card, as a guest on a real VM sees it, so a guest that
-// configures its network by that MAC, as cloud-init does, finds its NIC. See
-// networkArgs for how each container runtime is asked for it.
+// Each virtual Ethernet card is an interface of the container, eth<i> in
+// device-key order, with the card's MAC, as a guest on a real VM sees it, so a
+// guest that configures its network by that MAC, as cloud-init does, finds its
+// NIC. With a topology loaded each card joins the podman network of its L2
+// domain; see containerNICs and networkArgs. Without one, the container gets the
+// first card's MAC on the runtime's default network.
 //
 // With RUN.vmci=true the guest can also read and write guestinfo while it runs.
 // vcsim serves GuestRPC on a Unix socket mounted at /run/vmware/rpc.sock, names
@@ -206,6 +208,12 @@ func (svm *simVM) syncNetworkConfigToVMGuestProperties(ctx *Context, out []byte,
 		svm.vm.Config.Annotation = "inspect"
 		svm.vm.logPrintf("%s: %s", svm.vm.Config.Annotation, string(out))
 
+		live := ctx.Map.underlay != nil
+		var topoNICs []types.GuestNicInfo
+		if live {
+			topoNICs, primaryNet = svm.nicGuestInfo(ctx, detail.NetworkSettings.Networks)
+		}
+
 		if detail.State.Paused {
 			svm.vm.Runtime.PowerState = types.VirtualMachinePowerStateSuspended
 		} else if detail.State.Running {
@@ -229,45 +237,51 @@ func (svm *simVM) syncNetworkConfigToVMGuestProperties(ctx *Context, out []byte,
 			svm.vm.Summary.Guest.HostName = detail.Config.Hostname
 		}
 
+		// Without a topology the container's networks are the guest's NICs. With one they are matched to the
+		// VM's vNICs by MAC, so each NIC is reported whether or not it has an address.
 		var guestNics []types.GuestNicInfo
-		nicIndex := int32(0)
-		for networkName, netSettings := range detail.NetworkSettings.Networks {
-			if netSettings.IPAddress == "" {
-				continue
+		if live {
+			guestNics = topoNICs
+		} else {
+			nicIndex := int32(0)
+			for networkName, netSettings := range detail.NetworkSettings.Networks {
+				if netSettings.IPAddress == "" {
+					continue
+				}
+				nic := types.GuestNicInfo{
+					Network:        networkName,
+					IpAddress:      []string{netSettings.IPAddress},
+					MacAddress:     netSettings.MacAddress,
+					Connected:      true,
+					DeviceConfigId: nicIndex,
+					IpConfig: &types.NetIpConfigInfo{
+						IpAddress: []types.NetIpConfigInfoIpAddress{{
+							IpAddress:    netSettings.IPAddress,
+							PrefixLength: int32(netSettings.IPPrefixLen),
+							State:        string(types.NetIpConfigInfoIpAddressStatusPreferred),
+						}},
+					},
+				}
+				guestNics = append(guestNics, nic)
+				nicIndex++
 			}
-			nic := types.GuestNicInfo{
-				Network:        networkName,
-				IpAddress:      []string{netSettings.IPAddress},
-				MacAddress:     netSettings.MacAddress,
-				Connected:      true,
-				DeviceConfigId: nicIndex,
-				IpConfig: &types.NetIpConfigInfo{
-					IpAddress: []types.NetIpConfigInfoIpAddress{{
-						IpAddress:    netSettings.IPAddress,
-						PrefixLength: int32(netSettings.IPPrefixLen),
-						State:        string(types.NetIpConfigInfoIpAddressStatusPreferred),
-					}},
-				},
-			}
-			guestNics = append(guestNics, nic)
-			nicIndex++
-		}
 
-		if len(guestNics) == 0 && primaryNet.IPAddress != "" {
-			guestNics = append(guestNics, types.GuestNicInfo{
-				Network:        "default",
-				IpAddress:      []string{primaryNet.IPAddress},
-				MacAddress:     primaryNet.MacAddress,
-				Connected:      true,
-				DeviceConfigId: 0,
-				IpConfig: &types.NetIpConfigInfo{
-					IpAddress: []types.NetIpConfigInfoIpAddress{{
-						IpAddress:    primaryNet.IPAddress,
-						PrefixLength: int32(primaryNet.IPPrefixLen),
-						State:        string(types.NetIpConfigInfoIpAddressStatusPreferred),
-					}},
-				},
-			})
+			if len(guestNics) == 0 && primaryNet.IPAddress != "" {
+				guestNics = append(guestNics, types.GuestNicInfo{
+					Network:        "default",
+					IpAddress:      []string{primaryNet.IPAddress},
+					MacAddress:     primaryNet.MacAddress,
+					Connected:      true,
+					DeviceConfigId: 0,
+					IpConfig: &types.NetIpConfigInfo{
+						IpAddress: []types.NetIpConfigInfoIpAddress{{
+							IpAddress:    primaryNet.IPAddress,
+							PrefixLength: int32(primaryNet.IPPrefixLen),
+							State:        string(types.NetIpConfigInfoIpAddressStatusPreferred),
+						}},
+					},
+				})
+			}
 		}
 
 		svm.vm.Guest.Net = guestNics
@@ -294,10 +308,14 @@ func (svm *simVM) syncNetworkConfigToVMGuestProperties(ctx *Context, out []byte,
 			}}
 		}
 
-		for _, d := range svm.vm.Config.Hardware.Device {
-			if eth, ok := d.(types.BaseVirtualEthernetCard); ok {
-				eth.GetVirtualEthernetCard().MacAddress = primaryNet.MacAddress
-				break
+		// The vNIC's MAC is the input the container is attached with, so only the legacy path reports the
+		// container's MAC back onto the first card.
+		if !live {
+			for _, d := range svm.vm.Config.Hardware.Device {
+				if eth, ok := d.(types.BaseVirtualEthernetCard); ok {
+					eth.GetVirtualEthernetCard().MacAddress = primaryNet.MacAddress
+					break
+				}
 			}
 		}
 	})
@@ -540,10 +558,17 @@ func (svm *simVM) start(ctx *Context) error {
 		}
 	}
 
-	var err error
+	nics, err := svm.containerNICs(ctx)
+	if err != nil {
+		svm.removeGuestRPC()
+		svm.removeMachineID()
+		return err
+	}
+
 	svm.c, err = create(ctx, svm.vm.Name, svm.vm.uid.String(), args[0], args[1:], createOptions{
 		Networks:          networks,
-		MacAddress:        firstNICMacAddress(svm.vm),
+		NICs:              nics,
+		CapAdd:            capAdd(ctx),
 		Volumes:           volumes,
 		Ports:             ports,
 		Env:               env,

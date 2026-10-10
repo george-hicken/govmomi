@@ -393,11 +393,10 @@ func createBridge(bridgeName string, labels ...string) (string, error) {
 // ExtraConfig keys that set it for a VM are documented on
 // ContainerBackingOptionKey.
 type createOptions struct {
-	// Networks are the bridges to connect the container to.
+	// Networks are the bridges to connect the container to, without a MAC.
 	Networks []string
-	// MacAddress, when set, is given to the container's primary interface,
-	// named eth0; see networkArgs.
-	MacAddress string
+	// NICs are the container's interfaces in device-key order; see networkArgs.
+	NICs []containerNIC
 	// Volumes are docker -v arguments, "source:destination[:options]".
 	Volumes []string
 	// Ports are docker -p arguments, "hostPort:containerPort".
@@ -410,6 +409,8 @@ type createOptions struct {
 	// NestedContainers adds the flags a container needs to run containers
 	// itself, --privileged among them.
 	NestedContainers bool
+	// CapAdd are capabilities to add, such as NET_RAW for ping.
+	CapAdd []string
 
 	// QuoteImageAndArgs shell-quotes the image and each arg, for a command
 	// given as a JSON array, whose elements may contain shell metacharacters.
@@ -470,12 +471,16 @@ func create(ctx *Context, name string, id string, image string, args []string, o
 		dockerPort = append(dockerPort, "-p", opts.Ports[i])
 	}
 
-	dockerNet = networkArgs(opts.Networks, opts.MacAddress, runtimeNetwork())
+	dockerNet = networkArgs(opts.Networks, opts.NICs, runtimeNetwork())
 
 	run := []string{"docker", "create", "--name", c.name}
 
 	if opts.Privileged || opts.NestedContainers {
 		run = append(run, "--privileged")
+	}
+
+	for _, c := range opts.CapAdd {
+		run = append(run, "--cap-add", c)
 	}
 
 	if opts.NestedContainers {
@@ -973,28 +978,49 @@ func runtimeNetwork() containerNetwork {
 	return runtimeNetworkInfo
 }
 
-// networkArgs returns the docker create arguments that join networks and give
-// the primary interface mac, when mac is set.
+// containerNIC is one interface a container joins: a podman network, the MAC
+// the guest sees on it, and the interface name inside the container.
+type containerNIC struct {
+	// Network is the podman network. Empty means the runtime's default network,
+	// which takes the MAC only as described on networkArgs.
+	Network string
+	// MAC is given to the interface. Empty leaves it to the runtime.
+	MAC string
+	// Name is the interface name inside the container, eth<i>.
+	Name string
+}
+
+// networkArgs returns the docker create arguments that join networks, then
+// nics in the order given, each interface with its MAC and name.
 //
-// A named network's interface is already eth0, and takes --mac-address, as
-// does the default bridge of rootful docker or podman. Rootless podman's
-// default network cannot: slirp4netns has no MAC option, and pasta names the
-// interface after the host's and picks a random MAC. So with no named network
-// pasta is selected with both set. That is podman 5's default rootless network;
-// on podman 4 it replaces slirp4netns.
-func networkArgs(networks []string, mac string, rt containerNetwork) []string {
+// A named network's interface takes --network <net>:mac=<MAC>,interface_name=<name>,
+// as does the default bridge of rootful docker or podman with --mac-address.
+// Rootless podman's default network cannot: slirp4netns has no MAC option, and
+// pasta names the interface after the host's and picks a random MAC. So a
+// single NIC on the default network, with no named network, selects pasta with
+// both set. That is podman 5's default rootless network; on podman 4 it
+// replaces slirp4netns.
+func networkArgs(networks []string, nics []containerNIC, rt containerNetwork) []string {
 	var args []string
 	for _, n := range networks {
 		args = append(args, "--network", n)
 	}
-	switch {
-	case mac == "":
-	case len(networks) > 0 || !rt.rootlessPodman:
-		args = append(args, "--mac-address", mac)
-	case rt.pasta:
-		args = append(args, "--network", "pasta:--ns-ifname,eth0,--ns-mac-addr,"+mac)
-	default:
-		log.Printf("rootless podman without pasta: the container's primary interface cannot be given MAC %s", mac)
+	for _, nic := range nics {
+		switch {
+		case nic.Network != "":
+			spec := nic.Network
+			if nic.MAC != "" {
+				spec += ":mac=" + nic.MAC + ",interface_name=" + nic.Name
+			}
+			args = append(args, "--network", spec)
+		case nic.MAC == "":
+		case len(networks) > 0 || !rt.rootlessPodman:
+			args = append(args, "--mac-address", nic.MAC)
+		case rt.pasta && len(nics) == 1:
+			args = append(args, "--network", "pasta:--ns-ifname,eth0,--ns-mac-addr,"+nic.MAC)
+		default:
+			log.Printf("rootless podman without pasta: the container's primary interface cannot be given MAC %s", nic.MAC)
+		}
 	}
 	return args
 }
