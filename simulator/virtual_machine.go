@@ -1696,6 +1696,10 @@ func (vm *VirtualMachine) configureDevice(
 		})
 
 		c := x.GetVirtualEthernetCard()
+		if old, ok := oldDevice.(types.BaseVirtualEthernetCard); ok && c.MacAddress == "" {
+			// An edit that leaves the MAC out keeps the vNIC's MAC.
+			c.MacAddress = old.GetVirtualEthernetCard().MacAddress
+		}
 		if c.MacAddress == "" {
 			if c.UnitNumber == nil {
 				devices.AssignController(device, controller)
