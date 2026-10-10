@@ -291,7 +291,7 @@ func (u *underlayRuntime) startHelper(rt *routerInstance) error {
 	sock := filepath.Join(dir, "helper.sock")
 
 	cmd := exec.Command("podman", "unshare", "nsenter", "-t", strconv.Itoa(rt.pid), "-n", exe)
-	cmd.Env = append(os.Environ(), NetnsHelperEnv+"="+sock, netnsOwnerEnv+"="+strconv.Itoa(u.pid))
+	cmd.Env = append(os.Environ(), netnsHelperEnv+"="+sock, netnsOwnerEnv+"="+strconv.Itoa(u.pid))
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {

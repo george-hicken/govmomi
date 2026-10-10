@@ -55,14 +55,6 @@ var (
 )
 
 func main() {
-	// The underlay runtime re-executes this binary inside a router namespace as a netns helper.
-	if served, err := simulator.ServeNetnsHelperFromEnv(); served {
-		if err != nil {
-			log.Fatal(err)
-		}
-		os.Exit(0)
-	}
-
 	model := simulator.VPX()
 
 	flag.IntVar(&model.Datacenter, "dc", model.Datacenter, "Number of datacenters")
