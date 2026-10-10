@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -130,12 +131,14 @@ func sanitizeName(name string) string {
 	return sanitizeNameRx.ReplaceAllString(name, "-")
 }
 
-func constructContainerName(name, uid string) string {
-	return fmt.Sprintf("vcsim-%s-%s", sanitizeName(name), uid)
+// constructContainerName names a VM or host container. The run id keeps names unique across the vcsim
+// instances on a host, so one instance can never address another's container by name.
+func constructContainerName(run, name, uid string) string {
+	return fmt.Sprintf("vcsim-%s-%s-%s", sanitizeName(run), sanitizeName(name), uid)
 }
 
-func constructVolumeName(containerName, uid, volumeName string) string {
-	return constructContainerName(containerName, uid) + "--" + sanitizeName(volumeName)
+func constructVolumeName(containerName, volumeName string) string {
+	return containerName + "--" + sanitizeName(volumeName)
 }
 
 func prefixToMask(prefix int) string {
@@ -434,13 +437,17 @@ func create(ctx *Context, name string, id string, image string, args []string, o
 		return nil, errors.New("cannot create container backing without an image")
 	}
 
+	if err := ctx.Map.holdRun(); err != nil {
+		return nil, err
+	}
+
 	var c container
-	c.name = constructContainerName(name, id)
+	c.name = ctx.Map.containerName(name, id)
 	c.changes = make(chan struct{})
 
 	if opts.RecreateIfExists {
-		if _, preRmErr := exec.Command("docker", "rm", "-f", c.name).Output(); preRmErr == nil {
-			log.Printf("container create: removed stale container %q before create", c.name)
+		if err := ctx.Map.removeExistingContainer(c.name); err != nil {
+			return nil, err
 		}
 	}
 
@@ -473,7 +480,8 @@ func create(ctx *Context, name string, id string, image string, args []string, o
 
 	dockerNet = networkArgs(opts.Networks, opts.NICs, runtimeNetwork())
 
-	run := []string{"docker", "create", "--name", c.name}
+	run := []string{"docker", "create", "--name", c.name,
+		"--label", labelRun + "=" + ctx.Map.runID(), "--label", labelPID + "=" + strconv.Itoa(os.Getpid())}
 
 	if opts.Privileged || opts.NestedContainers {
 		run = append(run, "--privileged")

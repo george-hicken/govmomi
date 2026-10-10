@@ -187,7 +187,7 @@ func createSimulationHost(ctx *Context, host *HostSystem) (*simHost, error) {
 
 	hName := host.Summary.Config.Name
 	hUuid := host.Summary.Hardware.Uuid
-	containerName := constructContainerName(hName, hUuid)
+	containerName := ctx.Map.containerName(hName, hUuid)
 
 	// create volumes and mounts
 	dockerVol, volCmds, err := createSimHostMounts(ctx, containerName, host.Config.FileSystemVolume.MountInfo)
