@@ -75,13 +75,14 @@ func waitExtraConfig(t *testing.T, env *vcSimEnv, vmRef types.ManagedObjectRefer
 	defer cancel()
 
 	var got any
-	err := property.Wait(ctx, env.pc, vmRef, []string{"config.extraConfig"}, func(changes []types.PropertyChange) bool {
+	err := property.Wait(ctx, env.pc, vmRef, []string{"config"}, func(changes []types.PropertyChange) bool {
 		for _, change := range changes {
-			options, _ := change.Val.(types.ArrayOfOptionValue)
-			for _, opt := range options.OptionValue {
-				if v := opt.GetOptionValue(); v.Key == key {
-					got = v.Value
-				}
+			config, ok := change.Val.(types.VirtualMachineConfigInfo)
+			if !ok {
+				continue
+			}
+			if v, ok := object.OptionValueList(config.ExtraConfig).GetString(key); ok {
+				got = v
 			}
 		}
 		return got == want
@@ -148,10 +149,34 @@ func TestGuestRPCServer_InfoSet_PropertyChange(t *testing.T) {
 	vm := allVMs(t, env)[0]
 	_, out := serveGuestRPC(t, env, vm)
 
-	_, err := out.Request([]byte("info-set guestinfo.notify.test triggered"))
-	require.NoError(t, err)
+	const key, want = "guestinfo.notify.test", "triggered"
 
-	waitExtraConfig(t, env, vm.Self, "guestinfo.notify.test", "triggered", time.Second)
+	ctx, cancel := context.WithTimeout(env.goCtx, 10*time.Second)
+	defer cancel()
+
+	initial := true
+	var got any
+	err := property.Wait(ctx, env.pc, vm.Self, []string{"config"}, func(changes []types.PropertyChange) bool {
+		if initial {
+			// The guest writes only once the initial values are in, so the
+			// value can arrive only as an update.
+			initial = false
+			_, err := out.Request([]byte("info-set " + key + " " + want))
+			require.NoError(t, err)
+			return false
+		}
+		for _, change := range changes {
+			config, ok := change.Val.(types.VirtualMachineConfigInfo)
+			if !ok {
+				continue
+			}
+			if v, ok := object.OptionValueList(config.ExtraConfig).GetString(key); ok {
+				got = v
+			}
+		}
+		return got == want
+	})
+	require.NoError(t, err, "%s: got %v, want %q", key, got, want)
 }
 
 // TestGuestRPCServer_HostWriteGuestRead pins that the guest reads the live
