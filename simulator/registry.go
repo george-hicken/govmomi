@@ -81,6 +81,9 @@ type Registry struct {
 	// without requiring modifications to the code under test.
 	// See ContainerImageRegistry for details and usage examples.
 	ContainerImages ContainerImageRegistry
+
+	// underlay realises the Model's Topology. It is nil when no topology is loaded.
+	underlay *underlayRuntime
 }
 
 // tagManager is an interface to simplify internal interaction with the vapi tag manager simulator.

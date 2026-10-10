@@ -497,7 +497,31 @@ func (m *Model) Create() error {
 	if err := m.createRootTempDir(ctx.Map.OptionManager()); err != nil {
 		return err
 	}
+	if err := m.startUnderlay(ctx); err != nil {
+		return err
+	}
 	return m.CreateInfrastructure(ctx)
+}
+
+// startUnderlay realises the Topology: it sweeps what a dead run left behind, then creates every router. Domain
+// networks are created as vNICs need them.
+func (m *Model) startUnderlay(ctx *Context) error {
+	if m.Topology == nil {
+		return nil
+	}
+
+	u, err := newUnderlayRuntime(m.Topology)
+	if err != nil {
+		return err
+	}
+	for _, r := range m.Topology.Routers {
+		if err := u.StartRouter(r.Name); err != nil {
+			_ = u.Close()
+			return err
+		}
+	}
+	ctx.Map.underlay = u
+	return nil
 }
 
 func (m *Model) CreateInfrastructure(ctx *Context) error {
@@ -939,6 +963,14 @@ func (m *Model) Remove() {
 		}
 	}
 	ctx.Map.m.Unlock()
+
+	// Containers go before routers and networks, which podman will not remove while they are in use.
+	if u := ctx.Map.underlay; u != nil {
+		if err := u.Close(); err != nil {
+			log.Printf("underlay teardown: %s", err)
+		}
+		ctx.Map.underlay = nil
+	}
 
 	_ = os.RemoveAll(m.dir)
 }

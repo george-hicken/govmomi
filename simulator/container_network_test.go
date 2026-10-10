@@ -18,20 +18,42 @@ func TestNetworkArgs(t *testing.T) {
 	tests := []struct {
 		name     string
 		networks []string
-		mac      string
+		nics     []containerNIC
 		rt       containerNetwork
 		want     []string
 	}{
-		{"no MAC", []string{"podman"}, "", pasta, []string{"--network", "podman"}},
-		{"named network", []string{"vcsim-test-bridge"}, mac, pasta, []string{"--network", "vcsim-test-bridge", "--mac-address", mac}},
-		{"rootful default bridge", nil, mac, rootful, []string{"--mac-address", mac}},
-		{"rootless pasta", nil, mac, pasta, []string{"--network", "pasta:--ns-ifname,eth0,--ns-mac-addr," + mac}},
-		{"rootless without pasta", nil, mac, slirp, nil},
+		{"no MAC", []string{"podman"}, []containerNIC{{}}, pasta, []string{"--network", "podman"}},
+		{"named network", []string{"vcsim-test-bridge"}, []containerNIC{{MAC: mac}}, pasta, []string{"--network", "vcsim-test-bridge", "--mac-address", mac}},
+		{"rootful default bridge", nil, []containerNIC{{MAC: mac}}, rootful, []string{"--mac-address", mac}},
+		{"rootless pasta", nil, []containerNIC{{MAC: mac}}, pasta, []string{"--network", "pasta:--ns-ifname,eth0,--ns-mac-addr," + mac}},
+		{"rootless without pasta", nil, []containerNIC{{MAC: mac}}, slirp, nil},
+		{"no NICs", nil, nil, pasta, nil},
+		{
+			"topology NICs in device-key order",
+			nil,
+			[]containerNIC{
+				{Network: "vcsim-wl-v10", MAC: mac, Name: "eth0"},
+				{Network: "vcsim-wl-v20", MAC: "00:50:56:00:00:01", Name: "eth1"},
+			},
+			pasta,
+			[]string{
+				"--network", "vcsim-wl-v10:mac=" + mac + ",interface_name=eth0",
+				"--network", "vcsim-wl-v20:mac=00:50:56:00:00:01,interface_name=eth1",
+			},
+		},
+		{
+			// Pasta is for the no-topology single NIC only: a domain network takes its MAC by name.
+			"topology NIC on rootless pasta",
+			nil,
+			[]containerNIC{{Network: "vcsim-wl-v10", MAC: mac, Name: "eth0"}},
+			pasta,
+			[]string{"--network", "vcsim-wl-v10:mac=" + mac + ",interface_name=eth0"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := networkArgs(tc.networks, tc.mac, tc.rt); !slices.Equal(got, tc.want) {
-				t.Errorf("networkArgs(%q, %q, %+v) = %q, want %q", tc.networks, tc.mac, tc.rt, got, tc.want)
+			if got := networkArgs(tc.networks, tc.nics, tc.rt); !slices.Equal(got, tc.want) {
+				t.Errorf("networkArgs(%q, %+v, %+v) = %q, want %q", tc.networks, tc.nics, tc.rt, got, tc.want)
 			}
 		})
 	}
