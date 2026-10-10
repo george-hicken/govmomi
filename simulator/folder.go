@@ -805,6 +805,10 @@ func (f *Folder) CreateDVSTask(ctx *Context, req *types.CreateDVS_Task) soap.Has
 			}
 		}
 
+		if fault := dvs.reconfigureHosts(ctx, spec.Host); fault != nil {
+			return nil, fault
+		}
+
 		return dvs.Reference(), nil
 	})
 
