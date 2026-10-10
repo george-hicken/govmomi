@@ -62,6 +62,10 @@ type Model struct {
 	// Autostart will power on Model created VMs when true
 	Autostart bool `json:"-"`
 
+	// Topology, when set, describes the underlays, routers and pNIC attachments beneath the inventory.
+	// It is loaded from the vcsim -topology file; the default (nil) keeps today's behaviour.
+	Topology *Topology `json:"-"`
+
 	// Datacenter specifies the number of Datacenter entities to create
 	// Name prefix: DC, vcsim flag: -dc
 	Datacenter int `json:"datacenter"`
