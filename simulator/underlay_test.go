@@ -294,3 +294,18 @@ func TestResolveVNICInventory(t *testing.T) {
 		})
 	}
 }
+
+func TestModelRouterSeamsNeedTopology(t *testing.T) {
+	m := VPX()
+	if err := m.Create(); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Remove()
+
+	if _, err := m.ListenRouter("gw", "127.0.0.1:0"); !errors.Is(err, ErrNoTopology) {
+		t.Errorf("ListenRouter without a topology: %v, want ErrNoTopology", err)
+	}
+	if _, err := m.DialRouter("gw", "127.0.0.1:0"); !errors.Is(err, ErrNoTopology) {
+		t.Errorf("DialRouter without a topology: %v, want ErrNoTopology", err)
+	}
+}
