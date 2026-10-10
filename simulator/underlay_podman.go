@@ -191,6 +191,9 @@ func (u *underlayRuntime) configureRouter(rt *routerInstance, spec *Router) erro
 			steps = append(steps, []string{"ip", "link", "set", "dev", dev, "mtu", strconv.Itoa(ifc.MTU)})
 		}
 		steps = append(steps, []string{"ip", "addr", "add", ifc.Address, "dev", dev})
+		for _, alias := range ifc.Aliases {
+			steps = append(steps, []string{"ip", "addr", "add", alias, "dev", dev})
+		}
 	}
 	if spec.Forward {
 		steps = append(steps, []string{"sysctl", "-q", "-w", "net.ipv4.ip_forward=1"})

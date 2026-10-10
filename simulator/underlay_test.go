@@ -91,6 +91,8 @@ func TestParseTopologyErrors(t *testing.T) {
 		{"router vlan out of range", "run: a\nunderlays: [{name: x}]\nrouters: [{name: r, interfaces: [{domain: x/v4095, address: 10.0.0.1/24}]}]\n", "range"},
 		{"router bad address", "run: a\nunderlays: [{name: x}]\nrouters: [{name: r, interfaces: [{domain: x/untagged, address: 10.0.0.1}]}]\n", "address"},
 		{"router no interfaces", "run: a\nrouters: [{name: r}]\n", "no interfaces"},
+		{"alias outside subnet", "run: a\nunderlays: [{name: x}]\nrouters: [{name: r, interfaces: [{domain: x/untagged, address: 10.0.2.2/24, aliases: [10.0.3.10/24]}]}]\n", "outside the subnet"},
+		{"alias bad", "run: a\nunderlays: [{name: x}]\nrouters: [{name: r, interfaces: [{domain: x/untagged, address: 10.0.2.2/24, aliases: [10.0.2.10]}]}]\n", "alias"},
 		{"bad route", "run: a\nunderlays: [{name: x}]\nrouters: [{name: r, interfaces: [{domain: x/untagged, address: 10.0.0.1/24}], routes: [{dest: nope, via: 10.0.0.2}]}]\n", "route dest"},
 		{"attachment unknown underlay", "run: a\nunderlays: [{name: x}]\nattachments: [{host: '*', pnic: vmnic1, underlay: y}]\n", "unknown underlay"},
 		{"attachment duplicate", "run: a\nunderlays: [{name: x}]\nattachments: [{host: h, pnic: vmnic1, underlay: x}, {host: h, pnic: vmnic1, underlay: x}]\n", "more than once"},
@@ -307,5 +309,12 @@ func TestModelRouterSeamsNeedTopology(t *testing.T) {
 	}
 	if _, err := m.DialRouter("gw", "127.0.0.1:0"); !errors.Is(err, ErrNoTopology) {
 		t.Errorf("DialRouter without a topology: %v, want ErrNoTopology", err)
+	}
+}
+
+func TestParseTopologyAliasInSubnet(t *testing.T) {
+	doc := "run: a\nunderlays: [{name: x}]\nrouters: [{name: r, interfaces: [{domain: x/untagged, address: 10.0.2.2/24, aliases: [10.0.2.10/24]}]}]\n"
+	if _, err := ParseTopology([]byte(doc)); err != nil {
+		t.Fatalf("alias in the interface's subnet: %v", err)
 	}
 }
