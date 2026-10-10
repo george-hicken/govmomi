@@ -16,13 +16,13 @@ import (
 )
 
 const (
-	// NetnsHelperEnv, when set, makes a process act as a netns helper on the socket it names.
-	// See ServeNetnsHelperFromEnv.
-	NetnsHelperEnv = "VCSIM_NETNS_HELPER"
+	// netnsHelperEnv, when set, makes a process act as a netns helper on the socket it names. The suffix keeps
+	// the name from being set by accident, since any binary that imports this package checks it at start-up.
+	netnsHelperEnv = "VCSIM_NETNS_HELPER_SOCKET_7f3a9c21"
 
 	// netnsOwnerEnv carries the PID of the process that owns the helper. The helper exits when that process does,
 	// so a crashed run does not leave a helper holding a router namespace open.
-	netnsOwnerEnv = "VCSIM_NETNS_OWNER"
+	netnsOwnerEnv = "VCSIM_NETNS_OWNER_7f3a9c21"
 
 	netnsDialTimeout = 10 * time.Second
 )
@@ -38,15 +38,19 @@ type netnsResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
-// ServeNetnsHelperFromEnv serves as a netns helper when NetnsHelperEnv is set and reports whether it did.
-// Any binary that the runtime may re-execute as a helper (vcsim, test binaries) calls it before anything else.
-func ServeNetnsHelperFromEnv() (bool, error) {
-	sock := os.Getenv(NetnsHelperEnv)
+// init makes any binary that imports this package a netns helper when the container runtime re-executes it as
+// one, before main or TestMain runs. Without the environment variable it does nothing.
+func init() {
+	sock := os.Getenv(netnsHelperEnv)
 	if sock == "" {
-		return false, nil
+		return
 	}
 	owner, _ := strconv.Atoi(os.Getenv(netnsOwnerEnv))
-	return true, ServeNetnsHelper(sock, owner)
+	if err := ServeNetnsHelper(sock, owner); err != nil {
+		fmt.Fprintln(os.Stderr, "netns helper:", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
 }
 
 // ServeNetnsHelper serves listen, dial and shutdown requests on a unix socket until it is told to shut

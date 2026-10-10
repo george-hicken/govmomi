@@ -26,18 +26,6 @@ import (
 	"github.com/vmware/govmomi/vim25/types"
 )
 
-// TestMain lets this test binary act as the netns helper: the runtime re-executes it inside a router namespace.
-func TestMain(m *testing.M) {
-	if served, err := ServeNetnsHelperFromEnv(); served {
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "netns helper:", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-	os.Exit(m.Run())
-}
-
 // Run with: go test -tags underlay_spike -run TestUnderlaySpike -v ./simulator/
 // Needs rootless podman, a local busybox:latest, and the ip, sysctl and nft binaries on the host.
 func TestUnderlaySpike(t *testing.T) {
