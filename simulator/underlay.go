@@ -66,6 +66,11 @@ type RouterInterface struct {
 	// Address is the interface address in CIDR form.
 	Address string `json:"address"`
 
+	// Aliases are further addresses in CIDR form on this interface, in Address's subnet. An endpoint on the
+	// domain, such as vCenter on the management subnet, is served from the router on an alias, so the
+	// domain's guests reach it by ARP (spec 954 D-954-03).
+	Aliases []string `json:"aliases,omitempty"`
+
 	// MTU overrides the domain MTU on this link. Zero keeps the domain MTU.
 	MTU int `json:"mtu,omitempty"`
 }
@@ -179,8 +184,18 @@ func (t *Topology) Validate() error {
 			if d.Segment == "" && !underlays[d.Underlay] {
 				return fmt.Errorf("router %q: domain %q: unknown underlay", r.Name, ifc.Domain)
 			}
-			if _, err := netip.ParsePrefix(ifc.Address); err != nil {
+			base, err := netip.ParsePrefix(ifc.Address)
+			if err != nil {
 				return fmt.Errorf("router %q: address %q: %w", r.Name, ifc.Address, err)
+			}
+			for _, alias := range ifc.Aliases {
+				a, err := netip.ParsePrefix(alias)
+				if err != nil {
+					return fmt.Errorf("router %q: alias %q: %w", r.Name, alias, err)
+				}
+				if !base.Masked().Contains(a.Addr()) {
+					return fmt.Errorf("router %q: alias %q: outside the subnet of %q", r.Name, alias, ifc.Address)
+				}
 			}
 			if err := checkMTU(ifc.MTU); err != nil {
 				return fmt.Errorf("router %q: %w", r.Name, err)
