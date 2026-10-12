@@ -5687,3 +5687,118 @@ func TestReconfigNICEditKeepsMAC(t *testing.T) {
 		}
 	})
 }
+
+// TestCreateVmWithLinkedChildDisk creates a VM whose disk is a linked child of
+// an existing parent disk, with no FileOperation, as vm-operator FastDeploy
+// does in linked mode. The child is created next to the VM.
+func TestCreateVmWithLinkedChildDisk(t *testing.T) {
+	ctx := context.Background()
+
+	model := ESX()
+	defer model.Remove()
+	if err := model.Create(); err != nil {
+		t.Fatal(err)
+	}
+
+	s := model.Service.NewServer()
+	defer s.Close()
+
+	c, err := govmomi.NewClient(ctx, s.URL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	finder := find.NewFinder(c.Client, false)
+	dc, err := finder.DefaultDatacenter(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finder.SetDatacenter(dc)
+
+	folders, err := dc.Folders(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ds, err := finder.DefaultDatastore(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hosts, err := finder.HostSystemList(ctx, "*/*")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pool, err := hosts[0].ResourcePool(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dm := object.NewVirtualDiskManager(c.Client)
+	parent := fmt.Sprintf("[%s] parent.vmdk", ds.Name())
+	task, err := dm.CreateVirtualDisk(ctx, parent, nil, &types.FileBackedVirtualDiskSpec{
+		VirtualDiskSpec: types.VirtualDiskSpec{
+			AdapterType: string(types.VirtualDiskAdapterTypeLsiLogic),
+			DiskType:    string(types.VirtualDiskTypeThin),
+		},
+		CapacityKb: 1024 * 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = task.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var devices object.VirtualDeviceList
+	scsi, err := devices.CreateSCSIController("lsilogic")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	child := fmt.Sprintf("[%s] child.vmdk", ds.Name())
+	dsRef := ds.Reference()
+	disk := devices.CreateDisk(scsi.(types.BaseVirtualController), dsRef, child)
+	disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo).Parent = &types.VirtualDiskFlatVer2BackingInfo{
+		VirtualDeviceFileBackingInfo: types.VirtualDeviceFileBackingInfo{
+			FileName:  parent,
+			Datastore: &dsRef,
+		},
+		DiskMode:        string(types.VirtualDiskModePersistent),
+		ThinProvisioned: types.NewBool(true),
+	}
+
+	vmSpec := types.VirtualMachineConfigSpec{
+		Name:     "test-vm-linked-child",
+		GuestId:  string(types.VirtualMachineGuestOsIdentifierOtherGuest),
+		Files:    &types.VirtualMachineFileInfo{VmPathName: fmt.Sprintf("[%s]", ds.Name())},
+		NumCPUs:  1,
+		MemoryMB: 128,
+		DeviceChange: []types.BaseVirtualDeviceConfigSpec{
+			&types.VirtualDeviceConfigSpec{
+				Operation: types.VirtualDeviceConfigSpecOperationAdd,
+				Device:    scsi,
+			},
+			&types.VirtualDeviceConfigSpec{
+				Operation: types.VirtualDeviceConfigSpecOperationAdd,
+				Device:    disk,
+			},
+		},
+	}
+
+	vmTask, err := folders.VmFolder.CreateVM(ctx, vmSpec, pool, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = vmTask.WaitForResult(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = dm.QueryVirtualDiskUuid(ctx, parent, nil); err != nil {
+		t.Errorf("parent disk not found: %s", err)
+	}
+	if _, err = dm.QueryVirtualDiskUuid(ctx, child, nil); err != nil {
+		t.Errorf("child disk not created: %s", err)
+	}
+}

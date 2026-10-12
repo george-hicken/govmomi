@@ -1951,7 +1951,19 @@ func (vm *VirtualMachine) configureDevice(
 				info.FileName = filename
 			}
 
-			desc, err := vdmCreateVirtualDisk(ctx, spec.FileOperation, &types.CreateVirtualDisk_Task{
+			op := spec.FileOperation
+			if parent != "" && op == "" {
+				// A child of a parent disk that does not exist yet is created,
+				// as vSphere does when a linked clone is deployed (vm-operator
+				// FastDeploy, linked mode, sets no FileOperation).
+				if p, fault := ctx.Map.FileManager().resolve(ctx, &dc.Self, info.FileName); fault == nil {
+					if _, err := os.Stat(p); os.IsNotExist(err) {
+						op = types.VirtualDeviceConfigSpecFileOperationCreate
+					}
+				}
+			}
+
+			desc, err := vdmCreateVirtualDisk(ctx, op, &types.CreateVirtualDisk_Task{
 				Datacenter: &dc.Self,
 				Name:       info.FileName,
 				Spec: &types.FileBackedVirtualDiskSpec{
