@@ -264,7 +264,8 @@ func (m *VirtualDiskManager) CopyVirtualDiskTask(ctx *Context, req *types.CopyVi
 		dest := vdmNames(req.DestName)
 
 		for i, name := range vdmNames(req.SourceName) {
-			if fault := m.copyDisk(ctx, req, name, dest[i]); fault != nil {
+			// vdmNames lists the backing file first and the descriptor second.
+			if fault := m.copyDisk(ctx, req, name, dest[i], i == 1); fault != nil {
 				return nil, fault
 			}
 		}
@@ -279,10 +280,10 @@ func (m *VirtualDiskManager) CopyVirtualDiskTask(ctx *Context, req *types.CopyVi
 	}
 }
 
-// copyDisk copies the disk name to dest and, when DestSpec is set, rewrites dest's
-// descriptor. dest's copy lock is held across both steps, so a racing copy cannot
-// rewrite the descriptor while this one reads it.
-func (m *VirtualDiskManager) copyDisk(ctx *Context, req *types.CopyVirtualDisk_Task, name, dest string) types.BaseMethodFault {
+// copyDisk copies the disk name to dest. When DestSpec is set and descriptor is true, it
+// also rewrites dest's descriptor. dest's copy lock is held across both steps, so a
+// racing copy cannot rewrite the descriptor while this one reads it.
+func (m *VirtualDiskManager) copyDisk(ctx *Context, req *types.CopyVirtualDisk_Task, name, dest string, descriptor bool) types.BaseMethodFault {
 	fm := ctx.Map.FileManager()
 
 	src, fault := fm.resolve(ctx, req.SourceDatacenter, name)
@@ -294,13 +295,16 @@ func (m *VirtualDiskManager) copyDisk(ctx *Context, req *types.CopyVirtualDisk_T
 		return fault
 	}
 
-	defer fm.lockDst(dst)()
+	l := fm.lockDst(dst)
+	defer l.Unlock()
 
-	if fault := fm.copyFile(src, dst, isTrue(req.Force)); fault != nil {
+	if fault := fm.copyFile(l, src, dst, isTrue(req.Force), req.DestSpec); fault != nil {
 		return fault
 	}
 
-	if req.DestSpec == nil {
+	// The backing file holds the disk's data, which a descriptor rewrite would overwrite
+	// with descriptor text, so only the descriptor is rewritten.
+	if req.DestSpec == nil || !descriptor {
 		return nil
 	}
 
@@ -362,6 +366,8 @@ func (m *VirtualDiskManager) copyDisk(ctx *Context, req *types.CopyVirtualDisk_T
 		return fault
 	}
 
+	// The rewrite changed dst, so the copy is recorded against dst's new state.
+	l.record(src, dst, req.DestSpec)
 	return nil
 }
 
