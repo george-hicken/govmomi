@@ -18,6 +18,7 @@ import (
 	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/session"
 	"github.com/vmware/govmomi/simulator"
+	"github.com/vmware/govmomi/vapi/internal"
 	"github.com/vmware/govmomi/vapi/library"
 	"github.com/vmware/govmomi/vapi/rest"
 	"github.com/vmware/govmomi/vapi/tags"
@@ -264,6 +265,96 @@ func TestLibraryItemOVFFilterAndDeployNetwork(t *testing.T) {
 		if backing.Port.PortgroupKey != dvpg.Reference().Value {
 			t.Errorf("NIC portgroup key = %q, want %q", backing.Port.PortgroupKey, dvpg.Reference().Value)
 		}
+	})
+}
+
+// TestLibraryClientURLHost checks that the publish URL and the upload and download endpoints
+// returned to a client use the Host the client sent, not the simulator's listen address,
+// so a guest reaching vCenter at another address can use them.
+func TestLibraryClientURLHost(t *testing.T) {
+	const host = "10.0.2.10:443"
+
+	simulator.Test(func(ctx context.Context, vc *vim25.Client) {
+		c := rest.NewClient(vc)
+		if err := c.Login(ctx, simulator.DefaultLogin); err != nil {
+			t.Fatal(err)
+		}
+		ds, err := find.NewFinder(vc).DefaultDatastore(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := library.NewManager(c)
+
+		// send issues a vAPI request with its Host header set to host.
+		send := func(r *rest.Resource, method string, in, out any) {
+			t.Helper()
+			req := r.Request(method, in)
+			req.Host = host
+			if err := c.Do(ctx, req, out); err != nil {
+				t.Fatal(err)
+			}
+		}
+		checkHost := func(what, uri string) {
+			t.Helper()
+			u, err := url.Parse(uri)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if u.Host != host {
+				t.Errorf("%s host = %q, want %q", what, u.Host, host)
+			}
+		}
+
+		published := true
+		var libID string
+		send(c.Resource(internal.LocalLibraryPath), http.MethodPost, struct {
+			Library library.Library `json:"create_spec"`
+		}{library.Library{
+			Name:        "example",
+			Type:        "LOCAL",
+			Storage:     []library.StorageBacking{{DatastoreID: ds.Reference().Value, Type: "DATASTORE"}},
+			Publication: &library.Publication{AuthenticationMethod: "NONE", Published: &published},
+		}}, &libID)
+
+		lib, err := m.GetLibraryByID(ctx, libID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if lib.Publication == nil {
+			t.Fatal("library has no publication info")
+		}
+		checkHost("publish_url", lib.Publication.PublishURL)
+
+		itemID, err := m.CreateLibraryItem(ctx, library.Item{Name: "ttylinux", Type: library.ItemTypeOVF, LibraryID: libID})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		upID, err := m.CreateLibraryItemUpdateSession(ctx, library.Session{LibraryItemID: itemID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var update library.UpdateFile
+		send(c.Resource(internal.LibraryItemUpdateSessionFile).WithID(upID).WithAction("add"), http.MethodPost, struct {
+			File library.UpdateFile `json:"file_spec"`
+		}{library.UpdateFile{Name: "ttylinux.ovf", SourceType: "PUSH"}}, &update)
+		if update.UploadEndpoint == nil {
+			t.Fatal("update file has no upload endpoint")
+		}
+		checkHost("upload endpoint", update.UploadEndpoint.URI)
+
+		dlID, err := m.CreateLibraryItemDownloadSession(ctx, library.Session{LibraryItemID: itemID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var download library.DownloadFile
+		send(c.Resource(internal.LibraryItemDownloadSessionFile).WithID(dlID).WithAction("prepare"), http.MethodPost, struct {
+			Name string `json:"file_name"`
+		}{"ttylinux.ovf"}, &download)
+		if download.DownloadEndpoint == nil {
+			t.Fatal("download file has no download endpoint")
+		}
+		checkHost("download endpoint", download.DownloadEndpoint.URI)
 	})
 }
 
