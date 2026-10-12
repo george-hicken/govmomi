@@ -768,6 +768,15 @@ func (s *handler) action(r *http.Request) string {
 	return r.URL.Query().Get("~action")
 }
 
+// clientHost returns the host the client used to reach the simulator, so URLs returned to it are reachable from its network.
+// The server's own listen address is only a fallback for requests without a Host.
+func (s *handler) clientHost(r *http.Request) string {
+	if r.Host != "" {
+		return r.Host
+	}
+	return s.URL.Host
+}
+
 func (s *handler) id(r *http.Request) string {
 	base := path.Base(r.URL.Path)
 	id := strings.TrimPrefix(base, "id:")
@@ -1144,7 +1153,7 @@ func (s *handler) library(w http.ResponseWriter, r *http.Request) {
 				// Generate PublishURL as real vCenter does
 				pub.PublishURL = (&url.URL{
 					Scheme: s.URL.Scheme,
-					Host:   s.URL.Host,
+					Host:   s.clientHost(r),
 					Path:   "/cls/vcsp/lib/" + id,
 				}).String()
 			}
@@ -2549,7 +2558,7 @@ func (s *handler) libraryItemUpdateSessionFileID(w http.ResponseWriter, r *http.
 			case "PUSH":
 				u := url.URL{
 					Scheme: s.URL.Scheme,
-					Host:   s.URL.Host,
+					Host:   s.clientHost(r),
 					Path:   path.Join(rest.Path, internal.LibraryItemFileData, id, info.Name),
 				}
 				info.UploadEndpoint = &library.TransferEndpoint{URI: u.String()}
@@ -2715,7 +2724,7 @@ func (s *handler) libraryItemDownloadSessionFileID(w http.ResponseWriter, r *htt
 		if s.decode(r, w, &spec) {
 			u := url.URL{
 				Scheme: s.URL.Scheme,
-				Host:   s.URL.Host,
+				Host:   s.clientHost(r),
 				Path:   path.Join(rest.Path, internal.LibraryItemFileData, id, spec.File),
 			}
 			info := &library.DownloadFile{
