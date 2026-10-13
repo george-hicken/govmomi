@@ -774,32 +774,32 @@ func (f *Folder) CreateDVSTask(ctx *Context, req *types.CreateDVS_Task) soap.Has
 			Parent:   folderEventArgument(&f.Folder),
 		})
 
-		dvs.AddDVPortgroupTask(ctx, &types.AddDVPortgroup_Task{
-			Spec: []types.DVPortgroupConfigSpec{{
-				Name:     dvs.uplinkPortgroupName(),
-				Type:     string(types.DistributedVirtualPortgroupPortgroupTypeEarlyBinding),
-				NumPorts: 1,
-				DefaultPortConfig: &types.VMwareDVSPortSetting{
-					Vlan: &types.VmwareDistributedVirtualSwitchTrunkVlanSpec{
-						VlanId: []types.NumericRange{{Start: 0, End: 4094}},
+		if fault := dvs.addDVPortgroups(ctx, []types.DVPortgroupConfigSpec{{
+			Name:     dvs.uplinkPortgroupName(),
+			Type:     string(types.DistributedVirtualPortgroupPortgroupTypeEarlyBinding),
+			NumPorts: 1,
+			DefaultPortConfig: &types.VMwareDVSPortSetting{
+				Vlan: &types.VmwareDistributedVirtualSwitchTrunkVlanSpec{
+					VlanId: []types.NumericRange{{Start: 0, End: 4094}},
+				},
+				UplinkTeamingPolicy: &types.VmwareUplinkPortTeamingPolicy{
+					Policy: &types.StringPolicy{
+						Value: "loadbalance_srcid",
 					},
-					UplinkTeamingPolicy: &types.VmwareUplinkPortTeamingPolicy{
-						Policy: &types.StringPolicy{
-							Value: "loadbalance_srcid",
-						},
-						ReversePolicy: &types.BoolPolicy{
-							Value: types.NewBool(true),
-						},
-						NotifySwitches: &types.BoolPolicy{
-							Value: types.NewBool(true),
-						},
-						RollingOrder: &types.BoolPolicy{
-							Value: types.NewBool(true),
-						},
+					ReversePolicy: &types.BoolPolicy{
+						Value: types.NewBool(true),
+					},
+					NotifySwitches: &types.BoolPolicy{
+						Value: types.NewBool(true),
+					},
+					RollingOrder: &types.BoolPolicy{
+						Value: types.NewBool(true),
 					},
 				},
-			}},
-		})
+			},
+		}}); fault != nil {
+			return nil, fault
+		}
 
 		if fault := dvs.reconfigureHosts(ctx, spec.Host); fault != nil {
 			return nil, fault
