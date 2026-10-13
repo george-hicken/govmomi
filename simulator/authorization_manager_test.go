@@ -169,6 +169,9 @@ func TestAuthorizationManagerAddRolePrivileges(t *testing.T) {
 			"Namespaces.Owner",
 			"Namespaces.View",
 			"Namespaces.ViewAdmissionPolicy",
+			// image-registry-operator's config/vsphere-auth/roles.yaml
+			"ContentLibrary.AddLibraryUsage",
+			"ContentLibrary.RemoveLibraryUsage",
 		}
 
 		if _, err := m.AddRole(ctx, "supervisor-role", privs); err != nil {
