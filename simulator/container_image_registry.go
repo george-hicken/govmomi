@@ -45,6 +45,7 @@ package simulator
 
 import (
 	"path"
+	"sort"
 	"strings"
 	"sync"
 
@@ -83,11 +84,17 @@ type ContainerImageEntry struct {
 const VMNameToken = "{vmname}"
 
 // extraConfigFor returns the entry's ExtraConfig as option values for the VM
-// named vmName, with VMNameToken expanded in each value.
+// named vmName, with VMNameToken expanded in each value, sorted by key.
 func (e ContainerImageEntry) extraConfigFor(vmName string) []types.BaseOptionValue {
+	keys := make([]string, 0, len(e.ExtraConfig))
+	for k := range e.ExtraConfig {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
 	var opts []types.BaseOptionValue
-	for k, v := range e.ExtraConfig {
-		opts = append(opts, &types.OptionValue{Key: k, Value: strings.ReplaceAll(v, VMNameToken, vmName)})
+	for _, k := range keys {
+		opts = append(opts, &types.OptionValue{Key: k, Value: strings.ReplaceAll(e.ExtraConfig[k], VMNameToken, vmName)})
 	}
 	return opts
 }

@@ -1412,15 +1412,37 @@ func (vm *VirtualMachine) create(ctx *Context, spec *types.VirtualMachineConfigS
 	// images without modifying the code under test. All ExtraConfig entries
 	// from the matched entry (including RUN.mountdmi, etc) are injected before
 	// the simVM is created.
+	// The registry options go to applyExtraConfig with the client's, for keys the client did not set,
+	// so an empty client ExtraConfig still gets them and the client wins on a shared key.
+	applied := spec
 	if e := ctx.Map.ContainerImages.resolve(vm); e.OCIImage != "" {
-		vm.Config.ExtraConfig = append(
-			vm.Config.ExtraConfig,
+		client := make(map[string]bool, len(spec.ExtraConfig))
+		for _, o := range spec.ExtraConfig {
+			client[o.GetOptionValue().Key] = true
+		}
+
+		registryOpts := append([]types.BaseOptionValue{
 			&types.OptionValue{Key: ContainerBackingOptionKey, Value: e.OCIImage},
-		)
-		vm.Config.ExtraConfig = append(vm.Config.ExtraConfig, e.extraConfigFor(vm.Config.Name)...)
+		}, e.extraConfigFor(vm.Config.Name)...)
+
+		copied := *spec
+		copied.ExtraConfig = slices.Clone(spec.ExtraConfig)
+		for _, o := range registryOpts {
+			if !client[o.GetOptionValue().Key] {
+				copied.ExtraConfig = append(copied.ExtraConfig, o)
+			}
+		}
+		applied = &copied
 	}
 
-	return vm.applyExtraConfig(ctx, spec)
+	if err := vm.applyExtraConfig(ctx, applied); err != nil {
+		return err
+	}
+
+	if register {
+		return nil
+	}
+	return ctx.Map.VMRules.apply(ctx, vm, VMRulePhaseCreate)
 }
 
 var vmwOUI = net.HardwareAddr([]byte{0x0, 0xc, 0x29})
@@ -2526,6 +2548,10 @@ func (c *powerVMTask) Run(task *Task) (types.AnyType, types.BaseMethodFault) {
 	case types.VirtualMachinePowerStatePoweredOn:
 		if c.VirtualMachine.hostInMM(c.ctx) {
 			return nil, new(types.InvalidState)
+		}
+
+		if fault := c.ctx.Map.VMRules.apply(c.ctx, c.VirtualMachine, VMRulePhasePowerOn); fault != nil {
+			return nil, fault
 		}
 
 		err := c.svm.start(c.ctx)
