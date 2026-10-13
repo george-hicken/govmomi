@@ -200,18 +200,28 @@ func (f *FileManager) DiskDescriptor(ctx *Context, dc *types.ManagedObjectRefere
 	return desc, path, nil
 }
 
+// SaveDiskDescriptor writes desc over path through a temporary file renamed into place, so a reader sees
+// the old descriptor or the new one, never a partial write.
 func (f *FileManager) SaveDiskDescriptor(ctx *Context, desc *vmdk.Descriptor, path string) types.BaseMethodFault {
-	file, err := os.Create(path)
+	tmp := path + ".tmp"
+	file, err := os.Create(tmp)
 	if err != nil {
 		return f.fault(path, err, new(types.FileFault))
 	}
 
 	if err = desc.Write(file); err != nil {
 		_ = file.Close()
+		_ = os.Remove(tmp)
 		return f.fault(path, err, new(types.FileFault))
 	}
 
 	if err = file.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return f.fault(path, err, new(types.FileFault))
+	}
+
+	if err = os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
 		return f.fault(path, err, new(types.FileFault))
 	}
 

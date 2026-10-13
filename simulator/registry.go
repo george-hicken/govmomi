@@ -77,10 +77,14 @@ type Registry struct {
 	tagManager tagManager
 
 	// ContainerImages maps VM config attributes to OCI container images.
-	// It is consulted during PowerOn to enable container-backed simulation
+	// It is consulted at VM create to enable container-backed simulation
 	// without requiring modifications to the code under test.
 	// See ContainerImageRegistry for details and usage examples.
 	ContainerImages ContainerImageRegistry
+
+	// VMRules are applied at VM create and power-on, after the client's spec.
+	// See VMRule for details.
+	VMRules VMRules
 
 	// underlay realises the Model's Topology. It is nil when no topology is loaded.
 	underlay *underlayRuntime
