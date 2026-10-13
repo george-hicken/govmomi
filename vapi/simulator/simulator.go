@@ -2368,7 +2368,9 @@ func (s *handler) libraryItemUpdateSessionID(w http.ResponseWriter, r *http.Requ
 		case "complete":
 			go func() {
 				up.Wait() // wait for any PULL sources to complete
+				s.Lock()
 				done("DONE")
+				s.Unlock()
 				s.itemChanged(changeUpdate, &library.Item{ID: session.LibraryItemID, LibraryID: up.Library.ID})
 			}()
 		case "fail":
@@ -2511,7 +2513,7 @@ func (s *handler) pullSource(up update, info *library.UpdateFile) {
 		return
 	}
 
-	err = s.libraryItemFileCreate(&up, info.Name, res.Body, info.Checksum)
+	err = s.libraryItemFileCreate(&up, info.Name, res.Body, info.Checksum, false)
 	done(err)
 }
 
@@ -2784,9 +2786,20 @@ func (s *handler) libraryItemFileCreate(
 	up *update,
 	dstFileName string,
 	body io.ReadCloser,
-	cs *library.Checksum) error {
+	cs *library.Checksum,
+	locked bool) error {
 
 	defer body.Close()
+
+	// commit updates the library item. Callers serving a request already hold the handler lock,
+	// while pullSource does not, and must not hold it while streaming the source body.
+	commit := func(update func(i *item)) {
+		if !locked {
+			s.Lock()
+			defer s.Unlock()
+		}
+		update(s.Library[up.Library.ID].Item[up.Session.LibraryItemID])
+	}
 
 	if !isValidFileName(dstFileName) {
 		return errors.New("invalid file name")
@@ -2852,8 +2865,9 @@ func (s *handler) libraryItemFileCreate(
 		}
 
 		// Update the library item with the uploaded file.
-		i := s.Library[up.Library.ID].Item[up.Session.LibraryItemID]
-		i.File = append(i.File, f)
+		commit(func(i *item) {
+			i.File = append(i.File, f)
+		})
 		return nil
 	}
 
@@ -2907,8 +2921,9 @@ func (s *handler) libraryItemFileCreate(
 	}
 
 	// Update the library item with the uploaded files.
-	i := s.Library[up.Library.ID].Item[up.Session.LibraryItemID]
-	i.File = files
+	commit(func(i *item) {
+		i.File = files
+	})
 
 	return nil
 }
@@ -2950,7 +2965,7 @@ func (s *handler) libraryItemFileData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := s.libraryItemFileCreate(up, name, r.Body, nil)
+	err := s.libraryItemFileCreate(up, name, r.Body, nil, true)
 	if err != nil {
 		s.error(w, err)
 	}
