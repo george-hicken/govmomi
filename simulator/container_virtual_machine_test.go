@@ -19,6 +19,7 @@ import (
 
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/test"
 	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/mo"
@@ -288,4 +289,31 @@ func TestContainerVMToolsStatus(t *testing.T) {
 
 	powerOff(t, env, vm)
 	requireTools(t, types.VirtualMachineToolsStatusToolsNotRunning, types.VirtualMachineToolsRunningStatusGuestToolsNotRunning)
+}
+
+// TestVMRulePowerOnStartsContainer checks that a powerOn VMRule patching RUN.container starts the container.
+func TestVMRulePowerOnStartsContainer(t *testing.T) {
+	if !test.HasDocker() {
+		t.Skip("requires docker or podman (aliased as docker) on linux")
+	}
+
+	patch := &types.VirtualMachineConfigSpec{ExtraConfig: []types.BaseOptionValue{
+		&types.OptionValue{Key: ContainerBackingOptionKey, Value: testContainerCmd},
+	}}
+	require.NoError(t, test.ApplyContainerRuntimeDefaults(patch))
+
+	env := newVCSIMEnv(t)
+	require.NoError(t, env.simCtx.Map.VMRules.Add(VMRule{
+		Name:   "start-container",
+		Phases: []VMRulePhase{VMRulePhasePowerOn},
+		Match:  ObjectMatch{Include: property.Match{"name": "rule-container"}},
+		Patch:  patch,
+	}))
+
+	vmObj, vm := ruleVM(t, env, "rule-container")
+	name := env.simCtx.Map.containerName(vm.Name, vm.uid.String())
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", name).Run() })
+
+	powerOn(t, env, vmObj)
+	require.True(t, containerRunning(name))
 }
