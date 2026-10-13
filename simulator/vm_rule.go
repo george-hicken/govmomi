@@ -7,6 +7,7 @@ package simulator
 import (
 	"fmt"
 	"log"
+	"os"
 	"reflect"
 	"slices"
 	"sort"
@@ -213,11 +214,14 @@ func (s *VMRules) apply(ctx *Context, vm *VirtualMachine, phase VMRulePhase) typ
 		var keys []string
 		for _, o := range rule.Patch.ExtraConfig {
 			opt := o.GetOptionValue()
-			value, _ := opt.Value.(string)
-			spec.ExtraConfig = append(spec.ExtraConfig, &types.OptionValue{
-				Key:   opt.Key,
-				Value: strings.ReplaceAll(value, VMNameToken, vm.Config.Name),
-			})
+			raw, _ := opt.Value.(string)
+			value := strings.ReplaceAll(raw, VMNameToken, vm.Config.Name)
+			if err := createVMNameVolumeHost(opt.Key, raw, value); err != nil {
+				return &types.GenericVmConfigFault{
+					Reason: fmt.Sprintf("vcsim VMRule %q (%s) on VM %q: %s: %s", rule.Name, phase, vm.Config.Name, opt.Key, err),
+				}
+			}
+			spec.ExtraConfig = append(spec.ExtraConfig, &types.OptionValue{Key: opt.Key, Value: value})
 			keys = append(keys, opt.Key)
 		}
 		sort.Strings(keys)
@@ -239,4 +243,23 @@ func hasExtraConfigKey(vm *VirtualMachine, key string) bool {
 		}
 	}
 	return false
+}
+
+// createVMNameVolumeHost creates the host directory of a RUN.volume.* value whose host path names
+// VMNameToken, so the bind mount has a source for each VM. raw is the rule's value and expanded the value
+// with the token replaced. Podman does not create bind-mount sources, and nothing else would create a
+// directory named per VM. A host path without the token is left alone.
+func createVMNameVolumeHost(key, raw, expanded string) error {
+	if !strings.HasPrefix(key, "RUN.volume.") {
+		return nil
+	}
+	rawHost, _, _ := strings.Cut(raw, ":")
+	if !strings.Contains(rawHost, VMNameToken) {
+		return nil
+	}
+	host, _, _ := strings.Cut(expanded, ":")
+	if err := os.MkdirAll(host, 0o700); err != nil {
+		return fmt.Errorf("create volume host directory %q: %w", host, err)
+	}
+	return nil
 }

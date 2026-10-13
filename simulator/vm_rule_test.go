@@ -5,6 +5,8 @@
 package simulator
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -330,4 +332,58 @@ func TestExplainVM(t *testing.T) {
 	vmNamed(t, reg, "DC0_H0_VM1").Name = "dup"
 	_, err = reg.VMRules.ExplainVM(reg, "dup", VMRulePhaseCreate)
 	assert.EqualError(t, err, `vcsim: 2 VirtualMachines named "dup"`)
+}
+
+func TestVMRuleVMNameVolumeHostCreate(t *testing.T) {
+	env := newVCSIMEnv(t)
+	root := t.TempDir()
+	require.NoError(t, env.simCtx.Map.VMRules.Add(VMRule{
+		Name:   "volume-create",
+		Phases: []VMRulePhase{VMRulePhaseCreate},
+		Match:  ObjectMatch{Include: property.Match{"name": "rule-volume-create"}},
+		Patch: &types.VirtualMachineConfigSpec{ExtraConfig: []types.BaseOptionValue{
+			&types.OptionValue{Key: "RUN.volume.varlog", Value: filepath.Join(root, "{vmname}") + ":/var/log"},
+		}},
+	}))
+
+	ruleVM(t, env, "rule-volume-create")
+	assert.DirExists(t, filepath.Join(root, "rule-volume-create"))
+}
+
+func TestVMRuleVMNameVolumeHostPowerOn(t *testing.T) {
+	env := newVCSIMEnv(t)
+	root := t.TempDir()
+	require.NoError(t, env.simCtx.Map.VMRules.Add(VMRule{
+		Name:   "volume-power",
+		Phases: []VMRulePhase{VMRulePhasePowerOn},
+		Match:  ObjectMatch{Include: property.Match{"name": "rule-volume-power"}},
+		Patch: &types.VirtualMachineConfigSpec{ExtraConfig: []types.BaseOptionValue{
+			&types.OptionValue{Key: "RUN.volume.varlog", Value: filepath.Join(root, "{vmname}") + ":/var/log"},
+		}},
+	}))
+
+	vmObj, _ := ruleVM(t, env, "rule-volume-power")
+	assert.NoDirExists(t, filepath.Join(root, "rule-volume-power"))
+	powerOn(t, env, vmObj)
+	assert.DirExists(t, filepath.Join(root, "rule-volume-power"))
+}
+
+func TestVMRuleVMNameVolumeHostError(t *testing.T) {
+	env := newVCSIMEnv(t)
+	root := t.TempDir()
+	blocker := filepath.Join(root, "blocker")
+	require.NoError(t, os.WriteFile(blocker, nil, 0o600))
+	require.NoError(t, env.simCtx.Map.VMRules.Add(VMRule{
+		Name:   "volume-blocked",
+		Phases: []VMRulePhase{VMRulePhaseCreate},
+		Match:  ObjectMatch{Include: property.Match{"name": "rule-volume-blocked"}},
+		Patch: &types.VirtualMachineConfigSpec{ExtraConfig: []types.BaseOptionValue{
+			&types.OptionValue{Key: "RUN.volume.varlog", Value: filepath.Join(blocker, "{vmname}") + ":/var/log"},
+		}},
+	}))
+
+	_, err := createRuleVMRef(env, "rule-volume-blocked")
+	fault := ruleFault(t, err)
+	assert.Contains(t, fault.Reason, "volume-blocked")
+	assert.Contains(t, fault.Reason, "RUN.volume.varlog")
 }
