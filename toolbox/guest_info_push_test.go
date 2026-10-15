@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -364,5 +365,133 @@ func TestGuestRPCPing(t *testing.T) {
 	p, err = ReadGuestRPCPacket(&buf)
 	if err != nil || p.Type != GuestRPCPacketData || string(p.Payload) != "ping" || !p.FastClose {
 		t.Errorf("data read as %+v, %v", p, err)
+	}
+}
+
+// fakeGuestNIC replaces the guest's NICs with eth0, whose addresses are
+// addrs(n) on the n-th query. It returns the number of queries so far.
+func fakeGuestNIC(t *testing.T, addrs func(n int32) []net.Addr) *atomic.Int32 {
+	t.Helper()
+	var queries atomic.Int32
+	savedIfs, savedAddrs := netInterfaces, ifaceAddrs
+	netInterfaces = func() ([]net.Interface, error) {
+		mac := net.HardwareAddr{0x00, 0x50, 0x56, 0x00, 0x00, 0x01}
+		return []net.Interface{{Name: "eth0", Flags: net.FlagUp, HardwareAddr: mac}}, nil
+	}
+	ifaceAddrs = func(net.Interface) ([]net.Addr, error) {
+		return addrs(queries.Add(1)), nil
+	}
+	t.Cleanup(func() { netInterfaces, ifaceAddrs = savedIfs, savedAddrs })
+	return &queries
+}
+
+// nicReportAddrs returns the addresses carried by each NIC report in reqs,
+// in order, with the requests that are not NIC reports skipped.
+func nicReportAddrs(t *testing.T, reqs [][]byte) [][]string {
+	t.Helper()
+	prefix := string(GuestInfoCommand(GuestInfoIPAddressV2, nil))
+	var reports [][]string
+	for _, r := range reqs {
+		payload, ok := bytes.CutPrefix(r, []byte(prefix))
+		if !ok {
+			continue
+		}
+		var info GuestNicInfo
+		if err := DecodeXDR(payload, &info); err != nil {
+			t.Fatal(err)
+		}
+		var addrs []string
+		for _, nic := range info.V3.Nics {
+			for _, e := range nic.IPs {
+				addrs = append(addrs, e.Address.IP().String())
+			}
+		}
+		reports = append(reports, addrs)
+	}
+	return reports
+}
+
+func TestServiceGuestInfoRetriesUntilIPv4(t *testing.T) {
+	setHostname(t, "guest")
+	linkLocal := &net.IPNet{IP: net.ParseIP("fe80::250:56ff:fe00:1"), Mask: net.CIDRMask(64, 128)}
+	dhcp := &net.IPNet{IP: net.ParseIP("10.0.2.101"), Mask: net.CIDRMask(24, 32)}
+
+	// As at boot, eth0 has only its IPv6 link-local address for the first
+	// gather, and its IPv4 address appears after that.
+	queries := fakeGuestNIC(t, func(n int32) []net.Addr {
+		if n == 1 {
+			return []net.Addr{linkLocal}
+		}
+		return []net.Addr{linkLocal, dhcp}
+	})
+	savedInterval := guestInfoRetryInterval
+	guestInfoRetryInterval = 10 * time.Millisecond
+	t.Cleanup(func() { guestInfoRetryInterval = savedInterval })
+
+	out := &recordingChannelOut{reply: rpciOK, sent: make(chan struct{}, 16)}
+	s := NewService(new(mockChannelIn), out)
+	// The interval is long enough that only the retry can send the IPv4 report.
+	s.GuestInfoInterval = time.Hour
+
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	var reqs [][]byte
+	timeout := time.After(5 * time.Second)
+	for !slices.ContainsFunc(nicReportAddrs(t, reqs), func(a []string) bool { return slices.Contains(a, "10.0.2.101") }) {
+		select {
+		case <-out.sent:
+			reqs = append(reqs, out.take()...)
+		case <-timeout:
+			t.Fatalf("no NIC report with an IPv4 address sent; requests %q", reqs)
+		}
+	}
+
+	// Once the VMX has accepted the IPv4 report, gathering stops.
+	stopped := queries.Load()
+	time.Sleep(100 * time.Millisecond)
+	if n := queries.Load(); n != stopped {
+		t.Errorf("gathers continued after the IPv4 report: %d queries, then %d", stopped, n)
+	}
+
+	s.Stop()
+	s.Wait()
+	reqs = append(reqs, out.take()...)
+
+	reports := nicReportAddrs(t, reqs)
+	if want := [][]string{{"fe80::250:56ff:fe00:1"}, {"fe80::250:56ff:fe00:1", "10.0.2.101"}}; !reflect.DeepEqual(reports, want) {
+		t.Errorf("NIC reports %v, want %v", reports, want)
+	}
+}
+
+func TestServiceGuestInfoRetryWindow(t *testing.T) {
+	setHostname(t, "guest")
+	linkLocal := &net.IPNet{IP: net.ParseIP("fe80::250:56ff:fe00:1"), Mask: net.CIDRMask(64, 128)}
+	queries := fakeGuestNIC(t, func(int32) []net.Addr { return []net.Addr{linkLocal} })
+
+	savedInterval, savedWindow := guestInfoRetryInterval, guestInfoRetryWindow
+	guestInfoRetryInterval, guestInfoRetryWindow = 5*time.Millisecond, 50*time.Millisecond
+	t.Cleanup(func() { guestInfoRetryInterval, guestInfoRetryWindow = savedInterval, savedWindow })
+
+	out := &recordingChannelOut{reply: rpciOK}
+	s := NewService(new(mockChannelIn), out)
+	s.GuestInfoInterval = time.Hour
+
+	if err := s.Start(); err != nil {
+		t.Fatal(err)
+	}
+	// Without an IPv4 address the retry runs for its window, then stops.
+	time.Sleep(150 * time.Millisecond)
+	ended := queries.Load()
+	time.Sleep(100 * time.Millisecond)
+	if n := queries.Load(); n != ended {
+		t.Errorf("gathers continued after the retry window: %d queries, then %d", ended, n)
+	}
+	s.Stop()
+	s.Wait()
+
+	if ended < 2 {
+		t.Errorf("%d gathers in the retry window, want retries", ended)
 	}
 }
