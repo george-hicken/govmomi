@@ -610,7 +610,7 @@ func (svm *simVM) start(ctx *Context) error {
 
 	// Sync network config, retrying a few times to allow the container to get an IP
 	// Container runtimes may take a moment to assign an IP address after start
-	for range 5 {
+	for range ContainerIPAttempts {
 		if err = svm.syncNetworkConfigToVMGuestProperties(ctx, nil, nil); err != nil {
 			log.Printf("%s inspect %s: %s", svm.vm.Name, svm.c.id, err)
 			break
@@ -618,7 +618,7 @@ func (svm *simVM) start(ctx *Context) error {
 		if svm.vm.Guest.IpAddress != "" {
 			break
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(ContainerIPInterval)
 	}
 
 	callback := func(callbackCtx *Context, out []byte, details *containerDetails, c *container) error {

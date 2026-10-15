@@ -182,7 +182,7 @@ func (t *Task) Wait() {
 	}
 
 	for isRunning() {
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(TaskWaitPoll)
 	}
 }
 

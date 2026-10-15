@@ -10,7 +10,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"path"
@@ -1070,7 +1069,7 @@ func (dc *DelayConfig) delay(method string) {
 		d += md
 	}
 	if dc.DelayJitter > 0 {
-		d += int(rand.NormFloat64() * dc.DelayJitter * float64(d))
+		d += int(normFloat64() * dc.DelayJitter * float64(d))
 	}
 	if d > 0 {
 		//fmt.Printf("Delaying method %s %d ms\n", method, d)
