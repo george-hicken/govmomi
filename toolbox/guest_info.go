@@ -164,6 +164,7 @@ func GuestInfoCommand(kind int, req []byte) []byte {
 
 var (
 	netInterfaces = net.Interfaces
+	ifaceAddrs    = func(i net.Interface) ([]net.Addr, error) { return i.Addrs() }
 	maxNics       = 16 // guestRpc/nicinfo.x:NICINFO_MAX_NICS
 
 	hostname     = os.Hostname
@@ -211,7 +212,7 @@ func DefaultGuestNicInfo() *GuestNicInfo {
 		}
 
 		// #nosec: Errors unhandled
-		addrs, _ := i.Addrs()
+		addrs, _ := ifaceAddrs(i)
 
 		if len(addrs) == 0 {
 			continue // Not useful from outside the guest without an IP

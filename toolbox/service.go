@@ -33,6 +33,15 @@ const (
 	DefaultGuestInfoInterval = 30 * time.Second
 )
 
+// guestInfoRetryInterval is how often guest info is gathered after start until
+// the VMX accepts a NIC report with a global IPv4 address, as the guest's
+// address may not be configured yet when the Service starts.
+// guestInfoRetryWindow bounds that retry.
+var (
+	guestInfoRetryInterval = time.Second
+	guestInfoRetryWindow   = 60 * time.Second
+)
+
 var (
 	capabilities = []string{
 		// Without tools.set.version, the UI reports Tools are "running", but "not installed"
@@ -196,12 +205,26 @@ func (s *Service) Start() error {
 
 		// Guest info is gathered on this goroutine, as vmtoolsd gathers on
 		// its main loop, so that requests on s.out are never concurrent.
-		var gather <-chan time.Time
+		var gather, retry, retryEnd <-chan time.Time
+		var retryTicker *time.Ticker
+		stopRetry := func() {
+			if retryTicker != nil {
+				retryTicker.Stop()
+			}
+			retry, retryEnd = nil, nil
+		}
+		defer stopRetry()
+
 		if s.GuestInfoInterval > 0 {
 			ticker := time.NewTicker(s.GuestInfoInterval)
 			defer ticker.Stop()
 			gather = ticker.C
-			s.gatherGuestInfo()
+
+			if !s.gatherGuestInfo() {
+				retryTicker = time.NewTicker(guestInfoRetryInterval)
+				retry = retryTicker.C
+				retryEnd = time.After(guestInfoRetryWindow)
+			}
 		}
 
 		for {
@@ -209,6 +232,12 @@ func (s *Service) Start() error {
 			case <-s.stop:
 				s.stopChannel()
 				return
+			case <-retry:
+				if s.gatherGuestInfo() {
+					stopRetry()
+				}
+			case <-retryEnd:
+				stopRetry()
 			case <-gather:
 				s.gatherGuestInfo()
 			case <-time.After(time.Millisecond * 10 * s.delay):
@@ -387,8 +416,9 @@ func (s *Service) SendGuestInfo() {
 // gatherGuestInfo sends each guest info value that has changed since the VMX
 // last accepted it, as guestInfoServer.c GuestInfoGather and
 // GuestInfoUpdateVMX do. A value the VMX does not accept is retried at the
-// next gather.
-func (s *Service) gatherGuestInfo() {
+// next gather. It reports whether the VMX has accepted a NIC report with a
+// global IPv4 address, now or before.
+func (s *Service) gatherGuestInfo() bool {
 	if name, err := hostname(); err != nil {
 		log.Printf("gather guest info: hostname: %s", err)
 	} else {
@@ -397,28 +427,48 @@ func (s *Service) gatherGuestInfo() {
 		s.updateGuestInfo(GuestInfoDNSName, append([]byte(name), 0))
 	}
 
-	nics, err := EncodeXDR(DefaultGuestNicInfo())
+	info := DefaultGuestNicInfo()
+	nics, err := EncodeXDR(info)
 	if err != nil {
 		log.Printf("gather guest info: nicinfo: %s", err)
-		return
+		return false
 	}
-	s.updateGuestInfo(GuestInfoIPAddressV2, nics)
+	return s.updateGuestInfo(GuestInfoIPAddressV2, nics) && hasGlobalIPv4(info)
 }
 
-func (s *Service) updateGuestInfo(kind int, value []byte) {
+// hasGlobalIPv4 reports whether info has an IPv4 address that is neither
+// loopback nor link-local.
+func hasGlobalIPv4(info *GuestNicInfo) bool {
+	if info.V3 == nil {
+		return false
+	}
+	for _, nic := range info.V3.Nics {
+		for _, e := range nic.IPs {
+			if ip := e.Address.IP(); ip != nil && ip.To4() != nil && ip.IsGlobalUnicast() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// updateGuestInfo sends value as the guest info kind unless the VMX already
+// accepted it. It reports whether the VMX has accepted value.
+func (s *Service) updateGuestInfo(kind int, value []byte) bool {
 	if last, ok := s.guestInfo[kind]; ok && bytes.Equal(last, value) {
-		return
+		return true
 	}
 
 	if _, err := s.out.Request(GuestInfoCommand(kind, value)); err != nil {
 		log.Printf("SetGuestInfo %d: %s", kind, err)
-		return
+		return false
 	}
 
 	if s.guestInfo == nil {
 		s.guestInfo = make(map[int][]byte)
 	}
 	s.guestInfo[kind] = value
+	return true
 }
 
 // reportVersion sends the version guest variables vmtoolsd sends when it
