@@ -13,6 +13,11 @@ func buildToolbox() (string, error) {
 	return "", errors.New("toolbox build: only supported on linux")
 }
 
+// VmciToolboxBinary fails: the toolbox binary is only built on linux hosts.
+func VmciToolboxBinary() (string, error) {
+	return buildToolbox()
+}
+
 // VmciToolboxBinaryPath returns "": the toolbox binary is only built on linux hosts.
 func VmciToolboxBinaryPath() string {
 	return ""
