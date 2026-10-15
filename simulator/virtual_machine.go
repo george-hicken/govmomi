@@ -3850,9 +3850,8 @@ func (vm *VirtualMachine) PromoteDisksTask(ctx *Context, req *types.PromoteDisks
 			}
 		}
 
-		// Built-in default delay. `simulator.TaskDelay` can be used to add additional time
-		// Translates to roughly 1s per 1GB
-		sleep := time.Duration(cap/units.MB) * time.Millisecond
+		// Built-in default delay, roughly 1s per GiB (PromoteDisksPerGiB). `simulator.TaskDelay` can be used to add additional time
+		sleep := promoteDelay(cap)
 		if sleep > 0 {
 			log.Printf("%s: sleep %s for %s", t.Info.DescriptionId, sleep, units.ByteSize(cap))
 			time.Sleep(sleep)
