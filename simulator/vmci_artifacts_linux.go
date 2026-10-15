@@ -80,14 +80,22 @@ func goBuildToolbox() (string, error) {
 	return path, nil
 }
 
-// VmciToolboxBinaryPath returns the host path of the toolbox binary that vcsim
+// VmciToolboxBinary returns the host path of the toolbox binary that vcsim
 // mounts at /usr/bin/vmware-rpctool in container-backed VMs with RUN.vmci=true,
-// building it on first use. It returns "" if the build failed.
+// building it on first use. A caller that must not run without the toolbox
+// should use this rather than VmciToolboxBinaryPath, since the error is the
+// only way to learn that the build failed.
+func VmciToolboxBinary() (string, error) {
+	return buildToolbox()
+}
+
+// VmciToolboxBinaryPath returns the host path of the toolbox binary, as
+// VmciToolboxBinary does, or "" if the build failed.
 //
 // A caller whose guest runs vmtoolsd can mount the same binary in its place:
 //
 //	"RUN.volume.vmtoolsd": simulator.VmciToolboxBinaryPath() + ":/usr/bin/vmtoolsd:ro"
 func VmciToolboxBinaryPath() string {
-	path, _ := buildToolbox()
+	path, _ := VmciToolboxBinary()
 	return path
 }
