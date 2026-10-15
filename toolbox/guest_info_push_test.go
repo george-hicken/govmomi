@@ -473,12 +473,26 @@ func TestServiceGuestInfoRetryWindow(t *testing.T) {
 	if err := s.Start(); err != nil {
 		t.Fatal(err)
 	}
-	// Without an IPv4 address the retry gathers until its window passes, then
-	// stops. A retry that never stops keeps the count moving, and settle fails.
+	since := time.Now()
+	// Without an IPv4 address the retry gathers until its window passes.
 	waitFor(t, "retry gathers", func() bool { return queries.Load() >= 2 })
-	settle(t, queries, 10*s.GuestInfoRetryInterval)
+	assertGathersStopped(t, queries, since, s.GuestInfoRetryWindow)
 	s.Stop()
 	s.Wait()
+}
+
+// assertGathersStopped waits until three and then four times d have passed
+// since since, and fails if a gather happens in between. Sampling only after
+// the window has passed is what shows a retry that failed to stop: such a
+// retry keeps gathering every interval, so the count moves in that span.
+func assertGathersStopped(t *testing.T, queries *atomic.Int32, since time.Time, d time.Duration) {
+	t.Helper()
+	waitFor(t, "the window to pass", func() bool { return time.Since(since) > 3*d })
+	before := queries.Load()
+	waitFor(t, "a further window to pass", func() bool { return time.Since(since) > 4*d })
+	if n := queries.Load(); n != before {
+		t.Errorf("gathers continued after the window: %d queries, then %d", before, n)
+	}
 }
 
 // TestServiceGuestInfoRetryDisabled checks that the retry needs both fields
@@ -508,9 +522,12 @@ func TestServiceGuestInfoRetryDisabled(t *testing.T) {
 			if err := s.Start(); err != nil {
 				t.Fatal(err)
 			}
+			since := time.Now()
 			waitFor(t, "initial gather", func() bool { return queries.Load() >= 1 })
-			if got := settle(t, queries, 50*time.Millisecond); got != 1 {
-				t.Errorf("%d gathers, want only the initial one", got)
+			// 50 ms is the window of the window-only case, so the other cases wait as long.
+			assertGathersStopped(t, queries, since, 50*time.Millisecond)
+			if n := queries.Load(); n != 1 {
+				t.Errorf("%d gathers, want only the initial one", n)
 			}
 			s.Stop()
 			s.Wait()
