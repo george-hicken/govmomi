@@ -81,6 +81,8 @@ func main() {
 		service.Power.Reboot.Handler = toolbox.Reboot
 	}
 
+	// The guest journal's record of the retry in effect, so that a run shows which toolbox and settings ran.
+	log.Printf("guest info retry: interval %s window %s", service.GuestInfoRetryInterval, service.GuestInfoRetryWindow)
 	if err := service.Start(); err != nil {
 		log.Fatal(err)
 	}
@@ -97,8 +99,9 @@ func main() {
 }
 
 // envDuration returns the duration in the environment variable name, or zero
-// when it is unset. A value that does not parse is fatal, so that a mistyped
-// retry setting does not silently leave the retry off.
+// when it is unset or does not parse. It runs for every mode, so a bad value is
+// logged and ignored rather than fatal: a one-shot --cmd must not die on a
+// daemon-only setting. A typo in a flag is still fatal, in flag.Parse.
 func envDuration(name string) time.Duration {
 	v := os.Getenv(name)
 	if v == "" {
@@ -106,7 +109,8 @@ func envDuration(name string) time.Duration {
 	}
 	d, err := time.ParseDuration(v)
 	if err != nil {
-		log.Fatalf("%s: %s", name, err)
+		log.Printf("%s: ignored, not a duration: %s", name, err)
+		return 0
 	}
 	return d
 }
