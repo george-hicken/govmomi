@@ -800,6 +800,9 @@ func (f *Folder) CreateDVSTask(ctx *Context, req *types.CreateDVS_Task) soap.Has
 		}})
 
 		if uplinkPg := dvs.uplinkPortgroup(ctx); uplinkPg != nil {
+			// vCenter marks a DVS's uplink portgroup with config.uplink; clients
+			// use it to tell the uplinks apart from ordinary DVPGs.
+			uplinkPg.Config.Uplink = types.NewBool(true)
 			if config, ok := dvs.Config.(*types.VMwareDVSConfigInfo); ok {
 				config.UplinkPortgroup = []types.ManagedObjectReference{uplinkPg.Reference()}
 			}
