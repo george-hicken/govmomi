@@ -424,14 +424,12 @@ func TestServiceGuestInfoRetriesUntilIPv4(t *testing.T) {
 		}
 		return []net.Addr{linkLocal, dhcp}
 	})
-	savedInterval := guestInfoRetryInterval
-	guestInfoRetryInterval = 10 * time.Millisecond
-	t.Cleanup(func() { guestInfoRetryInterval = savedInterval })
-
 	out := &recordingChannelOut{reply: rpciOK, sent: make(chan struct{}, 16)}
 	s := NewService(new(mockChannelIn), out)
 	// The interval is long enough that only the retry can send the IPv4 report.
 	s.GuestInfoInterval = time.Hour
+	s.GuestInfoRetryInterval = 10 * time.Millisecond
+	s.GuestInfoRetryWindow = time.Minute
 
 	if err := s.Start(); err != nil {
 		t.Fatal(err)
@@ -449,11 +447,7 @@ func TestServiceGuestInfoRetriesUntilIPv4(t *testing.T) {
 	}
 
 	// Once the VMX has accepted the IPv4 report, gathering stops.
-	stopped := queries.Load()
-	time.Sleep(100 * time.Millisecond)
-	if n := queries.Load(); n != stopped {
-		t.Errorf("gathers continued after the IPv4 report: %d queries, then %d", stopped, n)
-	}
+	settle(t, queries, 20*s.GuestInfoRetryInterval)
 
 	s.Stop()
 	s.Wait()
@@ -470,28 +464,87 @@ func TestServiceGuestInfoRetryWindow(t *testing.T) {
 	linkLocal := &net.IPNet{IP: net.ParseIP("fe80::250:56ff:fe00:1"), Mask: net.CIDRMask(64, 128)}
 	queries := fakeGuestNIC(t, func(int32) []net.Addr { return []net.Addr{linkLocal} })
 
-	savedInterval, savedWindow := guestInfoRetryInterval, guestInfoRetryWindow
-	guestInfoRetryInterval, guestInfoRetryWindow = 5*time.Millisecond, 50*time.Millisecond
-	t.Cleanup(func() { guestInfoRetryInterval, guestInfoRetryWindow = savedInterval, savedWindow })
-
 	out := &recordingChannelOut{reply: rpciOK}
 	s := NewService(new(mockChannelIn), out)
 	s.GuestInfoInterval = time.Hour
+	s.GuestInfoRetryInterval = 5 * time.Millisecond
+	s.GuestInfoRetryWindow = 50 * time.Millisecond
 
 	if err := s.Start(); err != nil {
 		t.Fatal(err)
 	}
-	// Without an IPv4 address the retry runs for its window, then stops.
-	time.Sleep(150 * time.Millisecond)
-	ended := queries.Load()
-	time.Sleep(100 * time.Millisecond)
-	if n := queries.Load(); n != ended {
-		t.Errorf("gathers continued after the retry window: %d queries, then %d", ended, n)
-	}
+	// Without an IPv4 address the retry gathers until its window passes, then
+	// stops. A retry that never stops keeps the count moving, and settle fails.
+	waitFor(t, "retry gathers", func() bool { return queries.Load() >= 2 })
+	settle(t, queries, 10*s.GuestInfoRetryInterval)
 	s.Stop()
 	s.Wait()
+}
 
-	if ended < 2 {
-		t.Errorf("%d gathers in the retry window, want retries", ended)
+// TestServiceGuestInfoRetryDisabled checks that the retry needs both fields
+// set: with the default zero values, or with only one of them, guest info is
+// gathered once at start and not again until the interval.
+func TestServiceGuestInfoRetryDisabled(t *testing.T) {
+	setHostname(t, "guest")
+	linkLocal := &net.IPNet{IP: net.ParseIP("fe80::250:56ff:fe00:1"), Mask: net.CIDRMask(64, 128)}
+
+	for _, tc := range []struct {
+		name             string
+		interval, window time.Duration
+	}{
+		{name: "zero"},
+		{name: "interval only", interval: 5 * time.Millisecond},
+		{name: "window only", window: 50 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			queries := fakeGuestNIC(t, func(int32) []net.Addr { return []net.Addr{linkLocal} })
+
+			out := &recordingChannelOut{reply: rpciOK}
+			s := NewService(new(mockChannelIn), out)
+			s.GuestInfoInterval = time.Hour
+			s.GuestInfoRetryInterval = tc.interval
+			s.GuestInfoRetryWindow = tc.window
+
+			if err := s.Start(); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "initial gather", func() bool { return queries.Load() >= 1 })
+			if got := settle(t, queries, 50*time.Millisecond); got != 1 {
+				t.Errorf("%d gathers, want only the initial one", got)
+			}
+			s.Stop()
+			s.Wait()
+		})
 	}
+}
+
+// waitFor polls cond until it holds, and fails the test if it does not hold
+// within 5 seconds.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// settle returns the gather count once it has not changed for quiet. It
+// fails the test if the count keeps changing for 5 seconds.
+func settle(t *testing.T, queries *atomic.Int32, quiet time.Duration) int32 {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	last, since := queries.Load(), time.Now()
+	for time.Since(since) < quiet {
+		if time.Now().After(deadline) {
+			t.Fatalf("gathers still running after 5s: %d so far", queries.Load())
+		}
+		time.Sleep(time.Millisecond)
+		if n := queries.Load(); n != last {
+			last, since = n, time.Now()
+		}
+	}
+	return last
 }
