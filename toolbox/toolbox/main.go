@@ -41,8 +41,16 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/vmware/govmomi/toolbox"
+)
+
+// Environment variables that set the daemon's guest info retry when the
+// corresponding flag is not given. Their values are Go duration strings.
+const (
+	envGuestInfoRetryInterval = "TOOLBOX_GUESTINFO_RETRY_INTERVAL"
+	envGuestInfoRetryWindow   = "TOOLBOX_GUESTINFO_RETRY_WINDOW"
 )
 
 func main() {
@@ -51,6 +59,10 @@ func main() {
 	}
 
 	cmd := flag.String("cmd", "", "send one RPCI command and exit, as vmtoolsd --cmd")
+	retryInterval := flag.Duration("guestinfo-retry-interval", envDuration(envGuestInfoRetryInterval),
+		"gather guest info this often after start until the VMX accepts an IPv4 address; zero disables the retry")
+	retryWindow := flag.Duration("guestinfo-retry-window", envDuration(envGuestInfoRetryWindow),
+		"stop the guest info retry after this long; zero disables the retry")
 	flag.Parse()
 
 	if *cmd != "" {
@@ -60,6 +72,8 @@ func main() {
 	in, out := daemonChannels()
 	service := toolbox.NewService(in, out)
 	service.GuestInfoInterval = toolbox.DefaultGuestInfoInterval
+	service.GuestInfoRetryInterval = *retryInterval
+	service.GuestInfoRetryWindow = *retryWindow
 	service.ReportVersion = true
 
 	if os.Getuid() == 0 {
@@ -80,6 +94,21 @@ func main() {
 	}()
 
 	service.Wait()
+}
+
+// envDuration returns the duration in the environment variable name, or zero
+// when it is unset. A value that does not parse is fatal, so that a mistyped
+// retry setting does not silently leave the retry off.
+func envDuration(name string) time.Duration {
+	v := os.Getenv(name)
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		log.Fatalf("%s: %s", name, err)
+	}
+	return d
 }
 
 const rpctoolUsage = "rpctool syntax:\n\n" +

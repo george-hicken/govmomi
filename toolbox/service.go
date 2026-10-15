@@ -33,15 +33,6 @@ const (
 	DefaultGuestInfoInterval = 30 * time.Second
 )
 
-// guestInfoRetryInterval is how often guest info is gathered after start until
-// the VMX accepts a NIC report with a global IPv4 address, as the guest's
-// address may not be configured yet when the Service starts.
-// guestInfoRetryWindow bounds that retry.
-var (
-	guestInfoRetryInterval = time.Second
-	guestInfoRetryWindow   = 60 * time.Second
-)
-
 var (
 	capabilities = []string{
 		// Without tools.set.version, the UI reports Tools are "running", but "not installed"
@@ -83,6 +74,15 @@ type Service struct {
 	// TCLO reset. When zero, the default, guest info is sent only in reply to
 	// reset and broadcastIP.
 	GuestInfoInterval time.Duration
+
+	// GuestInfoRetryInterval and GuestInfoRetryWindow, when both positive,
+	// gather guest info every GuestInfoRetryInterval from the start of the
+	// Service until the VMX accepts a NIC report with a global IPv4 address,
+	// or until GuestInfoRetryWindow has passed. The guest's address may not
+	// be configured yet when the Service starts. When either is zero, the
+	// default, there is no retry.
+	GuestInfoRetryInterval time.Duration
+	GuestInfoRetryWindow   time.Duration
 
 	// ReportVersion makes the Service report its version as guest variables
 	// when it starts, as vmtoolsd's ToolsCoreReportVersionData does:
@@ -207,9 +207,13 @@ func (s *Service) Start() error {
 		// its main loop, so that requests on s.out are never concurrent.
 		var gather, retry, retryEnd <-chan time.Time
 		var retryTicker *time.Ticker
+		var retryTimer *time.Timer
+		// stopRetry ends the retry when it succeeds or times out, and on any
+		// exit from this goroutine, so that no timer outlives the Service.
 		stopRetry := func() {
 			if retryTicker != nil {
 				retryTicker.Stop()
+				retryTimer.Stop()
 			}
 			retry, retryEnd = nil, nil
 		}
@@ -220,10 +224,11 @@ func (s *Service) Start() error {
 			defer ticker.Stop()
 			gather = ticker.C
 
-			if !s.gatherGuestInfo() {
-				retryTicker = time.NewTicker(guestInfoRetryInterval)
-				retry = retryTicker.C
-				retryEnd = time.After(guestInfoRetryWindow)
+			accepted := s.gatherGuestInfo()
+			if !accepted && s.GuestInfoRetryInterval > 0 && s.GuestInfoRetryWindow > 0 {
+				retryTicker = time.NewTicker(s.GuestInfoRetryInterval)
+				retryTimer = time.NewTimer(s.GuestInfoRetryWindow)
+				retry, retryEnd = retryTicker.C, retryTimer.C
 			}
 		}
 
