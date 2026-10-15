@@ -410,8 +410,12 @@ type createOptions struct {
 	// Privileged adds --privileged.
 	Privileged bool
 	// NestedContainers adds the flags a container needs to run containers
-	// itself, --privileged among them.
+	// itself, --privileged among them; see nestedContainerArgs.
 	NestedContainers bool
+	// NestedVolumes are the container paths that NestedContainers mounts as
+	// anonymous volumes, off the overlay root filesystem. nil means /var, as
+	// kind mounts it; an empty slice mounts none.
+	NestedVolumes []string
 	// CapAdd are capabilities to add, such as NET_RAW for ping.
 	CapAdd []string
 
@@ -495,24 +499,11 @@ func create(ctx *Context, name string, id string, image string, args []string, o
 	}
 
 	if opts.NestedContainers {
-		// Adapted from kind, which runs Kubernetes nodes as containers:
-		// https://github.com/kubernetes-sigs/kind/blob/main/pkg/cluster/internal/providers/docker/provision.go
-		run = append(run,
-			// a private cgroup namespace, so cgroup v2 can be delegated to nested containers
-			"--cgroupns=private",
-			// the syscalls systemd and containerd need
-			"--security-opt", "seccomp=unconfined",
-			"--security-opt", "apparmor=unconfined",
-			// systemd expects /tmp and /run to be tmpfs
-			"--tmpfs", "/tmp",
-			"--tmpfs", "/run",
-			// containerd and kubelet state, off the overlay filesystem
-			"--volume", "/var",
-			// kernel modules, for iptables
-			"--volume", "/lib/modules:/lib/modules:ro",
-			// the fuse-overlayfs snapshotter
-			"--device", "/dev/fuse",
-		)
+		volumes := opts.NestedVolumes
+		if volumes == nil {
+			volumes = []string{"/var"}
+		}
+		run = append(run, nestedContainerArgs(volumes)...)
 	} else {
 		// the host cgroup namespace gives access to every controller, cpuset included
 		run = append(run, "--cgroupns=host")
@@ -545,6 +536,37 @@ func create(ctx *Context, name string, id string, image string, args []string, o
 	c.id = strings.TrimSpace(string(out))
 
 	return &c, nil
+}
+
+// nestedContainerArgs returns the docker create flags a container needs to run
+// containers itself. They are adapted from kind, which runs Kubernetes nodes as
+// containers:
+// https://github.com/kubernetes-sigs/kind/blob/main/pkg/cluster/internal/providers/docker/provision.go
+//
+// Each of volumes is mounted as an anonymous volume. A volume is needed for any
+// path that must not be on the overlay root filesystem, as containerd's
+// overlayfs snapshotter cannot nest on overlay. The image's content under a
+// volume is copied into it when the container is created, so a volume over a
+// large path adds that copy to every start.
+func nestedContainerArgs(volumes []string) []string {
+	args := []string{
+		// a private cgroup namespace, so cgroup v2 can be delegated to nested containers
+		"--cgroupns=private",
+		// the syscalls systemd and containerd need
+		"--security-opt", "seccomp=unconfined",
+		"--security-opt", "apparmor=unconfined",
+		// systemd expects /tmp and /run to be tmpfs
+		"--tmpfs", "/tmp",
+		"--tmpfs", "/run",
+		// kernel modules, for iptables
+		"--volume", "/lib/modules:/lib/modules:ro",
+		// the fuse-overlayfs snapshotter
+		"--device", "/dev/fuse",
+	}
+	for _, v := range volumes {
+		args = append(args, "--volume", v)
+	}
+	return args
 }
 
 // createVolume takes the specified files and writes them into a volume named for the container.
