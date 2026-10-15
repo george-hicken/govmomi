@@ -28,9 +28,6 @@ const (
 
 	// routerImage must be present locally: routers are started with --pull=never.
 	routerImage = "busybox:latest"
-
-	helperStartTimeout = 10 * time.Second
-	helperStopTimeout  = 5 * time.Second
 )
 
 // underlayRuntime realises one Topology in podman. Domain networks are created lazily and idempotently,
@@ -311,7 +308,7 @@ func (u *underlayRuntime) startHelper(rt *routerInstance) error {
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 
-	deadline := time.Now().Add(helperStartTimeout)
+	deadline := time.Now().Add(PodmanHelperStartTimeout)
 	for {
 		if c, err := net.Dial("unix", sock); err == nil {
 			_ = c.Close()
@@ -328,7 +325,7 @@ func (u *underlayRuntime) startHelper(rt *routerInstance) error {
 			_ = os.RemoveAll(dir)
 			return fmt.Errorf("router %q: netns helper did not start", rt.name)
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(PodmanHelperStartPoll)
 	}
 
 	rt.helper = &netnsHelper{socket: sock}
@@ -348,7 +345,7 @@ func (rt *routerInstance) stopHelper() error {
 	var err error
 	select {
 	case <-rt.helperErr:
-	case <-time.After(helperStopTimeout):
+	case <-time.After(PodmanHelperStopTimeout):
 		err = rt.helperCmd.Process.Kill()
 		<-rt.helperErr
 	}

@@ -825,14 +825,9 @@ func (c *container) remove(ctx *Context) error {
 // updated is a simple trigger allowing a caller to indicate that something has likely changed about the container
 // and interested parties should re-inspect as needed.
 func (c *container) updated() {
-	consolidationWindow := 250 * time.Millisecond
-	if d, err := time.ParseDuration(os.Getenv("VCSIM_EVENT_CONSOLIDATION_WINDOW")); err == nil {
-		consolidationWindow = d
-	}
-
 	select {
 	case c.changes <- struct{}{}:
-		time.Sleep(consolidationWindow)
+		time.Sleep(ContainerEventConsolidationWindow)
 		// as this is only a hint to avoid waiting for the full inspect interval, we don't care about accumulating
 		// multiple triggers. We do pause to allow large numbers of sequential updates to consolidate
 	default:
@@ -861,11 +856,7 @@ func (c *container) watchContainer(ctx *Context, updateFn func(*Context, []byte,
 	// Update the VM from the container at regular intervals until the done
 	// channel is closed.
 	go func() {
-		inspectInterval := 10 * time.Second
-		if d, err := time.ParseDuration(os.Getenv("VCSIM_INSPECT_INTERVAL")); err == nil {
-			inspectInterval = d
-		}
-		ticker := time.NewTicker(inspectInterval)
+		ticker := time.NewTicker(ContainerInspectInterval)
 
 		update := func() {
 			out, details, err := c.inspect()
