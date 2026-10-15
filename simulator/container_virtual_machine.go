@@ -49,9 +49,17 @@ import (
 //     an image with systemd as PID 1 needs.
 //   - RUN.nestedContainers (default false): let the container run containers,
 //     for example a Kubernetes node. It adds --privileged, --cgroupns=private,
-//     unconfined seccomp and apparmor, tmpfs at /tmp and /run, a volume at
-//     /var, /lib/modules read-only and /dev/fuse, adapted from kind. Without it
-//     the container shares the host's cgroup namespace.
+//     unconfined seccomp and apparmor, tmpfs at /tmp and /run, a volume for
+//     each path of RUN.nestedVolumes, /lib/modules read-only and /dev/fuse,
+//     adapted from kind. Without it the container shares the host's cgroup
+//     namespace.
+//   - RUN.nestedVolumes (default ["/var"]): with RUN.nestedContainers, the
+//     container paths to mount as anonymous volumes, as a JSON array of
+//     absolute paths. An anonymous volume copies the image's content under it
+//     when the container is created, so a volume over a large path adds that
+//     copy to every start; a path left out stays on the overlay root
+//     filesystem, writable and independent per container. An empty array
+//     mounts none. A value that does not parse leaves the default.
 //   - RUN.vmci (default false): serve GuestRPC to the guest, described below.
 //   - RUN.port.<port>: publish container port <port> on the host port given as
 //     the value.
@@ -423,6 +431,7 @@ func (svm *simVM) start(ctx *Context) error {
 	mountMachineID := true
 	privileged := false
 	nestedContainers := false
+	nestedVolumes := []string{"/var"}
 	vmci := false
 
 	// The keys are documented on ContainerBackingOptionKey.
@@ -468,6 +477,16 @@ func (svm *simVM) start(ctx *Context) error {
 
 		if val.Key == "RUN.nestedContainers" {
 			parseBoolOption(value, &nestedContainers)
+			continue
+		}
+
+		if val.Key == "RUN.nestedVolumes" {
+			paths, err := parseNestedVolumes(value)
+			if err != nil {
+				log.Printf("%s: RUN.nestedVolumes %q ignored: %s", svm.vm.Name, value, err)
+				continue
+			}
+			nestedVolumes = paths
 			continue
 		}
 
@@ -574,6 +593,7 @@ func (svm *simVM) start(ctx *Context) error {
 		Env:               env,
 		Privileged:        privileged,
 		NestedContainers:  nestedContainers,
+		NestedVolumes:     nestedVolumes,
 		QuoteImageAndArgs: jsonArgs,
 		RecreateIfExists:  true,
 	})
@@ -934,6 +954,24 @@ func hasVolumeDest(extraConfig []types.BaseOptionValue, dest string) bool {
 		}
 	}
 	return false
+}
+
+// parseNestedVolumes parses a RUN.nestedVolumes value: a JSON array of absolute
+// container paths, each of which docker -v can take as an anonymous volume.
+func parseNestedVolumes(value string) ([]string, error) {
+	var paths []string
+	if err := json.Unmarshal([]byte(value), &paths); err != nil {
+		return nil, err
+	}
+	if paths == nil {
+		return nil, fmt.Errorf("not a JSON array")
+	}
+	for _, p := range paths {
+		if !path.IsAbs(p) || path.Clean(p) != p || p == "/" || strings.Contains(p, ":") {
+			return nil, fmt.Errorf("%q is not an absolute container path", p)
+		}
+	}
+	return paths, nil
 }
 
 // parseBoolOption sets *dst from a JSON boolean, leaving it unchanged when
