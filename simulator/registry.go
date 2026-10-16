@@ -69,6 +69,9 @@ type Registry struct {
 	handlers map[types.ManagedObjectReference]RegisterObject
 	locks    map[types.ManagedObjectReference]*internal.ObjectLock
 
+	// eventWatch runs docker events for this registry's containers.
+	eventWatch eventWatcher
+
 	Namespace string
 	Path      string
 	Handler   func(*Context, *Method) (mo.Reference, types.BaseMethodFault)
