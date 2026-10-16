@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/find"
@@ -137,7 +138,10 @@ func Example_runContainer() {
 			log.Fatal(err)
 		}
 
-		ip, _ := vm.WaitForIP(ctx, true) // Returns the docker container's IP
+		// Bounded, so a container that never gets an IP fails rather than hangs.
+		ipCtx, cancelIP := context.WithTimeout(ctx, 60*time.Second)
+		ip, _ := vm.WaitForIP(ipCtx, true) // Returns the docker container's IP
+		cancelIP()
 
 		// Count the number of bytes in feature_test.go via nginx going direct to the container.
 		// Join the same bridge so the probe can reach the nginx container IP on rootless podman;
