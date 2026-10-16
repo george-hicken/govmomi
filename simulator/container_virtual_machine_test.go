@@ -110,6 +110,7 @@ func TestCreateVMWithContainerBacking(t *testing.T) {
 			t.Skip("requires docker on linux")
 			return
 		}
+		requireContainerBridge(t)
 
 		finder := find.NewFinder(c)
 		pool, _ := finder.ResourcePool(ctx, "DC0_H0/Resources")
@@ -190,6 +191,7 @@ func TestUpdateVMAddContainerBacking(t *testing.T) {
 			t.Skip("requires docker on linux")
 			return
 		}
+		requireContainerBridge(t)
 
 		finder := find.NewFinder(c)
 		pool, _ := finder.ResourcePool(ctx, "DC0_H0/Resources")

@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"net/url"
 	"os"
 	"os/exec"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/methods"
@@ -30,6 +32,68 @@ func HasDocker() bool {
 		return false
 	}
 	return true
+}
+
+var (
+	containerBridgeOnce sync.Once
+	containerBridgeOK   bool
+)
+
+// HasContainerBridge reports whether containers on this host can join a bridge
+// network. Under podman, netavark programs the bridge firewall with nftables
+// expressions. On a kernel without nft_fib, container start fails with
+//
+//	netavark: nftables error: "nft" did not return successfully while applying ruleset
+//
+// as seen with netavark 2.0.0 on Photon 5 kernel 6.12.112-5.ph5-esx. NETAVARK_FW=none
+// turns that programming off. Docker does not use netavark, so it is not probed.
+func HasContainerBridge() bool {
+	containerBridgeOnce.Do(func() {
+		containerBridgeOK = !isPodman() || os.Getenv("NETAVARK_FW") == "none" || probeContainerBridge()
+	})
+	return containerBridgeOK
+}
+
+const (
+	containerBridgeProbeImage   = "docker.io/library/alpine:3.20.3"
+	containerBridgeProbeTimeout = 60 * time.Second
+)
+
+// probeContainerBridge starts a container on a throwaway bridge network. It
+// returns false only for the netavark nftables error. Any other failure, and a
+// timeout (which includes the image pull), returns true so the test reports it.
+func probeContainerBridge() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), containerBridgeProbeTimeout)
+	defer cancel()
+
+	name := fmt.Sprintf("govmomi-bridge-probe-%08x", rand.Uint32())
+	if out, err := exec.CommandContext(ctx, "docker", "network", "create", name).CombinedOutput(); err != nil {
+		log.Printf("container bridge probe: network create %s: %v: %s", name, err, out)
+		return true
+	}
+	defer func() {
+		// Cleanup gets its own deadline, since ctx may already have expired.
+		cctx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		exec.CommandContext(cctx, "docker", "rm", "-f", name).Run()
+		if err := exec.CommandContext(cctx, "docker", "network", "rm", name).Run(); err != nil {
+			log.Printf("container bridge probe: network rm %s: %v", name, err)
+		}
+	}()
+
+	out, err := exec.CommandContext(ctx, "docker", "run", "--name", name, "--network", name, containerBridgeProbeImage, "true").CombinedOutput()
+	if ctx.Err() != nil {
+		log.Printf("container bridge probe: timed out after %s", containerBridgeProbeTimeout)
+		return true
+	}
+	return err == nil || !(strings.Contains(string(out), "netavark") && strings.Contains(string(out), "nftables"))
+}
+
+// isPodman reports whether the docker CLI is podman. It probes docker info with
+// a podman-only template field, since the docker --version string is not
+// reliable: some podman docker shims print "docker version".
+func isPodman() bool {
+	return exec.Command("docker", "info", "--format", "{{.Host.Security.Rootless}}").Run() == nil
 }
 
 var (

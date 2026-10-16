@@ -7,6 +7,8 @@ package simulator
 import (
 	"slices"
 	"testing"
+
+	"github.com/vmware/govmomi/test"
 )
 
 func TestNetworkArgs(t *testing.T) {
@@ -56,5 +58,23 @@ func TestNetworkArgs(t *testing.T) {
 				t.Errorf("networkArgs(%q, %+v, %+v) = %q, want %q", tc.networks, tc.nics, tc.rt, got, tc.want)
 			}
 		})
+	}
+}
+
+// requirePasta skips the test unless a container's primary interface can take
+// a vNIC's MAC, which rootless podman does only through pasta (see networkArgs).
+func requirePasta(t *testing.T) {
+	t.Helper()
+	if rt := runtimeNetwork(); rt.rootlessPodman && !rt.pasta {
+		t.Skip("requires pasta for the container's MAC under rootless podman, which is not installed")
+	}
+}
+
+// requireContainerBridge skips the test unless containers can join a bridge
+// network, which needs netavark's nftables firewall support on this host.
+func requireContainerBridge(t *testing.T) {
+	t.Helper()
+	if !test.HasContainerBridge() {
+		t.Skip("this host's netavark/kernel cannot set up bridge firewalling (set NETAVARK_FW=none to skip that setup)")
 	}
 }

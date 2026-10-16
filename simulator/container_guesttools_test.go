@@ -26,6 +26,7 @@ func TestVMCI_ToolboxDaemon(t *testing.T) {
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}
+	requirePasta(t)
 
 	env := newVCSIMEnv(t)
 	name := "vmci-toolbox-daemon"
