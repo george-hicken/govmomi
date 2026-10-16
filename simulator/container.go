@@ -26,8 +26,7 @@ import (
 )
 
 var (
-	shell      = "/bin/sh"
-	eventWatch eventWatcher
+	shell = "/bin/sh"
 )
 
 // shellQuote quotes s as one word for bash, for create()'s bash -c string.
@@ -72,9 +71,11 @@ func commandError(operation string, args []string, err error) error {
 type eventWatcher struct {
 	sync.Mutex
 
-	stdin   io.WriteCloser
-	stdout  io.ReadCloser
-	process *os.Process
+	// stdin and cmd are set while docker events runs. cmd leads its own process group, see startInOwnProcessGroup.
+	stdin io.WriteCloser
+	cmd   *exec.Cmd
+	// closed is set by close; a closed watcher starts no more docker events.
+	closed bool
 
 	// watches is a map of container IDs to container objects
 	watches map[string]*container
@@ -816,7 +817,7 @@ func (c *container) remove(ctx *Context) error {
 
 	if c.cancelWatch != nil {
 		c.cancelWatch()
-		eventWatch.ignore(c)
+		ctx.Map.eventWatch.ignore(c.id)
 	}
 	c.id = ""
 	return nil
@@ -848,15 +849,18 @@ func (c *container) watchContainer(ctx *Context, updateFn func(*Context, []byte,
 		return uninitializedContainer{errors.New("Attempt to watch uninitialized container")}
 	}
 
+	eventWatch := &ctx.Map.eventWatch
 	eventWatch.watch(c)
 
 	cancelCtx, cancelFunc := context.WithCancel(ctx)
 	c.cancelWatch = cancelFunc
+	id := c.id
 
 	// Update the VM from the container at regular intervals until the done
 	// channel is closed.
 	go func() {
 		ticker := time.NewTicker(ContainerInspectInterval)
+		defer ticker.Stop()
 
 		update := func() {
 			out, details, err := c.inspect()
@@ -885,6 +889,7 @@ func (c *container) watchContainer(ctx *Context, updateFn func(*Context, []byte,
 			case <-ticker.C:
 				update()
 			case <-cancelCtx.Done():
+				eventWatch.ignore(id)
 				return
 			}
 		}
@@ -897,54 +902,61 @@ func (w *eventWatcher) watch(c *container) {
 	w.Lock()
 	defer w.Unlock()
 
+	if w.closed {
+		return
+	}
+
 	if w.watches == nil {
 		w.watches = make(map[string]*container)
 	}
 
 	w.watches[c.id] = c
 
-	if w.stdin == nil {
+	if w.cmd == nil {
 		cmd := exec.Command("docker", "events", "--format", "'{{.ID}}'", "--filter", "Type=container")
-		w.stdout, _ = cmd.StdoutPipe()
-		w.stdin, _ = cmd.StdinPipe()
+		startInOwnProcessGroup(cmd)
+		stdout, _ := cmd.StdoutPipe()
+		stdin, _ := cmd.StdinPipe()
 		err := cmd.Start()
 		if err != nil {
 			log.Printf("docker event watcher: %s %s", cmd.Args, err)
-			w.stdin = nil
-			w.stdout = nil
-			w.process = nil
-
 			return
 		}
 
-		w.process = cmd.Process
+		w.stdin = stdin
+		w.cmd = cmd
 
-		go w.monitor()
+		go w.monitor(cmd, stdout)
 	}
 }
 
-func (w *eventWatcher) ignore(c *container) {
+// ignore drops the watch for container id, and stops docker events once no watch is left.
+func (w *eventWatcher) ignore(id string) {
 	w.Lock()
+	defer w.Unlock()
 
-	delete(w.watches, c.id)
+	delete(w.watches, id)
 
-	if len(w.watches) == 0 && w.stdin != nil {
+	if len(w.watches) == 0 {
 		w.stop()
 	}
-
-	w.Unlock()
 }
 
-func (w *eventWatcher) monitor() {
+// close stops docker events and refuses further watches. Model.Remove calls it, so the watcher never outlives the
+// registry that started it, and a closed registry does not respawn it.
+func (w *eventWatcher) close() {
 	w.Lock()
-	watches := len(w.watches)
-	w.Unlock()
+	defer w.Unlock()
 
-	if watches == 0 {
-		return
-	}
+	w.closed = true
+	w.watches = nil
+	w.stop()
+}
 
-	scanner := bufio.NewScanner(w.stdout)
+// monitor dispatches container events from docker events' stdout until the scan ends. It then stops docker events
+// and reaps it. The stop happens before Wait, while the pid is still unreaped, so no stop can signal a recycled pid.
+func (w *eventWatcher) monitor(cmd *exec.Cmd, stdout io.Reader) {
+	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
 		id := strings.TrimSpace(scanner.Text())
 
@@ -957,18 +969,28 @@ func (w *eventWatcher) monitor() {
 			go container.updated()
 		}
 	}
+
+	w.Lock()
+	if w.cmd == cmd {
+		w.stop()
+	}
+	w.Unlock()
+
+	_ = cmd.Wait()
 }
 
+// stop kills docker events and its process group, and clears w.cmd so the pid is never signalled again. The caller
+// holds w's lock.
 func (w *eventWatcher) stop() {
+	if w.cmd == nil {
+		return
+	}
 	if w.stdin != nil {
 		w.stdin.Close()
 		w.stdin = nil
 	}
-	if w.stdout != nil {
-		w.stdout.Close()
-		w.stdout = nil
-	}
-	w.process.Kill()
+	_ = killProcessGroup(w.cmd.Process)
+	w.cmd = nil
 }
 
 // containerNetwork is what the container runtime can do for a container's
