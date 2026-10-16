@@ -10,6 +10,8 @@ require (
 )
 
 require (
+	github.com/rasky/go-xdr v0.0.0-20170124162913-1a41d1a06c93 // indirect
+	github.com/vmware/vmw-guestinfo v0.0.0-20220317130741-510905f0efa3 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

@@ -14,13 +14,16 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/test"
 	"github.com/vmware/govmomi/vim25"
+	"github.com/vmware/govmomi/vim25/mo"
 	"github.com/vmware/govmomi/vim25/types"
 )
 
@@ -50,7 +53,7 @@ func constructNginxBacking(t *testing.T, content string, port int) []types.BaseO
 	err = os.Chmod(fpath, 0644)
 	require.Nil(t, err, "Expected to cleanly set file permissions on content: %s", err)
 
-	args := fmt.Sprintf("-v '%s:/usr/share/nginx/html:ro' nginx", dir)
+	args := fmt.Sprintf("-v '%s:/usr/share/nginx/html:ro' docker.io/library/nginx:1.27-alpine", dir)
 
 	return []types.BaseOptionValue{
 		&types.OptionValue{Key: ContainerBackingOptionKey, Value: args}, // run nginx
@@ -65,7 +68,11 @@ func constructNginxBacking(t *testing.T, content string, port int) []types.BaseO
 // podman pass test.ContainerNetworkFromSpec(&spec) so the probe shares the VM
 // container's network.
 func validateNginxContainer(t *testing.T, vm *object.VirtualMachine, expected string, port int, network string) error {
-	ip, _ := vm.WaitForIP(context.Background(), true) // Returns the docker container's IP
+	// Bounded, so a container that never gets an IP fails this test rather than
+	// hanging the test binary.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	ip, _ := vm.WaitForIP(ctx, true) // Returns the docker container's IP
 
 	// Verify direct container IP access.  Join the same bridge as the nginx
 	// container so the probe can reach it; omit --network on runtimes where
@@ -108,6 +115,7 @@ func TestCreateVMWithContainerBacking(t *testing.T) {
 			t.Skip("requires docker on linux")
 			return
 		}
+		requireContainerBridge(t)
 
 		finder := find.NewFinder(c)
 		pool, _ := finder.ResourcePool(ctx, "DC0_H0/Resources")
@@ -188,6 +196,7 @@ func TestUpdateVMAddContainerBacking(t *testing.T) {
 			t.Skip("requires docker on linux")
 			return
 		}
+		requireContainerBridge(t)
 
 		finder := find.NewFinder(c)
 		pool, _ := finder.ResourcePool(ctx, "DC0_H0/Resources")
@@ -253,4 +262,65 @@ func TestUpdateVMAddContainerBacking(t *testing.T) {
 		task, _ = vm.Destroy(ctx)
 		_ = task.Wait(ctx)
 	})
+}
+
+// TestContainerVMToolsStatus checks that, without a GuestRPC channel, guest
+// and summary.guest report the tools state of the container backing the VM,
+// and no tools version, since no tools have reported one.
+func TestContainerVMToolsStatus(t *testing.T) {
+	if !test.HasDocker() {
+		t.Skip("requires docker or podman (aliased as docker) on linux")
+	}
+
+	env := newVCSIMEnv(t)
+	vm, _ := powerOnContainerVM(t, env, "tools-status-test",
+		&types.OptionValue{Key: ContainerBackingOptionKey, Value: `["alpine","sh","-c","` + sleepForever + `"]`},
+	)
+
+	requireTools := func(t *testing.T, status types.VirtualMachineToolsStatus, running types.VirtualMachineToolsRunningStatus) {
+		t.Helper()
+
+		var props mo.VirtualMachine
+		require.NoError(t, vm.Properties(env.goCtx, vm.Reference(), []string{"guest", "summary.guest"}, &props))
+
+		require.Equal(t, status, props.Guest.ToolsStatus)
+		require.Equal(t, string(running), props.Guest.ToolsRunningStatus)
+		require.Equal(t, status, props.Summary.Guest.ToolsStatus)
+		require.Equal(t, string(running), props.Summary.Guest.ToolsRunningStatus)
+
+		require.Empty(t, props.Guest.ToolsVersionStatus2)
+		require.Empty(t, props.Summary.Guest.ToolsVersionStatus2)
+	}
+
+	requireTools(t, types.VirtualMachineToolsStatusToolsOk, types.VirtualMachineToolsRunningStatusGuestToolsRunning)
+
+	powerOff(t, env, vm)
+	requireTools(t, types.VirtualMachineToolsStatusToolsNotRunning, types.VirtualMachineToolsRunningStatusGuestToolsNotRunning)
+}
+
+// TestVMRulePowerOnStartsContainer checks that a powerOn VMRule patching RUN.container starts the container.
+func TestVMRulePowerOnStartsContainer(t *testing.T) {
+	if !test.HasDocker() {
+		t.Skip("requires docker or podman (aliased as docker) on linux")
+	}
+
+	patch := &types.VirtualMachineConfigSpec{ExtraConfig: []types.BaseOptionValue{
+		&types.OptionValue{Key: ContainerBackingOptionKey, Value: testContainerCmd},
+	}}
+	require.NoError(t, test.ApplyContainerRuntimeDefaults(patch))
+
+	env := newVCSIMEnv(t)
+	require.NoError(t, env.simCtx.Map.VMRules.Add(VMRule{
+		Name:   "start-container",
+		Phases: []VMRulePhase{VMRulePhasePowerOn},
+		Match:  ObjectMatch{Include: property.Match{"name": "rule-container"}},
+		Patch:  patch,
+	}))
+
+	vmObj, vm := ruleVM(t, env, "rule-container")
+	name := env.simCtx.Map.containerName(vm.Name, vm.uid.String())
+	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", name).Run() })
+
+	powerOn(t, env, vmObj)
+	require.True(t, containerRunning(name))
 }

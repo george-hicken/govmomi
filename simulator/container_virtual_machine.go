@@ -12,33 +12,146 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/vmware/govmomi/toolbox"
 	"github.com/vmware/govmomi/vim25/methods"
 	"github.com/vmware/govmomi/vim25/types"
 )
 
+// ContainerBackingOptionKey is the ExtraConfig key that backs a VM with a
+// container. Its value is an image name, or a JSON array of an image name and
+// the command to run in it, such as ["alpine", "sleep", "infinity"]. The
+// container is created at first power-on.
+//
+// These ExtraConfig keys configure the container. Boolean values are JSON,
+// "true" or "false"; any other value leaves the default.
+//
+//   - RUN.mountdmi (default true): mount the VM's DMI data at /sys/class/dmi/id.
+//     Set false where that mount is refused, as under rootless podman.
+//   - RUN.machineId (default true): mount a file holding config.uuid, the
+//     VM's BIOS UUID, as 32 lowercase hex digits read-only at /etc/machine-id
+//     and /var/lib/dbus/machine-id, except where a RUN.volume targets that
+//     path. A guest that has no DMI data, such as one under rootless podman,
+//     then still identifies itself by its BIOS UUID, as the kubelet does for
+//     its node's systemUUID, and no two VMs share the machine ID baked into
+//     an image.
+//   - RUN.network: the container network to join, such as "podman".
+//   - RUN.privileged (default false): run the container with --privileged, as
+//     an image with systemd as PID 1 needs.
+//   - RUN.nestedContainers (default false): let the container run containers,
+//     for example a Kubernetes node. It adds --privileged, --cgroupns=private,
+//     unconfined seccomp and apparmor, tmpfs at /tmp and /run, a volume for
+//     each path of RUN.nestedVolumes, /lib/modules read-only and /dev/fuse,
+//     adapted from kind. Without it the container shares the host's cgroup
+//     namespace.
+//   - RUN.nestedVolumes (default ["/var"]): with RUN.nestedContainers, the
+//     container paths to mount as anonymous volumes, as a JSON array of
+//     absolute paths. An anonymous volume copies the image's content under it
+//     when the container is created, so a volume over a large path adds that
+//     copy to every start; a path left out stays on the overlay root
+//     filesystem, writable and independent per container. An empty array
+//     mounts none. A value that does not parse leaves the default.
+//   - RUN.vmci (default false): serve GuestRPC to the guest, described below.
+//   - RUN.port.<port>: publish container port <port> on the host port given as
+//     the value.
+//   - RUN.volume.<label>: add a mount, "source:destination[:options]" as for
+//     docker -v, where source is a host path or a volume name.
+//   - RUN.env.<name>: set environment variable <name> to the value.
+//   - guestinfo.<key>: when the container is created, each becomes the
+//     environment variable VMX_GUESTINFO_<KEY>, and VMX_GUESTINFO=true is set.
+//     In a container this is the only guestinfo source cloud-init's VMware
+//     datasource reads, because it detects the container and skips
+//     vmware-rpctool.
+//
+// Each virtual Ethernet card is an interface of the container, eth<i> in
+// device-key order, with the card's MAC, as a guest on a real VM sees it, so a
+// guest that configures its network by that MAC, as cloud-init does, finds its
+// NIC. With a topology loaded each card joins the podman network of its L2
+// domain; see containerNICs and networkArgs. Without one, the container gets the
+// first card's MAC on the runtime's default network.
+//
+// With RUN.vmci=true the guest can also read and write guestinfo while it runs.
+// vcsim serves GuestRPC on a Unix socket mounted at /run/vmware/rpc.sock, names
+// it in $VMX_RPC_SOCK, and mounts the govmomi toolbox binary at
+// /usr/bin/vmware-rpctool unless a RUN.volume already targets that path; see
+// VmciToolboxBinaryPath to mount it as vmtoolsd as well. The guest may read
+// guestinfo.* keys and write those without "/". A write changes
+// config.extraConfig at once and is reported by PropertyCollector.
+//
+// Not simulated:
+//
+//   - AF_VSOCK and the x86 backdoor. Neither exists in the container, so stock
+//     open-vm-tools vmtoolsd and vmware-rpctool cannot reach vcsim; only the
+//     govmomi toolbox binary can.
+//   - Host-to-guest GuestRPC (TCLO). There are no tools-mediated power
+//     operations. Guest operations are served with docker exec, not through
+//     tools.
+//
+// With RUN.vmci=true, guest.toolsRunningStatus and the tools version follow
+// what the guest reports over GuestRPC, as they do on a real VM: the govmomi
+// toolbox daemon is running while its connection is open, and vmtoolsd while
+// its TCLO heartbeat continues (see guestTools). The guest also reports its
+// own network identity, which then replaces the container's observed address.
+// Without RUN.vmci there is no tools channel, and guest.toolsRunningStatus
+// follows the container's state.
+//
+// For example, a Kubernetes node that reports its status through guestinfo:
+//
+//	ExtraConfig: []types.BaseOptionValue{
+//		&types.OptionValue{Key: "RUN.container", Value: "my-k8s-node:latest"},
+//		&types.OptionValue{Key: "RUN.nestedContainers", Value: "true"},
+//		&types.OptionValue{Key: "RUN.vmci", Value: "true"},
+//		&types.OptionValue{Key: "guestinfo.userdata", Value: userdata},
+//	}
 const ContainerBackingOptionKey = "RUN.container"
 
 var (
+	// toolsRunning and toolsNotRunning leave the tools version in place, as
+	// vCenter keeps reporting the installed tools of a powered-off VM.
 	toolsRunning = []types.PropertyChange{
 		{Name: "guest.toolsStatus", Val: types.VirtualMachineToolsStatusToolsOk},
 		{Name: "guest.toolsRunningStatus", Val: string(types.VirtualMachineToolsRunningStatusGuestToolsRunning)},
+		{Name: "summary.guest.toolsStatus", Val: types.VirtualMachineToolsStatusToolsOk},
+		{Name: "summary.guest.toolsRunningStatus", Val: string(types.VirtualMachineToolsRunningStatusGuestToolsRunning)},
 	}
 
 	toolsNotRunning = []types.PropertyChange{
 		{Name: "guest.toolsStatus", Val: types.VirtualMachineToolsStatusToolsNotRunning},
 		{Name: "guest.toolsRunningStatus", Val: string(types.VirtualMachineToolsRunningStatusGuestToolsNotRunning)},
+		{Name: "summary.guest.toolsStatus", Val: types.VirtualMachineToolsStatusToolsNotRunning},
+		{Name: "summary.guest.toolsRunningStatus", Val: string(types.VirtualMachineToolsRunningStatusGuestToolsNotRunning)},
 	}
 )
 
 type simVM struct {
 	vm *VirtualMachine
 	c  *container
+
+	// guestRPCDir is the host directory mounted at /run/vmware when RUN.vmci
+	// is true. It lives as long as the container, so a restarted container
+	// finds its mount source; guestRPC serves the socket in it while the VM is
+	// powered on.
+	guestRPCDir string
+	guestRPC    *guestRPCServer
+
+	// machineIDDir is the host directory holding the machine-id file mounted
+	// at machineIDPaths when RUN.machineId is true. Like guestRPCDir it lives
+	// as long as the container.
+	machineIDDir string
+
+	// toolsNicInfo is set while the guest's tools have reported its NIC info
+	// in this power-on, which then takes precedence over the container's
+	// observed network settings (spec 95 D-95-31).
+	toolsNicInfo atomic.Bool
 }
 
 // createSimulationVM inspects the provided VirtualMachine and creates a simVM binding for it if
@@ -63,6 +176,8 @@ func createSimulationVM(vm *VirtualMachine) *simVM {
 
 // syncNetworkConfigToVMGuestProperties applies container network settings to
 // vm.Guest properties and triggers granular property-change notifications.
+// Once the guest has reported its NIC info over GuestRPC, only the power
+// state is applied.
 //
 // out and detail are an optional docker/podman inspect result (e.g.
 // from watchContainer's update loop, which must inspect anyway to detect
@@ -101,12 +216,25 @@ func (svm *simVM) syncNetworkConfigToVMGuestProperties(ctx *Context, out []byte,
 		svm.vm.Config.Annotation = "inspect"
 		svm.vm.logPrintf("%s: %s", svm.vm.Config.Annotation, string(out))
 
+		live := ctx.Map.underlay != nil
+		var topoNICs []types.GuestNicInfo
+		if live {
+			topoNICs, primaryNet = svm.nicGuestInfo(ctx, detail.NetworkSettings.Networks)
+		}
+
 		if detail.State.Paused {
 			svm.vm.Runtime.PowerState = types.VirtualMachinePowerStateSuspended
 		} else if detail.State.Running {
 			svm.vm.Runtime.PowerState = types.VirtualMachinePowerStatePoweredOn
 		} else {
 			svm.vm.Runtime.PowerState = types.VirtualMachinePowerStatePoweredOff
+		}
+
+		// The container's network settings are the address observed from
+		// outside the guest, reported only while the guest's own tools have
+		// not reported its NICs (spec 95 D-95-31).
+		if svm.toolsNicInfo.Load() {
+			return
 		}
 
 		svm.vm.Guest.IpAddress = primaryNet.IPAddress
@@ -117,45 +245,51 @@ func (svm *simVM) syncNetworkConfigToVMGuestProperties(ctx *Context, out []byte,
 			svm.vm.Summary.Guest.HostName = detail.Config.Hostname
 		}
 
+		// Without a topology the container's networks are the guest's NICs. With one they are matched to the
+		// VM's vNICs by MAC, so each NIC is reported whether or not it has an address.
 		var guestNics []types.GuestNicInfo
-		nicIndex := int32(0)
-		for networkName, netSettings := range detail.NetworkSettings.Networks {
-			if netSettings.IPAddress == "" {
-				continue
+		if live {
+			guestNics = topoNICs
+		} else {
+			nicIndex := int32(0)
+			for networkName, netSettings := range detail.NetworkSettings.Networks {
+				if netSettings.IPAddress == "" {
+					continue
+				}
+				nic := types.GuestNicInfo{
+					Network:        networkName,
+					IpAddress:      []string{netSettings.IPAddress},
+					MacAddress:     netSettings.MacAddress,
+					Connected:      true,
+					DeviceConfigId: nicIndex,
+					IpConfig: &types.NetIpConfigInfo{
+						IpAddress: []types.NetIpConfigInfoIpAddress{{
+							IpAddress:    netSettings.IPAddress,
+							PrefixLength: int32(netSettings.IPPrefixLen),
+							State:        string(types.NetIpConfigInfoIpAddressStatusPreferred),
+						}},
+					},
+				}
+				guestNics = append(guestNics, nic)
+				nicIndex++
 			}
-			nic := types.GuestNicInfo{
-				Network:        networkName,
-				IpAddress:      []string{netSettings.IPAddress},
-				MacAddress:     netSettings.MacAddress,
-				Connected:      true,
-				DeviceConfigId: nicIndex,
-				IpConfig: &types.NetIpConfigInfo{
-					IpAddress: []types.NetIpConfigInfoIpAddress{{
-						IpAddress:    netSettings.IPAddress,
-						PrefixLength: int32(netSettings.IPPrefixLen),
-						State:        string(types.NetIpConfigInfoIpAddressStatusPreferred),
-					}},
-				},
-			}
-			guestNics = append(guestNics, nic)
-			nicIndex++
-		}
 
-		if len(guestNics) == 0 && primaryNet.IPAddress != "" {
-			guestNics = append(guestNics, types.GuestNicInfo{
-				Network:        "default",
-				IpAddress:      []string{primaryNet.IPAddress},
-				MacAddress:     primaryNet.MacAddress,
-				Connected:      true,
-				DeviceConfigId: 0,
-				IpConfig: &types.NetIpConfigInfo{
-					IpAddress: []types.NetIpConfigInfoIpAddress{{
-						IpAddress:    primaryNet.IPAddress,
-						PrefixLength: int32(primaryNet.IPPrefixLen),
-						State:        string(types.NetIpConfigInfoIpAddressStatusPreferred),
-					}},
-				},
-			})
+			if len(guestNics) == 0 && primaryNet.IPAddress != "" {
+				guestNics = append(guestNics, types.GuestNicInfo{
+					Network:        "default",
+					IpAddress:      []string{primaryNet.IPAddress},
+					MacAddress:     primaryNet.MacAddress,
+					Connected:      true,
+					DeviceConfigId: 0,
+					IpConfig: &types.NetIpConfigInfo{
+						IpAddress: []types.NetIpConfigInfoIpAddress{{
+							IpAddress:    primaryNet.IPAddress,
+							PrefixLength: int32(primaryNet.IPPrefixLen),
+							State:        string(types.NetIpConfigInfoIpAddressStatusPreferred),
+						}},
+					},
+				})
+			}
 		}
 
 		svm.vm.Guest.Net = guestNics
@@ -182,10 +316,14 @@ func (svm *simVM) syncNetworkConfigToVMGuestProperties(ctx *Context, out []byte,
 			}}
 		}
 
-		for _, d := range svm.vm.Config.Hardware.Device {
-			if eth, ok := d.(types.BaseVirtualEthernetCard); ok {
-				eth.GetVirtualEthernetCard().MacAddress = primaryNet.MacAddress
-				break
+		// The vNIC's MAC is the input the container is attached with, so only the legacy path reports the
+		// container's MAC back onto the first card.
+		if !live {
+			for _, d := range svm.vm.Config.Hardware.Device {
+				if eth, ok := d.(types.BaseVirtualEthernetCard); ok {
+					eth.GetVirtualEthernetCard().MacAddress = primaryNet.MacAddress
+					break
+				}
 			}
 		}
 	})
@@ -217,26 +355,37 @@ func (svm *simVM) prepareGuestOperation(auth types.BaseGuestAuthentication) type
 	return nil
 }
 
+// biosUUID returns the VM's BIOS UUID, config.uuid, which a client may set
+// with spec.uuid. It falls back to the UUID vcsim derived for the VM when
+// config.uuid does not parse.
+func (svm *simVM) biosUUID() uuid.UUID {
+	if id, err := uuid.Parse(svm.vm.Config.Uuid); err == nil {
+		return id
+	}
+	return svm.vm.uid
+}
+
 // populateDMI writes BIOS UUID DMI files to a container volume
 func (svm *simVM) populateDMI() error {
 	if svm.c == nil {
 		return nil
 	}
 
+	id := svm.biosUUID()
 	files := []tarEntry{
 		{
 			&tar.Header{
 				Name: "product_uuid",
 				Mode: 0444,
 			},
-			[]byte(productUUID(svm.vm.uid)),
+			[]byte(productUUID(id)),
 		},
 		{
 			&tar.Header{
 				Name: "product_serial",
 				Mode: 0444,
 			},
-			[]byte(productSerial(svm.vm.uid)),
+			[]byte(productSerial(id)),
 		},
 	}
 
@@ -252,11 +401,21 @@ func (svm *simVM) start(ctx *Context) error {
 	}
 
 	if svm.c != nil && svm.c.id != "" {
+		// config.uuid may have been reconfigured while the VM was off.
+		if err := svm.writeMachineID(); err != nil {
+			return err
+		}
+
+		if err := svm.startGuestRPC(ctx); err != nil {
+			return err
+		}
+
 		err := svm.c.start(ctx)
 		if err != nil {
 			log.Printf("%s %s: %s", svm.vm.Name, "start", err)
+			svm.stopGuestRPC()
 		} else {
-			ctx.Update(svm.vm, toolsRunning)
+			svm.updateToolsStatus(ctx, false)
 		}
 
 		return err
@@ -266,34 +425,73 @@ func (svm *simVM) start(ctx *Context) error {
 	var env []string
 	var ports []string
 	var networks []string
+	var extraVolumes []string
+	jsonArgs := false
 	mountDMI := true
+	mountMachineID := true
+	privileged := false
+	nestedContainers := false
+	nestedVolumes := []string{"/var"}
+	vmci := false
 
+	// The keys are documented on ContainerBackingOptionKey.
 	for _, opt := range svm.vm.Config.ExtraConfig {
 		val := opt.GetOptionValue()
+		// Any value is accepted as its string form: a client may send one
+		// typed other than xsd:string, and a failed type assertion here would
+		// panic the power-on task.
+		value := fmt.Sprint(val.Value)
+
 		if val.Key == ContainerBackingOptionKey {
-			run := val.Value.(string)
-			err := json.Unmarshal([]byte(run), &args)
-			if err != nil {
+			run := value
+			if err := json.Unmarshal([]byte(run), &args); err != nil {
 				args = []string{run}
+			} else {
+				jsonArgs = true
 			}
 
 			continue
 		}
 
 		if val.Key == "RUN.mountdmi" {
-			var mount bool
-			err := json.Unmarshal([]byte(val.Value.(string)), &mount)
-			if err == nil {
-				mountDMI = mount
-			}
+			parseBoolOption(value, &mountDMI)
+			continue
+		}
 
+		if val.Key == "RUN.machineId" {
+			parseBoolOption(value, &mountMachineID)
 			continue
 		}
 
 		if val.Key == "RUN.network" {
 			// Specify container network (e.g., "podman" for rootless podman bridge network)
 			// This is important for rootless podman which doesn't assign IPs without a network
-			networks = append(networks, val.Value.(string))
+			networks = append(networks, value)
+			continue
+		}
+
+		if val.Key == "RUN.privileged" {
+			parseBoolOption(value, &privileged)
+			continue
+		}
+
+		if val.Key == "RUN.nestedContainers" {
+			parseBoolOption(value, &nestedContainers)
+			continue
+		}
+
+		if val.Key == "RUN.nestedVolumes" {
+			paths, err := parseNestedVolumes(value)
+			if err != nil {
+				log.Printf("%s: RUN.nestedVolumes %q ignored: %s", svm.vm.Name, value, err)
+				continue
+			}
+			nestedVolumes = paths
+			continue
+		}
+
+		if val.Key == "RUN.vmci" {
+			parseBoolOption(value, &vmci)
 			continue
 		}
 
@@ -302,7 +500,15 @@ func (svm *simVM) start(ctx *Context) error {
 			// or inlined into the RUN.container freeform string as is the case with the nginx volume in the examples?
 			sKey := strings.Split(val.Key, ".")
 			containerPort := sKey[len(sKey)-1]
-			ports = append(ports, fmt.Sprintf("%s:%s", val.Value.(string), containerPort))
+			ports = append(ports, fmt.Sprintf("%s:%s", value, containerPort))
+
+			continue
+		}
+
+		if strings.HasPrefix(val.Key, "RUN.volume.") {
+			if v := strings.TrimSpace(value); v != "" {
+				extraVolumes = append(extraVolumes, v)
+			}
 
 			continue
 		}
@@ -310,12 +516,14 @@ func (svm *simVM) start(ctx *Context) error {
 		if strings.HasPrefix(val.Key, "RUN.env.") {
 			sKey := strings.Split(val.Key, ".")
 			envKey := sKey[len(sKey)-1]
-			env = append(env, fmt.Sprintf("%s=%s", envKey, val.Value.(string)))
+			env = append(env, fmt.Sprintf("%s=%s", envKey, value))
+
+			continue
 		}
 
 		if strings.HasPrefix(val.Key, "guestinfo.") {
 			key := strings.Replace(strings.ToUpper(val.Key), ".", "_", -1)
-			env = append(env, fmt.Sprintf("VMX_%s=%s", key, val.Value.(string)))
+			env = append(env, fmt.Sprintf("VMX_%s=%s", key, value))
 
 			continue
 		}
@@ -326,19 +534,72 @@ func (svm *simVM) start(ctx *Context) error {
 		return nil
 	}
 
-	if len(env) != 0 {
-		// Configure env as the data access method for cloud-init-vmware-guestinfo
-		env = append(env, "VMX_GUESTINFO=true")
-	}
+	// cloud-init's VMware datasource reads guestinfo from the environment only
+	// when VMX_GUESTINFO=true.
+	env = append(env, "VMX_GUESTINFO=true")
 
 	volumes := []string{}
 	if mountDMI {
-		volumes = append(volumes, constructVolumeName(svm.vm.Name, svm.vm.uid.String(), "dmi")+":/sys/class/dmi/id")
+		volumes = append(volumes, constructVolumeName(ctx.Map.containerName(svm.vm.Name, svm.vm.uid.String()), "dmi")+":/sys/class/dmi/id")
+	}
+	volumes = append(volumes, extraVolumes...)
+
+	if mountMachineID {
+		mounts, err := svm.carryBIOSUUID(selectBIOSUUIDCarrier())
+		if err != nil {
+			return err
+		}
+		volumes = append(volumes, mounts...)
+	} else {
+		log.Printf("%s: BIOS UUID carrier none: RUN.machineId is false", svm.vm.Name)
 	}
 
-	var err error
-	svm.c, err = create(ctx, svm.vm.Name, svm.vm.uid.String(), networks, volumes, ports, env, args[0], args[1:])
+	if vmci {
+		dir, err := os.MkdirTemp("", "vcsim-rpc-")
+		if err != nil {
+			svm.removeMachineID()
+			return fmt.Errorf("guestrpc: %w", err)
+		}
+		svm.guestRPCDir = dir
+
+		// The directory is mounted, not the socket, because a file mount
+		// target cannot be created inside the fresh tmpfs that
+		// RUN.nestedContainers puts at /run.
+		volumes = append(volumes, dir+":"+path.Dir(toolbox.UnixSocketPath))
+		env = append(env, toolbox.UnixSocketEnv+"="+toolbox.UnixSocketPath)
+
+		if !hasVolumeDest(svm.vm.Config.ExtraConfig, rpctoolPath) {
+			if bin, err := buildToolbox(); err != nil {
+				log.Printf("%s: %s not mounted: %s", svm.vm.Name, rpctoolPath, err)
+			} else {
+				volumes = append(volumes, bin+":"+rpctoolPath+":ro")
+			}
+		}
+	}
+
+	nics, err := svm.containerNICs(ctx)
 	if err != nil {
+		svm.removeGuestRPC()
+		svm.removeMachineID()
+		return err
+	}
+
+	svm.c, err = create(ctx, svm.vm.Name, svm.vm.uid.String(), args[0], args[1:], createOptions{
+		Networks:          networks,
+		NICs:              nics,
+		CapAdd:            capAdd(ctx),
+		Volumes:           volumes,
+		Ports:             ports,
+		Env:               env,
+		Privileged:        privileged,
+		NestedContainers:  nestedContainers,
+		NestedVolumes:     nestedVolumes,
+		QuoteImageAndArgs: jsonArgs,
+		RecreateIfExists:  true,
+	})
+	if err != nil {
+		svm.removeGuestRPC()
+		svm.removeMachineID()
 		return err
 	}
 
@@ -352,19 +613,24 @@ func (svm *simVM) start(ctx *Context) error {
 		}
 	}
 
-	err = svm.c.start(ctx)
-	if err != nil {
-		log.Printf("%s %s: %s %s", svm.vm.Name, "start", args, err)
+	if err = svm.startGuestRPC(ctx); err != nil {
 		return err
 	}
 
-	ctx.Update(svm.vm, toolsRunning)
+	err = svm.c.start(ctx)
+	if err != nil {
+		log.Printf("%s %s: %s %s", svm.vm.Name, "start", args, err)
+		svm.stopGuestRPC()
+		return err
+	}
+
+	svm.updateToolsStatus(ctx, false)
 
 	svm.vm.logPrintf("%s: %s", args, svm.c.id)
 
 	// Sync network config, retrying a few times to allow the container to get an IP
 	// Container runtimes may take a moment to assign an IP address after start
-	for range 5 {
+	for range ContainerIPAttempts {
 		if err = svm.syncNetworkConfigToVMGuestProperties(ctx, nil, nil); err != nil {
 			log.Printf("%s inspect %s: %s", svm.vm.Name, svm.c.id, err)
 			break
@@ -372,7 +638,7 @@ func (svm *simVM) start(ctx *Context) error {
 		if svm.vm.Guest.IpAddress != "" {
 			break
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(ContainerIPInterval)
 	}
 
 	callback := func(callbackCtx *Context, out []byte, details *containerDetails, c *container) error {
@@ -398,12 +664,24 @@ func (svm *simVM) start(ctx *Context) error {
 			}
 		}
 
-		return svm.syncNetworkConfigToVMGuestProperties(callbackCtx, out, details)
+		if containerGone {
+			return svm.syncNetworkConfigToVMGuestProperties(callbackCtx, out, details)
+		}
+
+		// The watcher inspected the container without the VM's lock, so a
+		// power operation may have changed the container since, and applying
+		// that result would undo the operation's power state. Inspect again
+		// under the lock, which power operations hold.
+		var err error
+		callbackCtx.WithLock(svm.vm, func() {
+			err = svm.syncNetworkConfigToVMGuestProperties(callbackCtx, nil, nil)
+		})
+		return err
 	}
 
 	// Start watching the container resource.
 	err = svm.c.watchContainer(ctx, callback)
-	if _, ok := err.(uninitializedContainer); ok {
+	if isUninitializedContainer(err) {
 		// the container has been deleted before we could watch, despite successful launch so clean up.
 		callback(ctx, nil, nil, svm.c)
 
@@ -419,6 +697,8 @@ func (svm *simVM) stop(ctx *Context) error {
 	if svm == nil || svm.c == nil {
 		return nil
 	}
+
+	defer svm.stopGuestRPC()
 
 	err := svm.c.stop(ctx)
 	if err != nil {
@@ -445,7 +725,7 @@ func (svm *simVM) pause(ctx *Context) error {
 		return err
 	}
 
-	ctx.Update(svm.vm, toolsNotRunning)
+	svm.updateToolsStatus(ctx, true)
 
 	return nil
 }
@@ -463,7 +743,13 @@ func (svm *simVM) restart(ctx *Context) error {
 		return err
 	}
 
-	ctx.Update(svm.vm, toolsRunning)
+	if svm.guestRPC != nil {
+		// The guest's tools restart with it, and report again once they
+		// have; until then they are not running.
+		ctx.Update(svm.vm, toolsNotRunning)
+	} else {
+		ctx.Update(svm.vm, toolsRunning)
+	}
 
 	return nil
 }
@@ -474,6 +760,9 @@ func (svm *simVM) remove(ctx *Context) error {
 		return nil
 	}
 
+	defer svm.removeGuestRPC()
+	defer svm.removeMachineID()
+
 	err := svm.c.remove(ctx)
 	if err != nil {
 		log.Printf("%s %s: %s", svm.vm.Name, "remove", err)
@@ -482,6 +771,216 @@ func (svm *simVM) remove(ctx *Context) error {
 	}
 
 	return nil
+}
+
+// startGuestRPC serves GuestRPC in svm.guestRPCDir, if the VM has one and it
+// is not already served.
+func (svm *simVM) startGuestRPC(ctx *Context) error {
+	if svm.guestRPCDir == "" || svm.guestRPC != nil {
+		return nil
+	}
+
+	srv := newGuestRPCServer(svm.vm, filepath.Join(svm.guestRPCDir, path.Base(toolbox.UnixSocketPath)))
+	svm.toolsNicInfo.Store(false)
+	srv.reported = &svm.toolsNicInfo
+	if err := srv.start(ctx); err != nil {
+		return err
+	}
+	svm.guestRPC = srv
+
+	return nil
+}
+
+// updateToolsStatus reports the tools status after the container has started
+// or resumed (paused false) or has been paused (paused true). With a GuestRPC
+// channel the status is what the guest's tools have reported, which survives
+// a pause; without one it follows the container.
+func (svm *simVM) updateToolsStatus(ctx *Context, paused bool) {
+	if svm.guestRPC == nil {
+		ctx.Update(svm.vm, toolsStatusChanges(!paused))
+		return
+	}
+	svm.guestRPC.setPaused(paused)
+	ctx.Update(svm.vm, toolsStatusChanges(svm.guestRPC.tools.running()))
+}
+
+// stopGuestRPC stops serving GuestRPC, keeping svm.guestRPCDir for a restart.
+func (svm *simVM) stopGuestRPC() {
+	if svm.guestRPC != nil {
+		svm.guestRPC.stop()
+		svm.guestRPC = nil
+	}
+}
+
+// removeGuestRPC stops serving GuestRPC and removes svm.guestRPCDir.
+func (svm *simVM) removeGuestRPC() {
+	svm.stopGuestRPC()
+
+	if svm.guestRPCDir != "" {
+		_ = os.RemoveAll(svm.guestRPCDir)
+		svm.guestRPCDir = ""
+	}
+}
+
+// biosUUIDCarrier is how a container VM's guest is given its BIOS UUID, for
+// RUN.machineId, where it has no DMI data from RUN.mountdmi.
+type biosUUIDCarrier string
+
+// carrierMachineID mounts the BIOS UUID as the guest's machine ID; see
+// createMachineID.
+const carrierMachineID biosUUIDCarrier = "machine-id"
+
+// selectBIOSUUIDCarrier picks the BIOS UUID carrier for this host. Only
+// machine-id is implemented. A DMI carrier, bind-mounting product_uuid and
+// the related files at /sys/class/dmi/id, is to be chosen here on hosts that
+// have /sys/class/dmi/id (spec 95 D-95-32); WSL2 has none.
+func selectBIOSUUIDCarrier() biosUUIDCarrier {
+	return carrierMachineID
+}
+
+// carryBIOSUUID prepares carrier for the VM and returns the mounts that give
+// the guest its BIOS UUID. It logs the carrier, so that one is never chosen
+// silently.
+func (svm *simVM) carryBIOSUUID(carrier biosUUIDCarrier) ([]string, error) {
+	var mounts []string
+	var err error
+
+	switch carrier {
+	case carrierMachineID:
+		mounts, err = svm.createMachineID()
+	default:
+		return nil, fmt.Errorf("unknown BIOS UUID carrier %q", carrier)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if len(mounts) == 0 {
+		log.Printf("%s: BIOS UUID carrier %s: none mounted, RUN.volume targets every path", svm.vm.Name, carrier)
+	} else {
+		log.Printf("%s: BIOS UUID carrier %s: %s", svm.vm.Name, carrier, strings.Join(mounts, " "))
+	}
+
+	return mounts, nil
+}
+
+// machineIDPaths are where vcsim mounts the machine ID for RUN.machineId:
+// systemd's and D-Bus's (machine-id(5)).
+var machineIDPaths = []string{"/etc/machine-id", "/var/lib/dbus/machine-id"}
+
+// createMachineID creates svm.machineIDDir holding the VM's machine ID and
+// returns the read-only mounts of it at each of machineIDPaths that no
+// RUN.volume targets. It returns no mounts, and creates nothing, if every
+// path is taken.
+//
+// A host file is bind-mounted, as for GuestRPC, because a volume cannot be
+// mounted at a file, and the file must be in place before the container
+// starts, since systemd and D-Bus read the machine ID at boot.
+func (svm *simVM) createMachineID() ([]string, error) {
+	var dests []string
+	for _, p := range machineIDPaths {
+		if !hasVolumeDest(svm.vm.Config.ExtraConfig, p) {
+			dests = append(dests, p)
+		}
+	}
+	if len(dests) == 0 {
+		return nil, nil
+	}
+
+	dir, err := os.MkdirTemp("", "vcsim-machine-id-")
+	if err != nil {
+		return nil, fmt.Errorf("machine-id: %w", err)
+	}
+	// MkdirTemp creates the directory 0700, which a container user that is
+	// not the host user, as under rootless podman, could not traverse.
+	if err = os.Chmod(dir, 0755); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("machine-id: %w", err)
+	}
+	svm.machineIDDir = dir
+
+	if err = svm.writeMachineID(); err != nil {
+		svm.removeMachineID()
+		return nil, err
+	}
+
+	file := filepath.Join(dir, "machine-id")
+	mounts := make([]string, len(dests))
+	for i, p := range dests {
+		mounts[i] = file + ":" + p + ":ro"
+	}
+
+	return mounts, nil
+}
+
+// writeMachineID writes the VM's machine ID, its BIOS UUID as machine-id(5)
+// formats it, to the file in svm.machineIDDir, if there is one. The file is
+// rewritten in place, so a mount of it sees the change.
+func (svm *simVM) writeMachineID() error {
+	if svm.machineIDDir == "" {
+		return nil
+	}
+
+	id := svm.biosUUID()
+	data := hex.EncodeToString(id[:]) + "\n"
+	if err := os.WriteFile(filepath.Join(svm.machineIDDir, "machine-id"), []byte(data), 0644); err != nil {
+		return fmt.Errorf("machine-id: %w", err)
+	}
+
+	return nil
+}
+
+// removeMachineID removes svm.machineIDDir.
+func (svm *simVM) removeMachineID() {
+	if svm.machineIDDir != "" {
+		_ = os.RemoveAll(svm.machineIDDir)
+		svm.machineIDDir = ""
+	}
+}
+
+// rpctoolPath is where vcsim mounts the toolbox binary for RUN.vmci.
+const rpctoolPath = "/usr/bin/vmware-rpctool"
+
+// hasVolumeDest reports whether a RUN.volume.* key in extraConfig mounts
+// something at dest.
+func hasVolumeDest(extraConfig []types.BaseOptionValue, dest string) bool {
+	for _, opt := range extraConfig {
+		v := opt.GetOptionValue()
+		if !strings.HasPrefix(v.Key, "RUN.volume.") {
+			continue
+		}
+		if parts := strings.SplitN(fmt.Sprint(v.Value), ":", 3); len(parts) >= 2 && parts[1] == dest {
+			return true
+		}
+	}
+	return false
+}
+
+// parseNestedVolumes parses a RUN.nestedVolumes value: a JSON array of absolute
+// container paths, each of which docker -v can take as an anonymous volume.
+func parseNestedVolumes(value string) ([]string, error) {
+	var paths []string
+	if err := json.Unmarshal([]byte(value), &paths); err != nil {
+		return nil, err
+	}
+	if paths == nil {
+		return nil, fmt.Errorf("not a JSON array")
+	}
+	for _, p := range paths {
+		if !path.IsAbs(p) || path.Clean(p) != p || p == "/" || strings.Contains(p, ":") {
+			return nil, fmt.Errorf("%q is not an absolute container path", p)
+		}
+	}
+	return paths, nil
+}
+
+// parseBoolOption sets *dst from a JSON boolean, leaving it unchanged when
+// value is not one.
+func parseBoolOption(value string, dst *bool) {
+	var b bool
+	if json.Unmarshal([]byte(value), &b) == nil {
+		*dst = b
+	}
 }
 
 func (svm *simVM) exec(ctx *Context, auth types.BaseGuestAuthentication, args []string) (string, types.BaseMethodFault) {
@@ -590,4 +1089,15 @@ func productUUID(id uuid.UUID) string {
 	hex.Encode(dst[24:], id[10:])
 
 	return strings.ToUpper(string(dst[:]))
+}
+
+// firstNICMacAddress returns the MAC address of vm's first virtual Ethernet
+// card, or "" if it has none.
+func firstNICMacAddress(vm *VirtualMachine) string {
+	for _, d := range vm.Config.Hardware.Device {
+		if eth, ok := d.(types.BaseVirtualEthernetCard); ok {
+			return eth.GetVirtualEthernetCard().MacAddress
+		}
+	}
+	return ""
 }

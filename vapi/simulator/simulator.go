@@ -72,6 +72,24 @@ type content struct {
 	VMTX map[string]*types.ManagedObjectReference
 }
 
+// setSecurityCompliance sets the security fields that vCenter reports on every item of l. The
+// vSphere Automation API documents security_compliance as present in every item get and list, and
+// certificate_verification_info only for items in a library with a security policy. An item in a
+// library without a policy is compliant; an item in a library with one is non-compliant, because
+// the simulator does not verify signatures.
+func (l *content) setSecurityCompliance(i *library.Item) {
+	if l.SecurityPolicyID == "" {
+		i.SecurityCompliance = types.NewBool(true)
+		i.CertificateVerification = nil
+		return
+	}
+	// TODO: verify signed items
+	i.SecurityCompliance = types.NewBool(false)
+	i.CertificateVerification = &library.ItemCertificateVerification{
+		Status: "NOT_AVAILABLE",
+	}
+}
+
 type update struct {
 	*sync.WaitGroup
 	*library.Session
@@ -100,6 +118,7 @@ type handler struct {
 	Policies     []library.ContentSecurityPoliciesInfo
 	Trust        map[string]library.TrustedCertificate
 	LibraryUsage map[string]map[string]library.Usage
+	Changes      changeLog
 }
 
 func init() {
@@ -185,10 +204,12 @@ func New(u *url.URL, r *simulator.Registry) ([]string, http.Handler) {
 		h := handlers[i]
 		s.HandleFunc(h.p, h.m)
 	}
+	s.ServeMux.HandleFunc(CLSPath, s.cls)
 
 	return []string{
 		rest.Path, rest.Path + "/",
 		vapi.Path, vapi.Path + "/",
+		CLSPath,
 	}, s
 }
 
@@ -297,7 +318,34 @@ func (s *handler) isAuthorized(r *http.Request) bool {
 	} else {
 		_, ok = s.Update[id]
 	}
+	if !ok {
+		_, ok = s.soapSession(id)
+	}
 	return ok
+}
+
+// soapSession returns the vAPI view of the live SOAP session with the given ID.
+// vCenter 8.0U3 and later accept a SOAP session ID as vmware-api-session-id, so a
+// client can share one session across both endpoints without a vAPI login. The
+// session is not copied into s.Session: each request looks it up again, so a SOAP
+// logout or expiry ends it here too.
+func (s *handler) soapSession(id string) (*rest.Session, bool) {
+	if id == "" {
+		return nil, false
+	}
+	us, ok := s.Map.SessionManager().ActiveSession(id)
+	if !ok {
+		return nil, false
+	}
+	return &rest.Session{User: us.UserName, Created: us.LoginTime, LastAccessed: us.LastActiveTime}, true
+}
+
+// sessionInfo returns the vAPI session with the given ID, created by a vAPI login or shared from SOAP.
+func (s *handler) sessionInfo(id string) (*rest.Session, bool) {
+	if session, ok := s.Session[id]; ok {
+		return session, true
+	}
+	return s.soapSession(id)
 }
 
 func (s *handler) hasAuthorization(r *http.Request) (string, bool) {
@@ -305,8 +353,11 @@ func (s *handler) hasAuthorization(r *http.Request) (string, bool) {
 	if ok { // user+pass auth
 		return u, s.Map.SessionManager().Authenticate(s.URL, &vim.Login{UserName: u, Password: p})
 	}
-	auth := r.Header.Get("Authorization")
-	return "TODO", strings.HasPrefix(auth, "SIGN ") // token auth
+	auth, ok := strings.CutPrefix(r.Header.Get("Authorization"), "SIGN ")
+	if !ok {
+		return "", false
+	}
+	return s.tokenAuthorization(r, auth) // token auth
 }
 
 func (s *handler) findTag(e vim.VslmTagEntry) *tags.Tag {
@@ -580,7 +631,7 @@ func (s *handler) session(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		if s.action(r) != "" {
-			if session, ok := s.Session[id]; ok {
+			if session, ok := s.sessionInfo(id); ok {
 				OK(w, session)
 			} else {
 				w.WriteHeader(http.StatusUnauthorized)
@@ -608,7 +659,8 @@ func (s *handler) session(w http.ResponseWriter, r *http.Request) {
 		delete(s.Session, id)
 		OK(w)
 	case http.MethodGet:
-		OK(w, s.Session[id])
+		session, _ := s.sessionInfo(id)
+		OK(w, session)
 	}
 }
 
@@ -714,6 +766,15 @@ func (s *handler) certificateAuthority(w http.ResponseWriter, r *http.Request) {
 
 func (s *handler) action(r *http.Request) string {
 	return r.URL.Query().Get("~action")
+}
+
+// clientHost returns the host the client used to reach the simulator, so URLs returned to it are reachable from its network.
+// The server's own listen address is only a fallback for requests without a Host.
+func (s *handler) clientHost(r *http.Request) string {
+	if r.Host != "" {
+		return r.Host
+	}
+	return s.URL.Host
 }
 
 func (s *handler) id(r *http.Request) string {
@@ -1072,6 +1133,8 @@ func (s *handler) library(w http.ResponseWriter, r *http.Request) {
 			spec.Library.ServerGUID = uuid.New().String()
 			spec.Library.CreationTime = types.NewTime(time.Now())
 			spec.Library.LastModifiedTime = types.NewTime(time.Now())
+			// The version is server-assigned; a create spec's version is ignored.
+			spec.Library.Version = getVersionString("")
 			spec.Library.UnsetSecurityPolicyID = spec.Library.SecurityPolicyID == ""
 			dir := s.libraryPath(&spec.Library, "")
 			if err := os.Mkdir(dir, 0750); err != nil {
@@ -1090,11 +1153,12 @@ func (s *handler) library(w http.ResponseWriter, r *http.Request) {
 				// Generate PublishURL as real vCenter does
 				pub.PublishURL = (&url.URL{
 					Scheme: s.URL.Scheme,
-					Host:   s.URL.Host,
+					Host:   s.clientHost(r),
 					Path:   "/cls/vcsp/lib/" + id,
 				}).String()
 			}
 
+			s.libraryChanged(changeCreate, &spec.Library)
 			s.syncSubLib(s.Library[id])
 
 			spec.Library.StateInfo = &library.StateInfo{State: "ACTIVE"}
@@ -1186,8 +1250,11 @@ func (s *handler) syncSubLib(dstLib *content) error {
 			},
 		}
 
+		dstLib.setSecurityCompliance(dstItem.Item)
+
 		// Add the new item to the subscribed library.
 		dstLib.Item[dstItem.ID] = dstItem
+		s.itemChanged(changeCreate, dstItem.Item)
 
 		// Synchronize the item.
 		if err := s.syncItem(
@@ -1257,6 +1324,7 @@ func (s *handler) syncItem(
 	if !ok {
 		// The source item is no more, so delete the destination item.
 		delete(dstLib.Item, dstItem.ID)
+		s.itemChanged(changeDelete, dstItem.Item)
 
 		// Clean up the destination item's files as well.
 		os.RemoveAll(dstItemPath)
@@ -1534,13 +1602,19 @@ func (s *handler) libraryID(w http.ResponseWriter, r *http.Request) {
 		}
 		delete(s.Library, id)
 		delete(s.LibraryUsage, id)
+		s.libraryChanged(changeDelete, l.Library)
 		OK(w)
 	case http.MethodPatch:
 		var spec struct {
 			Library library.Library `json:"update_spec"`
 		}
 		if s.decode(r, w, &spec) {
+			// As on vCenter, the version is incremented by an update of the library's own
+			// properties; adding, updating or removing its items leaves it unchanged.
+			version := l.Version
 			l.Patch(&spec.Library)
+			l.Version = getVersionString(version)
+			s.libraryChanged(changeUpdate, l.Library, libraryProperties(&spec.Library)...)
 			OK(w)
 		}
 	case http.MethodPost:
@@ -1980,14 +2054,9 @@ func (s *handler) libraryItem(w http.ResponseWriter, r *http.Request) {
 			spec.Item.ContentVersion = getVersionString("")
 			spec.Item.MetadataVersion = getVersionString("")
 
-			if l.SecurityPolicyID != "" {
-				// TODO: verify signed items
-				spec.Item.SecurityCompliance = types.NewBool(false)
-				spec.Item.CertificateVerification = &library.ItemCertificateVerification{
-					Status: "NOT_AVAILABLE",
-				}
-			}
+			l.setSecurityCompliance(&spec.Item)
 			l.Item[id] = &item{Item: &spec.Item}
+			s.itemChanged(changeCreate, &spec.Item)
 			OK(w, id)
 		}
 	case http.MethodGet:
@@ -2042,6 +2111,7 @@ func (s *handler) libraryItemID(w http.ResponseWriter, r *http.Request) {
 		}
 		s.deleteVM(l.Item[item.ID].Template)
 		delete(l.Item, item.ID)
+		s.itemChanged(changeDelete, item.Item)
 		OK(w)
 	case http.MethodPatch:
 		var spec struct {
@@ -2049,6 +2119,7 @@ func (s *handler) libraryItemID(w http.ResponseWriter, r *http.Request) {
 		}
 		if s.decode(r, w, &spec) {
 			item.Patch(&spec.Item)
+			s.itemChanged(changeUpdate, item.Item, itemProperties(&spec.Item)...)
 			OK(w)
 		}
 	case http.MethodPost:
@@ -2075,7 +2146,9 @@ func (s *handler) libraryItemID(w http.ResponseWriter, r *http.Request) {
 			nitem := item.cp()
 			nitem.ID = id
 			nitem.LibraryID = spec.LibraryID
+			l.setSecurityCompliance(nitem.Item)
 			l.Item[id] = nitem
+			s.itemChanged(changeCreate, nitem.Item)
 
 			OK(w, id)
 		case "sync":
@@ -2295,7 +2368,10 @@ func (s *handler) libraryItemUpdateSessionID(w http.ResponseWriter, r *http.Requ
 		case "complete":
 			go func() {
 				up.Wait() // wait for any PULL sources to complete
+				s.Lock()
 				done("DONE")
+				s.Unlock()
+				s.itemChanged(changeUpdate, &library.Item{ID: session.LibraryItemID, LibraryID: up.Library.ID})
 			}()
 		case "fail":
 			done("ERROR")
@@ -2437,7 +2513,7 @@ func (s *handler) pullSource(up update, info *library.UpdateFile) {
 		return
 	}
 
-	err = s.libraryItemFileCreate(&up, info.Name, res.Body, info.Checksum)
+	err = s.libraryItemFileCreate(&up, info.Name, res.Body, info.Checksum, false)
 	done(err)
 }
 
@@ -2484,7 +2560,7 @@ func (s *handler) libraryItemUpdateSessionFileID(w http.ResponseWriter, r *http.
 			case "PUSH":
 				u := url.URL{
 					Scheme: s.URL.Scheme,
-					Host:   s.URL.Host,
+					Host:   s.clientHost(r),
 					Path:   path.Join(rest.Path, internal.LibraryItemFileData, id, info.Name),
 				}
 				info.UploadEndpoint = &library.TransferEndpoint{URI: u.String()}
@@ -2650,7 +2726,7 @@ func (s *handler) libraryItemDownloadSessionFileID(w http.ResponseWriter, r *htt
 		if s.decode(r, w, &spec) {
 			u := url.URL{
 				Scheme: s.URL.Scheme,
-				Host:   s.URL.Host,
+				Host:   s.clientHost(r),
 				Path:   path.Join(rest.Path, internal.LibraryItemFileData, id, spec.File),
 			}
 			info := &library.DownloadFile{
@@ -2710,9 +2786,20 @@ func (s *handler) libraryItemFileCreate(
 	up *update,
 	dstFileName string,
 	body io.ReadCloser,
-	cs *library.Checksum) error {
+	cs *library.Checksum,
+	locked bool) error {
 
 	defer body.Close()
+
+	// commit updates the library item. Callers serving a request already hold the handler lock,
+	// while pullSource does not, and must not hold it while streaming the source body.
+	commit := func(update func(i *item)) {
+		if !locked {
+			s.Lock()
+			defer s.Unlock()
+		}
+		update(s.Library[up.Library.ID].Item[up.Session.LibraryItemID])
+	}
 
 	if !isValidFileName(dstFileName) {
 		return errors.New("invalid file name")
@@ -2778,8 +2865,9 @@ func (s *handler) libraryItemFileCreate(
 		}
 
 		// Update the library item with the uploaded file.
-		i := s.Library[up.Library.ID].Item[up.Session.LibraryItemID]
-		i.File = append(i.File, f)
+		commit(func(i *item) {
+			i.File = append(i.File, f)
+		})
 		return nil
 	}
 
@@ -2833,8 +2921,9 @@ func (s *handler) libraryItemFileCreate(
 	}
 
 	// Update the library item with the uploaded files.
-	i := s.Library[up.Library.ID].Item[up.Session.LibraryItemID]
-	i.File = files
+	commit(func(i *item) {
+		i.File = files
+	})
 
 	return nil
 }
@@ -2876,7 +2965,7 @@ func (s *handler) libraryItemFileData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := s.libraryItemFileCreate(up, name, r.Body, nil)
+	err := s.libraryItemFileCreate(up, name, r.Body, nil, true)
 	if err != nil {
 		s.error(w, err)
 	}
@@ -3114,6 +3203,7 @@ func (s *handler) libraryItemOVF(w http.ResponseWriter, r *http.Request) {
 		l, ok := s.Library[req.Target.LibraryID]
 		if !ok {
 			http.NotFound(w, r)
+			return
 		}
 
 		id := uuid.New().String()
@@ -3128,6 +3218,8 @@ func (s *handler) libraryItemOVF(w http.ResponseWriter, r *http.Request) {
 				LastModifiedTime: types.NewTime(time.Now()),
 			},
 		}
+		l.setSecurityCompliance(l.Item[id].Item)
+		s.itemChanged(changeCreate, l.Item[id].Item)
 
 		res := vcenter.CreateResult{
 			Succeeded: true,
@@ -3203,13 +3295,53 @@ func (s *handler) libraryItemOVFID(w http.ResponseWriter, r *http.Request) {
 		}
 		OK(w, d)
 	case "filter":
-		res := vcenter.FilterResponse{
-			Name: item.Name,
-		}
-		OK(w, res)
+		OK(w, s.libraryItemFilter(lib, item))
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// libraryItemFilter returns the ovf_summary of an OVF item: the networks of its
+// NetworkSection, which clients map to target networks in a deploy, along with the
+// annotation and EULAs of its VirtualSystem. An item without a readable descriptor
+// reports its name only.
+func (s *handler) libraryItemFilter(lib *library.Library, item *item) vcenter.FilterResponse {
+	res := vcenter.FilterResponse{
+		Name: item.Name,
+	}
+
+	name := item.ovf()
+	if name == "" {
+		return res
+	}
+	f, err := os.Open(filepath.Join(s.libraryPath(lib, item.ID), name))
+	if err != nil {
+		log.Printf("library item %s filter: %s", item.ID, err)
+		return res
+	}
+	defer f.Close()
+
+	e, err := ovf.Unmarshal(f)
+	if err != nil {
+		log.Printf("library item %s filter: %s", item.ID, err)
+		return res
+	}
+
+	if e.Network != nil {
+		for _, n := range e.Network.Networks {
+			res.Networks = append(res.Networks, n.Name)
+		}
+	}
+	if vs := e.VirtualSystem; vs != nil {
+		if vs.Annotation != nil {
+			res.Annotation = vs.Annotation.Annotation
+		}
+		for _, eula := range vs.Eula {
+			res.EULAs = append(res.EULAs, eula.License)
+		}
+	}
+
+	return res
 }
 
 func (s *handler) deleteVM(ref *types.ManagedObjectReference) {
@@ -3316,6 +3448,8 @@ func (s *handler) libraryItemCreateTemplate(w http.ResponseWriter, r *http.Reque
 		},
 		Template: ref,
 	}
+	l.setSecurityCompliance(l.Item[id].Item)
+	s.itemChanged(changeCreate, l.Item[id].Item)
 
 	OK(w, id)
 }

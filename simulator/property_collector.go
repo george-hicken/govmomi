@@ -929,7 +929,7 @@ func (pc *PropertyCollector) WaitForUpdatesEx(ctx *Context, r *types.WaitForUpda
 		return body
 	}
 
-	ticker := time.NewTicker(20 * time.Millisecond) // allow for updates to accumulate
+	ticker := time.NewTicker(PropertyCollectorBatchWindow) // allow for updates to accumulate
 	defer ticker.Stop()
 	// Start the wait loop, returning on one of:
 	// - Client calls CancelWaitForUpdates

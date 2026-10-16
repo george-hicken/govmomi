@@ -45,6 +45,8 @@ package simulator
 
 import (
 	"path"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/vmware/govmomi/vim25/types"
@@ -71,7 +73,30 @@ type ContainerImageEntry struct {
 	// Common examples:
 	//   "RUN.mountdmi":       "false"  — disable /sys/class/dmi mount for rootless podman
 	//   "RUN.network":        "podman" — explicit network for rootless podman
+	//
+	// A value may contain the token "{vmname}", which is replaced with the
+	// matched VM's name when the entry is injected. That names a per-VM host
+	// path, such as a log directory, for an entry whose glob matches many VMs.
 	ExtraConfig map[string]string
+}
+
+// VMNameToken is the ExtraConfig value token that expands to the VM's name.
+const VMNameToken = "{vmname}"
+
+// extraConfigFor returns the entry's ExtraConfig as option values for the VM
+// named vmName, with VMNameToken expanded in each value, sorted by key.
+func (e ContainerImageEntry) extraConfigFor(vmName string) []types.BaseOptionValue {
+	keys := make([]string, 0, len(e.ExtraConfig))
+	for k := range e.ExtraConfig {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var opts []types.BaseOptionValue
+	for _, k := range keys {
+		opts = append(opts, &types.OptionValue{Key: k, Value: strings.ReplaceAll(e.ExtraConfig[k], VMNameToken, vmName)})
+	}
+	return opts
 }
 
 // ContainerImageRegistry maps VM config attributes to OCI container images.

@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vmware/govmomi/internal"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/vim25/methods"
 	"github.com/vmware/govmomi/vim25/mo"
@@ -25,6 +26,11 @@ import (
 
 type Folder struct {
 	mo.Folder
+
+	// externallyManaged is the info a CreateExternallyManagedFolder call
+	// recorded. mo.Folder has no property for it, so it is not visible to
+	// the property collector.
+	externallyManaged *types.FolderExternallyManagedFolderInfo
 }
 
 func asFolderMO(obj mo.Reference) (*mo.Folder, bool) {
@@ -186,33 +192,105 @@ func (f *Folder) AddStandaloneHostTask(ctx *Context, a *types.AddStandaloneHost_
 func (f *Folder) CreateFolder(ctx *Context, c *types.CreateFolder) soap.HasFault {
 	r := &methods.CreateFolderBody{}
 
-	if folderHasChildType(&f.Folder, "Folder") {
-		name := escapeSpecialCharacters(c.Name)
-
-		if obj := ctx.Map.FindByName(name, f.ChildEntity); obj != nil {
-			r.Fault_ = Fault("", &types.DuplicateName{
-				Name:   name,
-				Object: obj.Reference(),
-			})
-
-			return r
-		}
-
-		folder := &Folder{}
-
-		folder.Name = name
-		folder.ChildType = f.ChildType
-
-		folderPutChild(ctx, &f.Folder, folder)
-
-		r.Res = &types.CreateFolderResponse{
-			Returnval: folder.Self,
-		}
-	} else {
+	if !folderHasChildType(&f.Folder, "Folder") {
 		r.Fault_ = f.typeNotSupported()
+		return r
+	}
+
+	ref, fault := f.createFolder(ctx, c.Name, nil)
+	if fault != nil {
+		r.Fault_ = fault
+		return r
+	}
+
+	r.Res = &types.CreateFolderResponse{
+		Returnval: ref,
 	}
 
 	return r
+}
+
+// CreateNamespaceFolder is the internal vCenter method wcpsvc and
+// wcp-namespace-operator use to create a Supervisor Namespace folder. It
+// behaves as CreateFolder and additionally sets the folder's namespace
+// property, which supervisor-authz-service requires before it honours
+// permissions on the folder.
+func (f *Folder) CreateNamespaceFolder(ctx *Context, c *internal.CreateNamespaceFolderRequest) soap.HasFault {
+	r := &internal.CreateNamespaceFolderBody{}
+
+	if !folderHasChildType(&f.Folder, "Folder") {
+		r.Fault_ = f.typeNotSupported()
+		return r
+	}
+
+	ref, fault := f.createFolder(ctx, c.Name, func(folder *Folder) {
+		folder.Namespace = &c.NamespaceId
+	})
+	if fault != nil {
+		r.Fault_ = fault
+		return r
+	}
+
+	r.Res = &internal.CreateNamespaceFolderResponse{
+		Returnval: ref,
+	}
+
+	return r
+}
+
+// CreateExternallyManagedFolder is the internal vCenter method used to create
+// a folder that represents an object in an external system, such as the
+// vSphere Pod folder wcp-namespace-operator creates under each namespace
+// folder. It behaves as CreateFolder and records the external ID and type.
+func (f *Folder) CreateExternallyManagedFolder(ctx *Context, c *internal.CreateExternallyManagedFolderRequest) soap.HasFault {
+	r := &internal.CreateExternallyManagedFolderBody{}
+
+	if !folderHasChildType(&f.Folder, "Folder") {
+		r.Fault_ = f.typeNotSupported()
+		return r
+	}
+
+	ref, fault := f.createFolder(ctx, c.Name, func(folder *Folder) {
+		info := c.Info
+		folder.externallyManaged = &info
+	})
+	if fault != nil {
+		r.Fault_ = fault
+		return r
+	}
+
+	r.Res = &internal.CreateExternallyManagedFolderResponse{
+		Returnval: ref,
+	}
+
+	return r
+}
+
+// createFolder creates a child folder of f with f's child types, faulting
+// with DuplicateName (carrying the existing object) if a child of that name
+// already exists. init, if not nil, sets method-specific state on the new
+// folder before it is added to the inventory.
+func (f *Folder) createFolder(ctx *Context, name string, init func(*Folder)) (types.ManagedObjectReference, *soap.Fault) {
+	name = escapeSpecialCharacters(name)
+
+	if obj := ctx.Map.FindByName(name, f.ChildEntity); obj != nil {
+		return types.ManagedObjectReference{}, Fault("", &types.DuplicateName{
+			Name:   name,
+			Object: obj.Reference(),
+		})
+	}
+
+	folder := &Folder{}
+
+	folder.Name = name
+	folder.ChildType = f.ChildType
+	if init != nil {
+		init(folder)
+	}
+
+	folderPutChild(ctx, &f.Folder, folder)
+
+	return folder.Self, nil
 }
 
 func escapeSpecialCharacters(name string) string {
@@ -722,9 +800,16 @@ func (f *Folder) CreateDVSTask(ctx *Context, req *types.CreateDVS_Task) soap.Has
 		}})
 
 		if uplinkPg := dvs.uplinkPortgroup(ctx); uplinkPg != nil {
+			// vCenter marks a DVS's uplink portgroup with config.uplink; clients
+			// use it to tell the uplinks apart from ordinary DVPGs.
+			uplinkPg.Config.Uplink = types.NewBool(true)
 			if config, ok := dvs.Config.(*types.VMwareDVSConfigInfo); ok {
 				config.UplinkPortgroup = []types.ManagedObjectReference{uplinkPg.Reference()}
 			}
+		}
+
+		if fault := dvs.reconfigureHosts(ctx, spec.Host); fault != nil {
+			return nil, fault
 		}
 
 		return dvs.Reference(), nil

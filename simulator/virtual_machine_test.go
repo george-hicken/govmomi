@@ -5628,3 +5628,177 @@ func TestVirtualMachineRuntimeEnumFields(t *testing.T) {
 		t.Fatal("no VirtualMachine objects found in the model")
 	}
 }
+
+// An edit that leaves a vNIC's MAC out keeps the MAC; the simulator used to generate a new one.
+func TestReconfigNICEditKeepsMAC(t *testing.T) {
+	Test(func(ctx context.Context, c *vim25.Client) {
+		finder := find.NewFinder(c, false)
+		dc, err := finder.DefaultDatacenter(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		finder.SetDatacenter(dc)
+		vms, err := finder.VirtualMachineList(ctx, "*")
+		if err != nil || len(vms) == 0 {
+			t.Fatalf("no VMs: %v", err)
+		}
+		vm := vms[0]
+
+		devices, err := vm.Device(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nics := devices.SelectByType((*types.VirtualEthernetCard)(nil))
+		if len(nics) == 0 {
+			t.Skip("VM has no vNIC")
+		}
+		nic := nics[0]
+		card := nic.(types.BaseVirtualEthernetCard).GetVirtualEthernetCard()
+		edit := func() {
+			task, err := vm.Reconfigure(ctx, types.VirtualMachineConfigSpec{
+				DeviceChange: []types.BaseVirtualDeviceConfigSpec{&types.VirtualDeviceConfigSpec{
+					Operation: types.VirtualDeviceConfigSpecOperationEdit,
+					Device:    nic,
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := task.Wait(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// A MAC that generateMAC would not produce, so the check cannot pass by chance.
+		const mac = "00:50:56:aa:bb:cc"
+		card.MacAddress = mac
+		edit()
+
+		card.MacAddress = ""
+		edit()
+
+		devices, err = vm.Device(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := devices.FindByKey(card.Key).(types.BaseVirtualEthernetCard).GetVirtualEthernetCard().MacAddress
+		if got != mac {
+			t.Errorf("vNIC MAC after an edit without one: %s, want %s", got, mac)
+		}
+	})
+}
+
+// TestCreateVmWithLinkedChildDisk creates a VM whose disk is a linked child of
+// an existing parent disk, with no FileOperation, as vm-operator FastDeploy
+// does in linked mode. The child is created next to the VM.
+func TestCreateVmWithLinkedChildDisk(t *testing.T) {
+	ctx := context.Background()
+
+	model := ESX()
+	defer model.Remove()
+	if err := model.Create(); err != nil {
+		t.Fatal(err)
+	}
+
+	s := model.Service.NewServer()
+	defer s.Close()
+
+	c, err := govmomi.NewClient(ctx, s.URL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	finder := find.NewFinder(c.Client, false)
+	dc, err := finder.DefaultDatacenter(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finder.SetDatacenter(dc)
+
+	folders, err := dc.Folders(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ds, err := finder.DefaultDatastore(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hosts, err := finder.HostSystemList(ctx, "*/*")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pool, err := hosts[0].ResourcePool(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dm := object.NewVirtualDiskManager(c.Client)
+	parent := fmt.Sprintf("[%s] parent.vmdk", ds.Name())
+	task, err := dm.CreateVirtualDisk(ctx, parent, nil, &types.FileBackedVirtualDiskSpec{
+		VirtualDiskSpec: types.VirtualDiskSpec{
+			AdapterType: string(types.VirtualDiskAdapterTypeLsiLogic),
+			DiskType:    string(types.VirtualDiskTypeThin),
+		},
+		CapacityKb: 1024 * 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = task.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var devices object.VirtualDeviceList
+	scsi, err := devices.CreateSCSIController("lsilogic")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	child := fmt.Sprintf("[%s] child.vmdk", ds.Name())
+	dsRef := ds.Reference()
+	disk := devices.CreateDisk(scsi.(types.BaseVirtualController), dsRef, child)
+	disk.Backing.(*types.VirtualDiskFlatVer2BackingInfo).Parent = &types.VirtualDiskFlatVer2BackingInfo{
+		VirtualDeviceFileBackingInfo: types.VirtualDeviceFileBackingInfo{
+			FileName:  parent,
+			Datastore: &dsRef,
+		},
+		DiskMode:        string(types.VirtualDiskModePersistent),
+		ThinProvisioned: types.NewBool(true),
+	}
+
+	vmSpec := types.VirtualMachineConfigSpec{
+		Name:     "test-vm-linked-child",
+		GuestId:  string(types.VirtualMachineGuestOsIdentifierOtherGuest),
+		Files:    &types.VirtualMachineFileInfo{VmPathName: fmt.Sprintf("[%s]", ds.Name())},
+		NumCPUs:  1,
+		MemoryMB: 128,
+		DeviceChange: []types.BaseVirtualDeviceConfigSpec{
+			&types.VirtualDeviceConfigSpec{
+				Operation: types.VirtualDeviceConfigSpecOperationAdd,
+				Device:    scsi,
+			},
+			&types.VirtualDeviceConfigSpec{
+				Operation: types.VirtualDeviceConfigSpecOperationAdd,
+				Device:    disk,
+			},
+		},
+	}
+
+	vmTask, err := folders.VmFolder.CreateVM(ctx, vmSpec, pool, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = vmTask.WaitForResult(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = dm.QueryVirtualDiskUuid(ctx, parent, nil); err != nil {
+		t.Errorf("parent disk not found: %s", err)
+	}
+	if _, err = dm.QueryVirtualDiskUuid(ctx, child, nil); err != nil {
+		t.Errorf("child disk not created: %s", err)
+	}
+}

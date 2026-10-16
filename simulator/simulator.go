@@ -265,7 +265,19 @@ func (s *Service) call(ctx *Context, method *Method) soap.HasFault {
 	if m.Type().NumIn() == 2 {
 		args = append(args, reflect.ValueOf(ctx))
 	}
-	args = append(args, reflect.ValueOf(method.Body))
+	body := reflect.ValueOf(method.Body)
+	if in := m.Type().In(m.Type().NumIn() - 1); body.Type() != in {
+		// Another package linked into the process, such as a fork of vim25/types, can
+		// register its own type under the same name, so the decoder builds that type
+		// rather than the one the handler takes. Convert it when the layouts match.
+		if !body.Type().ConvertibleTo(in) {
+			msg := fmt.Sprintf("%s: request type %s does not match %s", method.Name, body.Type(), in)
+			log.Print(msg)
+			return &serverFaultBody{Reason: Fault(msg, &types.InvalidRequest{})}
+		}
+		body = body.Convert(in)
+	}
+	args = append(args, body)
 	ctx.Map.WithLock(ctx, handler, func() {
 		res = m.Call(args)
 	})
