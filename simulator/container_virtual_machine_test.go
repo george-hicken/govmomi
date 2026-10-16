@@ -52,7 +52,7 @@ func constructNginxBacking(t *testing.T, content string, port int) []types.BaseO
 	err = os.Chmod(fpath, 0644)
 	require.Nil(t, err, "Expected to cleanly set file permissions on content: %s", err)
 
-	args := fmt.Sprintf("-v '%s:/usr/share/nginx/html:ro' nginx", dir)
+	args := fmt.Sprintf("-v '%s:/usr/share/nginx/html:ro' docker.io/library/nginx:1.27-alpine", dir)
 
 	return []types.BaseOptionValue{
 		&types.OptionValue{Key: ContainerBackingOptionKey, Value: args}, // run nginx

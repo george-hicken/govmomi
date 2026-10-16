@@ -77,7 +77,7 @@ func Example_setVirtualMachineProperties() {
 // Tie a docker container to the lifecycle of a vcsim VM
 func Example_runContainer() {
 	simulator.Test(func(ctx context.Context, c *vim25.Client) {
-		if !test.HasDocker() {
+		if !test.HasDocker() || !test.HasContainerBridge() {
 			fmt.Println("0 diff")
 			return
 		}
@@ -101,7 +101,7 @@ func Example_runContainer() {
 		os.Chmod(fpath, 0644)
 		defer os.RemoveAll(dir)
 
-		args := fmt.Sprintf("-v '%s:/usr/share/nginx/html:ro' nginx", dir)
+		args := fmt.Sprintf("-v '%s:/usr/share/nginx/html:ro' docker.io/library/nginx:1.27-alpine", dir)
 
 		spec := types.VirtualMachineConfigSpec{
 			Name: "nginx",
