@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -67,7 +68,11 @@ func constructNginxBacking(t *testing.T, content string, port int) []types.BaseO
 // podman pass test.ContainerNetworkFromSpec(&spec) so the probe shares the VM
 // container's network.
 func validateNginxContainer(t *testing.T, vm *object.VirtualMachine, expected string, port int, network string) error {
-	ip, _ := vm.WaitForIP(context.Background(), true) // Returns the docker container's IP
+	// Bounded, so a container that never gets an IP fails this test rather than
+	// hanging the test binary.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	ip, _ := vm.WaitForIP(ctx, true) // Returns the docker container's IP
 
 	// Verify direct container IP access.  Join the same bridge as the nginx
 	// container so the probe can reach it; omit --network on runtimes where
