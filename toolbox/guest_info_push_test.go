@@ -565,3 +565,40 @@ func settle(t *testing.T, queries *atomic.Int32, quiet time.Duration) int32 {
 	}
 	return last
 }
+
+// TestUpdateGuestInfoDedup checks that a value the VMX rejects is not recorded
+// as sent, so the next gather resends it, and that a reset forgets the
+// accepted values.
+func TestUpdateGuestInfoDedup(t *testing.T) {
+	out := &recordingChannelOut{reply: []byte("0 Invalid nicinfo")}
+	s := NewService(new(mockChannelIn), out)
+	s.out = &ChannelOut{out} // no trace
+
+	value := []byte("nicinfo")
+	if s.updateGuestInfo(GuestInfoIPAddressV2, value) {
+		t.Fatal("rejected value reported as accepted")
+	}
+
+	out.reply = rpciOK
+	if !s.updateGuestInfo(GuestInfoIPAddressV2, value) {
+		t.Fatal("accepted value reported as rejected")
+	}
+	if n := len(out.take()); n != 2 {
+		t.Fatalf("sent %d requests, want 2: the rejected value must be resent", n)
+	}
+
+	if !s.updateGuestInfo(GuestInfoIPAddressV2, value) {
+		t.Fatal("unchanged accepted value reported as rejected")
+	}
+	if n := len(out.take()); n != 0 {
+		t.Errorf("sent %d requests for an unchanged value, want 0", n)
+	}
+
+	s.guestInfo = nil // as a reset does
+	if !s.updateGuestInfo(GuestInfoIPAddressV2, value) {
+		t.Fatal("value after reset reported as rejected")
+	}
+	if n := len(out.take()); n != 1 {
+		t.Errorf("sent %d requests after reset, want 1", n)
+	}
+}
