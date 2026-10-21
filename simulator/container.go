@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -505,6 +506,7 @@ func create(ctx *Context, name string, id string, image string, args []string, o
 			volumes = []string{"/var"}
 		}
 		run = append(run, nestedContainerArgs(volumes)...)
+		run = append(run, nestedModulesVolumes("/lib/modules")...)
 	} else {
 		// the host cgroup namespace gives access to every controller, cpuset included
 		run = append(run, "--cgroupns=host")
@@ -568,6 +570,61 @@ func nestedContainerArgs(volumes []string) []string {
 		args = append(args, "--volume", v)
 	}
 	return args
+}
+
+// nestedModulesVolumes returns the --volume flags that bind, read-only, the real
+// directory behind each symlink in the host's modules directory that points outside
+// it, at the path the link names. The /lib/modules bind mount alone exposes such a
+// link as dangling, as when a kernel package update replaces the running kernel's
+// directory with a link into /tmp: modprobe in the container then finds no modules.
+// The mount goes at the link's target rather than at the link's own path under
+// /lib/modules, because the read-only bind cannot take a new mount point beneath the
+// dangling link. Links into the modules directory itself are already visible, and
+// dangling links and links to anything but a directory are skipped.
+func nestedModulesVolumes(hostModules string) []string {
+	entries, err := os.ReadDir(hostModules)
+	if err != nil {
+		log.Printf("nested containers: reading %s: %s", hostModules, err)
+		return nil
+	}
+
+	var args []string
+	for _, e := range entries {
+		if e.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+		link := filepath.Join(hostModules, e.Name())
+		dest, err := os.Readlink(link)
+		if err != nil {
+			log.Printf("nested containers: reading modules link %s: %s", link, err)
+			continue
+		}
+		if !filepath.IsAbs(dest) {
+			dest = path.Join(containerModules, dest)
+		}
+		real, err := filepath.EvalSymlinks(link)
+		if err != nil {
+			log.Printf("nested containers: skipping modules link %s: %s", link, err)
+			continue
+		}
+		if pathWithin(hostModules, real) || pathWithin(containerModules, dest) {
+			continue
+		}
+		if info, err := os.Stat(real); err != nil || !info.IsDir() {
+			continue
+		}
+		args = append(args, "--volume", real+":"+dest+":ro")
+	}
+	return args
+}
+
+// containerModules is the kernel module directory in a nested container, as bound from the host.
+const containerModules = "/lib/modules"
+
+// pathWithin reports whether p is dir or a path beneath it. Both must be clean absolute paths.
+func pathWithin(dir, p string) bool {
+	rel, err := filepath.Rel(dir, p)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // createVolume takes the specified files and writes them into a volume named for the container.

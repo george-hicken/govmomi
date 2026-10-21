@@ -5,6 +5,8 @@
 package simulator
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 
@@ -84,4 +86,71 @@ func TestParseNestedVolumes(t *testing.T) {
 		_, err := parseNestedVolumes(value)
 		assert.Error(t, err, "value %s", value)
 	}
+}
+
+func TestNestedModulesVolumes(t *testing.T) {
+	root := t.TempDir()
+	kernel := filepath.Join(root, "tmp", ".6.12.112-5.ph5-esx")
+	require.NoError(t, os.MkdirAll(filepath.Join(kernel, "kernel", "fs"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(kernel, "file"), nil, 0o644))
+
+	link := func(t *testing.T, dir, name, target string) {
+		t.Helper()
+		require.NoError(t, os.Symlink(target, filepath.Join(dir, name)))
+	}
+
+	t.Run("link outside the directory", func(t *testing.T) {
+		modules := filepath.Join(root, "lib-modules")
+		require.NoError(t, os.MkdirAll(filepath.Join(modules, "6.12.113-1"), 0o755))
+		link(t, modules, "6.12.112-5.ph5-esx", kernel)
+
+		// the container path is the link's target, where the dangling link points
+		assert.Equal(t, []string{"--volume", kernel + ":" + kernel + ":ro"}, nestedModulesVolumes(modules))
+	})
+
+	t.Run("relative link out of the directory", func(t *testing.T) {
+		parent := t.TempDir()
+		modules := filepath.Join(parent, "lib-modules")
+		require.NoError(t, os.MkdirAll(modules, 0o755))
+		require.NoError(t, os.MkdirAll(filepath.Join(parent, "kernel"), 0o755))
+		link(t, modules, "6.12.112-5.ph5-esx", "../kernel")
+
+		assert.Equal(t, []string{"--volume", filepath.Join(parent, "kernel") + ":/lib/kernel:ro"},
+			nestedModulesVolumes(modules))
+	})
+
+	t.Run("no link", func(t *testing.T) {
+		modules := filepath.Join(root, "plain")
+		require.NoError(t, os.MkdirAll(filepath.Join(modules, "6.12.113-1"), 0o755))
+
+		assert.Empty(t, nestedModulesVolumes(modules))
+	})
+
+	t.Run("link within the directory", func(t *testing.T) {
+		modules := filepath.Join(root, "inner")
+		require.NoError(t, os.MkdirAll(filepath.Join(modules, "6.12.113-1"), 0o755))
+		link(t, modules, "current", "6.12.113-1")
+
+		assert.Empty(t, nestedModulesVolumes(modules))
+	})
+
+	t.Run("dangling link and link to a file", func(t *testing.T) {
+		modules := filepath.Join(root, "broken")
+		require.NoError(t, os.MkdirAll(modules, 0o755))
+		link(t, modules, "gone", filepath.Join(root, "missing"))
+		link(t, modules, "file", filepath.Join(kernel, "file"))
+
+		assert.Empty(t, nestedModulesVolumes(modules))
+	})
+
+	t.Run("link to a path under /lib/modules in the container", func(t *testing.T) {
+		modules := filepath.Join(root, "container-path")
+		require.NoError(t, os.MkdirAll(modules, 0o755))
+		link(t, modules, "6.12.112-5.ph5-esx", filepath.Join(containerModules, "elsewhere"))
+
+		assert.Empty(t, nestedModulesVolumes(modules))
+	})
+	t.Run("missing directory", func(t *testing.T) {
+		assert.Empty(t, nestedModulesVolumes(filepath.Join(root, "absent")))
+	})
 }
