@@ -116,16 +116,16 @@ func TestIssue(t *testing.T) {
 
 		t.Run("holder-of-key token for a user", func(t *testing.T) {
 			s, err := sc.Issue(ctx, sts.TokenRequest{
-				Userinfo:    url.UserPassword("wcp-1234@vsphere.local", "pass"),
+				Userinfo:    url.UserPassword("svc-1234@vsphere.local", "pass"),
 				Certificate: certificate(t, "ignored"),
 			})
 			require.NoError(t, err)
-			assert.Contains(t, s.Token, ">wcp-1234@vsphere.local</saml2:NameID>")
+			assert.Contains(t, s.Token, ">svc-1234@vsphere.local</saml2:NameID>")
 			assert.Contains(t, s.Token, "urn:oasis:names:tc:SAML:2.0:cm:holder-of-key")
 
 			user, err := restUser(ctx, c, s)
 			require.NoError(t, err)
-			assert.Equal(t, "wcp-1234@vsphere.local", user)
+			assert.Equal(t, "svc-1234@vsphere.local", user)
 
 			// The request must be signed with the key the token confirms.
 			other := &sts.Signer{Token: s.Token, Certificate: certificate(t, "other")}

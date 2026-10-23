@@ -27,7 +27,7 @@ import (
 )
 
 // agent returns a holder-of-key token for the given user, and a vAPI client logged in with it,
-// as supervisor-agent obtains them.
+// as the agent obtains them.
 func agent(ctx context.Context, t *testing.T, c *vim25.Client, user string) (*sts.Signer, *rest.Client) {
 	t.Helper()
 	sc, err := sts.NewClient(ctx, c)
@@ -46,7 +46,7 @@ func agent(ctx context.Context, t *testing.T, c *vim25.Client, user string) (*st
 	return signer, rc
 }
 
-// exchangeSpec is the request supervisor-agent's TES client sends.
+// exchangeSpec is the request the agent's TES client sends.
 func exchangeSpec(token string) authentication.TokenIssueSpec {
 	return authentication.TokenIssueSpec{
 		Audience:           stssim.AudienceVNS,
@@ -96,7 +96,7 @@ func claims(t *testing.T, jwt string) map[string]any {
 
 func TestTokenExchange(t *testing.T) {
 	test(t, func(ctx context.Context, c *vim25.Client, h *stssim.Handler) {
-		signer, rc := agent(ctx, t, c, "wcp-1234@vsphere.local")
+		signer, rc := agent(ctx, t, c, "svc-1234@vsphere.local")
 
 		t.Run("SAML token to JWT", func(t *testing.T) {
 			info, err := authentication.NewManager(rc).Issue(ctx, exchangeSpec(signer.Token))
@@ -108,8 +108,8 @@ func TestTokenExchange(t *testing.T) {
 			assert.Equal(t, h.Issuer(), c["iss"])
 			assert.Equal(t, "https://"+rc.URL().Host+"/openidconnect/vsphere.local", c["iss"])
 			assert.Equal(t, stssim.AudienceVNS, c["aud"])
-			assert.Equal(t, "wcp-1234@vsphere.local", c["sub"])
-			assert.Equal(t, "wcp-1234", c["username"])
+			assert.Equal(t, "svc-1234@vsphere.local", c["sub"])
+			assert.Equal(t, "svc-1234", c["username"])
 			assert.Equal(t, "vsphere.local", c["domain"])
 			assert.Equal(t, []any{"Users@vsphere.local", "Everyone@vsphere.local"}, c["group_names"])
 			assert.Greater(t, c["exp"], c["iat"])
@@ -130,7 +130,7 @@ func TestTokenExchange(t *testing.T) {
 		})
 
 		t.Run("invalid subject token", func(t *testing.T) {
-			forged := strings.Replace(signer.Token, ">wcp-1234@", ">root@", 1)
+			forged := strings.Replace(signer.Token, ">svc-1234@", ">root@", 1)
 			status, body := exchange(ctx, t, rc, exchangeSpec(forged))
 			assert.Equal(t, http.StatusInternalServerError, status)
 			assert.Contains(t, body, stssim.InvalidGrant)

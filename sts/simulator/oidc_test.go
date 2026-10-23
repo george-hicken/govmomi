@@ -153,8 +153,8 @@ func (v *verifier) verify(ctx context.Context, jwt string) (map[string]any, erro
 	return claims, nil
 }
 
-// TestTokenChain follows supervisor-agent's credential from its SAML token, through the JWT that TES issues for
-// it, to the Supervisor's API server verifying that JWT against the discovery and JWKS vcsim serves.
+// TestTokenChain follows the agent's credential from its SAML token, through the JWT that TES issues for
+// it, to the Kubernetes API server verifying that JWT against the discovery and JWKS vcsim serves.
 func TestTokenChain(t *testing.T) {
 	ctx := context.Background()
 
@@ -177,13 +177,13 @@ func TestTokenChain(t *testing.T) {
 	require.NotNil(t, h)
 
 	// The agent's HoK token, and a vAPI session for it.
-	signer, rc := agent(ctx, t, c.Client, "wcp-1234@vsphere.local")
+	signer, rc := agent(ctx, t, c.Client, "svc-1234@vsphere.local")
 
 	// The agent exchanges its token for a JWT.
 	info, err := authentication.NewManager(rc).Issue(ctx, exchangeSpec(signer.Token))
 	require.NoError(t, err)
 
-	// The API server's issuer, as supervisor's bootstrapper derives it from the vCenter endpoint and SSO domain,
+	// The API server's issuer, as the bootstrapper derives it from the vCenter endpoint and SSO domain,
 	// trusting the vcsim certificate as its CA bundle.
 	endpoint := &url.URL{Scheme: "https", Host: srv.URL.Host}
 	roots := x509.NewCertPool()
@@ -196,8 +196,8 @@ func TestTokenChain(t *testing.T) {
 
 	claims, err := v.verify(ctx, info.AccessToken)
 	require.NoError(t, err)
-	// The API server maps the claims to user "sso:wcp-1234@vsphere.local", the name bootstrapper binds.
-	assert.Equal(t, "wcp-1234@vsphere.local", claims["sub"])
+	// The API server maps the claims to user "sso:svc-1234@vsphere.local", the name bootstrapper binds.
+	assert.Equal(t, "svc-1234@vsphere.local", claims["sub"])
 	assert.Contains(t, claims["group_names"], "Everyone@vsphere.local")
 
 	t.Run("altered JWT", func(t *testing.T) {
@@ -215,7 +215,7 @@ func TestTokenChain(t *testing.T) {
 		assert.Contains(t, minted, info.AccessToken)
 
 		// A failed exchange is logged by neither the simulator nor, via its response, the client.
-		status, body := exchange(ctx, t, rc, exchangeSpec(strings.Replace(signer.Token, "wcp-1234", "root", 1)))
+		status, body := exchange(ctx, t, rc, exchangeSpec(strings.Replace(signer.Token, "svc-1234", "root", 1)))
 		assert.Equal(t, http.StatusInternalServerError, status)
 		minted = append(minted, base64.StdEncoding.EncodeToString([]byte(signer.Token)))
 		for _, canary := range minted {

@@ -25,7 +25,7 @@ import (
 // stands in for (services/vmtoolsd/cmdLine.c ToolsCoreRunCommand and
 // rpctool/rpctool.c RpcToolCommand): the reply without its "1 " or "0 "
 // prefix, on stdout with exit status 0 or on stderr with exit status 1.
-// cloud-init and the Supervisor bootstrapper both parse that output.
+// cloud-init and the bootstrapper both parse that output.
 //
 // The binary runs on the host against the server RUN.vmci starts, so stdout
 // and stderr are exactly the binary's.

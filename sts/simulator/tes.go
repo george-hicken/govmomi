@@ -32,7 +32,7 @@ const (
 	tokenTypeSAML2     = "urn:ietf:params:oauth:token-type:saml2"          // #nosec G101 -- not a credential
 	tokenTypeIDToken   = "urn:ietf:params:oauth:token-type:id_token"       // #nosec G101 -- not a credential
 
-	// AudienceVNS is the audience of a JWT for the Supervisor's Kubernetes API server.
+	// AudienceVNS is the audience of a JWT for the Kubernetes API server.
 	AudienceVNS = "vmware-tes:vc:vns:k8s"
 
 	// InvalidGrant is the error class TES responds with when a token is invalid.

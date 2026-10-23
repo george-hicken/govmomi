@@ -17,16 +17,16 @@ func testVMNamed(name string) *VirtualMachine {
 
 func TestContainerImageRegistryResolve(t *testing.T) {
 	var reg ContainerImageRegistry
-	reg.Register(ContainerImageEntry{VMNameGlob: "supervisor-bootstrap-vm", OCIImage: "bootstrap:latest"})
-	reg.Register(ContainerImageEntry{VMNameGlob: "supervisor-?????-?????", OCIImage: "node:latest"})
+	reg.Register(ContainerImageEntry{VMNameGlob: "example-bootstrap-vm", OCIImage: "bootstrap:latest"})
+	reg.Register(ContainerImageEntry{VMNameGlob: "example-?????-?????", OCIImage: "node:latest"})
 
 	tests := []struct {
 		name string
 		want string
 	}{
-		{"supervisor-bootstrap-vm", "bootstrap:latest"},
-		{"supervisor-vpq4g-t4sr2", "node:latest"},
-		{"supervisor-vpq4g", ""},
+		{"example-bootstrap-vm", "bootstrap:latest"},
+		{"example-vpq4g-t4sr2", "node:latest"},
+		{"example-vpq4g", ""},
 		{"other-vpq4g-t4sr2", ""},
 	}
 	for _, tc := range tests {
@@ -44,12 +44,12 @@ func TestContainerImageEntryExtraConfigFor(t *testing.T) {
 		"RUN.mountdmi":      "false",
 	}}
 	got := map[string]string{}
-	for _, opt := range e.extraConfigFor("supervisor-vpq4g-t4sr2") {
+	for _, opt := range e.extraConfigFor("example-vpq4g-t4sr2") {
 		ov := opt.(*types.OptionValue)
 		got[ov.Key] = ov.Value.(string)
 	}
 	want := map[string]string{
-		"RUN.volume.varlog": "/logs/supervisor-vpq4g-t4sr2:/var/log",
+		"RUN.volume.varlog": "/logs/example-vpq4g-t4sr2:/var/log",
 		"RUN.mountdmi":      "false",
 	}
 	if len(got) != len(want) {

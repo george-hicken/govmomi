@@ -314,7 +314,7 @@ func TestFolderCreateExternallyManagedFolder(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// As wcp-namespace-operator creates the vSphere Pod folder.
+		// As the namespace operator creates the vSphere Pod folder.
 		info := types.FolderExternallyManagedFolderInfo{
 			Id:   ns.Reference().Value + ":" + c.ServiceContent.About.InstanceUuid,
 			Type: string(types.FolderExternallyManagedFolderTypeVSPHERE_POD),
@@ -425,7 +425,7 @@ func TestFolderCreateNamespaceFolder(t *testing.T) {
 
 		assertDuplicate("ns1", ref)
 
-		// supervisor-adm pre-creates the namespace folder with CreateFolder;
+		// the namespace controller pre-creates the namespace folder with CreateFolder;
 		// the namespace operator adopts it from the DuplicateName fault.
 		pre, err := folders.VmFolder.CreateFolder(ctx, "ns2")
 		if err != nil {

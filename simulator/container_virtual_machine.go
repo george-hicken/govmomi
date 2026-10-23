@@ -163,7 +163,7 @@ type simVM struct {
 
 	// toolsNicInfo is set while the guest's tools have reported its NIC info
 	// in this power-on, which then takes precedence over the container's
-	// observed network settings (spec 95 D-95-31).
+	// observed network settings.
 	toolsNicInfo atomic.Bool
 
 	// sysctlDir is the host directory mounted at sysctlOverlayDir when RUN.sysctl
@@ -251,7 +251,7 @@ func (svm *simVM) syncNetworkConfigToVMGuestProperties(ctx *Context, out []byte,
 
 		// The container's network settings are the address observed from
 		// outside the guest, reported only while the guest's own tools have
-		// not reported its NICs (spec 95 D-95-31).
+		// not reported its NICs.
 		if svm.toolsNicInfo.Load() {
 			return
 		}
@@ -879,7 +879,7 @@ const carrierMachineID biosUUIDCarrier = "machine-id"
 // selectBIOSUUIDCarrier picks the BIOS UUID carrier for this host. Only
 // machine-id is implemented. A DMI carrier, bind-mounting product_uuid and
 // the related files at /sys/class/dmi/id, is to be chosen here on hosts that
-// have /sys/class/dmi/id (spec 95 D-95-32); WSL2 has none.
+// have /sys/class/dmi/id; WSL2 has none.
 func selectBIOSUUIDCarrier() biosUUIDCarrier {
 	return carrierMachineID
 }

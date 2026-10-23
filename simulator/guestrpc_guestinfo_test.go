@@ -197,7 +197,7 @@ func TestSetGuestInfo_ToolboxService(t *testing.T) {
 	waitGuestProperty(t, env, vm.Self, "guest.hostName", name)
 }
 
-// TestSyncNetworkConfig_ToolsTakePrecedence checks D-95-31's order: the
+// TestSyncNetworkConfig_ToolsTakePrecedence checks the precedence order: the
 // container's network settings are reported until the guest's tools report
 // its NICs, and the power state is still taken from the container after.
 func TestSyncNetworkConfig_ToolsTakePrecedence(t *testing.T) {

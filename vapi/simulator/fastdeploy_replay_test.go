@@ -34,21 +34,21 @@ import (
 )
 
 const (
-	run62IDV1 = "0123456789abcdef0123456789abcd01"
-	run62IDV2 = "0123456789abcdef0123456789abcd02"
-	run62IDI2 = "0123456789abcdef0123456789abcd03"
+	replayIDV1 = "0123456789abcdef0123456789abcd01"
+	replayIDV2 = "0123456789abcdef0123456789abcd02"
+	replayIDI2 = "0123456789abcdef0123456789abcd03"
 
-	run62Node1     = "sv2-node-" + run62IDV1
-	run62Node2     = "sv2-node-" + run62IDV2
-	run62Lookaside = "lookaside:" + simulator.LookasideDiskDescriptor
+	replayNode1     = "example-node-" + replayIDV1
+	replayNode2     = "example-node-" + replayIDV2
+	replayLookaside = "lookaside:" + simulator.LookasideDiskDescriptor
 
-	run62Photon = "photon-5-amd64-v1.35.5---vmware.1-skr.1"
-	run62NS     = "vmware-system-supervisor"
+	replayPhoton = "photon-5-amd64-v1.35.5---vmware.1-skr.1"
+	replayNS     = "example-system"
 )
 
-// run62Stub is a 1 MiB stream-optimized disk whose descriptor carries id as ddb.longContentID and
+// replayStub is a 1 MiB stream-optimized disk whose descriptor carries id as ddb.longContentID and
 // whose CID is the last 8 hex digits of id, as the harness stamps it.
-func run62Stub(t *testing.T, id string) []byte {
+func replayStub(t *testing.T, id string) []byte {
 	t.Helper()
 	cid, err := strconv.ParseUint(id[len(id)-8:], 16, 32)
 	if err != nil {
@@ -74,13 +74,13 @@ func run62Stub(t *testing.T, id string) []byte {
 	return b
 }
 
-type run62File struct {
+type replayFile struct {
 	name string
 	data []byte
 }
 
-// run62Upload adds files to one update session of the library item and completes it.
-func run62Upload(ctx context.Context, t *testing.T, m *library.Manager, itemID string, files ...run62File) {
+// replayUpload adds files to one update session of the library item and completes it.
+func replayUpload(ctx context.Context, t *testing.T, m *library.Manager, itemID string, files ...replayFile) {
 	t.Helper()
 	session, err := m.CreateLibraryItemUpdateSession(ctx, library.Session{LibraryItemID: itemID})
 	if err != nil {
@@ -110,16 +110,16 @@ func run62Upload(ctx context.Context, t *testing.T, m *library.Manager, itemID s
 	}
 }
 
-// run62Path is the datastore path of a library item file.
-func run62Path(libID, itemID, file string) string {
+// replayPath is the datastore path of a library item file.
+func replayPath(libID, itemID, file string) string {
 	return fmt.Sprintf("[LocalDS_0] contentlib-%s/%s/%s", libID, itemID, file)
 }
 
-// run62Spec decodes the run 62 CreateVM spec and rebases it onto name, dir and namespace. An empty
-// ns removes vmservice.namespacedName, as a VM that is not a Supervisor VM has none.
-func run62Spec(t *testing.T, name, dir, ns string) *types.VirtualMachineConfigSpec {
+// replaySpec decodes the captured CreateVM spec and rebases it onto name, dir and namespace. An empty
+// ns removes vmservice.namespacedName, as a VM that is not a service VM has none.
+func replaySpec(t *testing.T, name, dir, ns string) *types.VirtualMachineConfigSpec {
 	t.Helper()
-	f, err := os.Open("testdata/run62-vmop/createvm-configspec.json")
+	f, err := os.Open("testdata/replay-vmop/createvm-configspec.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,8 +150,8 @@ func run62Spec(t *testing.T, name, dir, ns string) *types.VirtualMachineConfigSp
 	return &spec
 }
 
-// run62Ec reads one ExtraConfig value of vm, or "" when absent.
-func run62Ec(ctx context.Context, t *testing.T, c *vim25.Client, vm types.ManagedObjectReference, key string) string {
+// replayEc reads one ExtraConfig value of vm, or "" when absent.
+func replayEc(ctx context.Context, t *testing.T, c *vim25.Client, vm types.ManagedObjectReference, key string) string {
 	t.Helper()
 	var mvm mo.VirtualMachine
 	if err := property.DefaultCollector(c).RetrieveOne(ctx, vm, []string{"config.extraConfig"}, &mvm); err != nil {
@@ -165,8 +165,8 @@ func run62Ec(ctx context.Context, t *testing.T, c *vim25.Client, vm types.Manage
 	return ""
 }
 
-// run62Copy copies src to dst as a thin lsiLogic disk, as vm-operator's cache and clone copies do.
-func run62Copy(ctx context.Context, c *vim25.Client, dc *object.Datacenter, src, dst string) error {
+// replayCopy copies src to dst as a thin lsiLogic disk, as vm-operator's cache and clone copies do.
+func replayCopy(ctx context.Context, c *vim25.Client, dc *object.Datacenter, src, dst string) error {
 	vdm := object.NewVirtualDiskManager(c)
 	destSpec := &types.FileBackedVirtualDiskSpec{VirtualDiskSpec: types.VirtualDiskSpec{AdapterType: "lsiLogic", DiskType: "thin"}}
 	tk, err := vdm.CopyVirtualDisk(ctx, src, dc, dst, dc, destSpec, false)
@@ -176,8 +176,8 @@ func run62Copy(ctx context.Context, c *vim25.Client, dc *object.Datacenter, src,
 	return tk.Wait(ctx)
 }
 
-// run62Prop reads one property of a lookaside record, or "" when the record lacks it.
-func run62Prop(rec simulator.LookasideRecord, name string) string {
+// replayProp reads one property of a lookaside record, or "" when the record lacks it.
+func replayProp(rec simulator.LookasideRecord, name string) string {
 	for _, p := range rec {
 		if p.Name == name {
 			return fmt.Sprint(p.Val)
@@ -186,10 +186,10 @@ func run62Prop(rec simulator.LookasideRecord, name string) string {
 	return ""
 }
 
-// TestRun62FastDeployReplay replays the vm-operator CreateVM and PowerOn sequence of run 62 against
+// TestFastDeployReplay replays the vm-operator CreateVM and PowerOn sequence captured from a run against
 // VMRules: a library item, concurrent cache copies, linked and empty disks, a second item session, and
-// the bootstrap VM. It is the gate before any full-sim run (D-9522-11).
-func TestRun62FastDeployReplay(t *testing.T) {
+// the bootstrap VM. It is the gate before any end-to-end run.
+func TestFastDeployReplay(t *testing.T) {
 	model := simulator.VPX()
 	simulator.Test(func(ctx context.Context, c *vim25.Client) {
 		rc := rest.NewClient(c)
@@ -218,7 +218,7 @@ func TestRun62FastDeployReplay(t *testing.T) {
 		// Step 1: library and items.
 		m := library.NewManager(rc)
 		libID, err := m.CreateLibrary(ctx, library.Library{
-			Name:    "run62-lib",
+			Name:    "replay-lib",
 			Type:    "LOCAL",
 			Storage: []library.StorageBacking{{DatastoreID: ds.Reference().Value, Type: "DATASTORE"}},
 		})
@@ -235,35 +235,35 @@ func TestRun62FastDeployReplay(t *testing.T) {
 		}
 		desc := strings.ReplaceAll(string(ovf), `ovf:name="nat"`, `ovf:name="Management Network"`)
 		desc = strings.ReplaceAll(desc, "<rasd:Connection>nat</rasd:Connection>", "<rasd:Connection>Management Network</rasd:Connection>")
-		desc = strings.ReplaceAll(desc, "ttylinux-pc_i486-16.1-disk1.vmdk", run62Photon+"-disk1.vmdk")
-		run62Upload(ctx, t, m, i1,
-			run62File{run62Photon + ".ovf", []byte(desc)},
-			run62File{run62Photon + "-disk1.vmdk", run62Stub(t, run62IDV1)})
+		desc = strings.ReplaceAll(desc, "ttylinux-pc_i486-16.1-disk1.vmdk", replayPhoton+"-disk1.vmdk")
+		replayUpload(ctx, t, m, i1,
+			replayFile{replayPhoton + ".ovf", []byte(desc)},
+			replayFile{replayPhoton + "-disk1.vmdk", replayStub(t, replayIDV1)})
 		i2, err := m.CreateLibraryItem(ctx, library.Item{Name: "item-2", Type: library.ItemTypeOVF, LibraryID: libID})
 		if err != nil {
 			t.Fatal(err)
 		}
-		run62Upload(ctx, t, m, i2, run62File{"item-2-disk1.vmdk", run62Stub(t, run62IDI2)})
-		lp1 := run62Path(libID, i1, run62Photon+"-disk1.vmdk")
-		lp2 := run62Path(libID, i2, "item-2-disk1.vmdk")
+		replayUpload(ctx, t, m, i2, replayFile{"item-2-disk1.vmdk", replayStub(t, replayIDI2)})
+		lp1 := replayPath(libID, i1, replayPhoton+"-disk1.vmdk")
+		lp2 := replayPath(libID, i2, "item-2-disk1.vmdk")
 
 		// Step 2: folders.
 		dcFolder, err := finder.DefaultFolder(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		sv2, err := dcFolder.CreateFolder(ctx, "sv2-sim-test")
+		exFolder, err := dcFolder.CreateFolder(ctx, "example-sim-test")
 		if err != nil {
 			t.Fatal(err)
 		}
-		sup, err := sv2.CreateFolder(ctx, run62NS)
+		sup, err := exFolder.CreateFolder(ctx, replayNS)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		// Step 3: rules, in order, before any CreateVM.
 		S := func() property.Match {
-			return property.Match{`config.extraConfig["vmservice.namespacedName"]`: run62NS + "/*"}
+			return property.Match{`config.extraConfig["vmservice.namespacedName"]`: replayNS + "/*"}
 		}
 		X := func() property.Match { return property.Match{`config.extraConfig["RUN.container"]`: "*"} }
 		dd := func(id string) []simulator.LookasideMatch {
@@ -274,18 +274,18 @@ func TestRun62FastDeployReplay(t *testing.T) {
 				&types.OptionValue{Key: "RUN.container", Value: image}}}
 		}
 		rules := []simulator.VMRule{
-			{Name: "sv2-bootstrap", Phases: []simulator.VMRulePhase{simulator.VMRulePhaseCreate},
-				Match: simulator.ObjectMatch{Include: property.Match{"name": "sv2-sim-test-bootstrap-vm"}, Exclude: X()},
-				Patch: patch("sv2-sim-bootstrap:test")},
-			{Name: run62Node1, Match: simulator.ObjectMatch{Include: S(), Lookaside: dd(run62IDV1), Exclude: X()},
+			{Name: "example-bootstrap", Phases: []simulator.VMRulePhase{simulator.VMRulePhaseCreate},
+				Match: simulator.ObjectMatch{Include: property.Match{"name": "example-sim-test-bootstrap-vm"}, Exclude: X()},
+				Patch: patch("example-sim-bootstrap:test")},
+			{Name: replayNode1, Match: simulator.ObjectMatch{Include: S(), Lookaside: dd(replayIDV1), Exclude: X()},
 				Patch: patch("node:v1")},
-			{Name: run62Node2, Match: simulator.ObjectMatch{Include: S(), Lookaside: dd(run62IDV2), Exclude: X()},
+			{Name: replayNode2, Match: simulator.ObjectMatch{Include: S(), Lookaside: dd(replayIDV2), Exclude: X()},
 				Patch: patch("node:v2")},
-			{Name: "sv2-node-default", Match: simulator.ObjectMatch{Include: S(), Lookaside: dd("*"), Exclude: X()},
+			{Name: "example-node-default", Match: simulator.ObjectMatch{Include: S(), Lookaside: dd("*"), Exclude: X()},
 				Patch: patch("node:default")},
-			{Name: "sv2-require-container", Phases: []simulator.VMRulePhase{simulator.VMRulePhasePowerOn},
+			{Name: "example-require-container", Phases: []simulator.VMRulePhase{simulator.VMRulePhasePowerOn},
 				Match: simulator.ObjectMatch{Include: S(), Exclude: X()},
-				Fault: "VM in guard scope has no container config: no sv2-node rule matched a disk content ID (disks created empty or by DeployLibraryItem have none)"},
+				Fault: "VM in guard scope has no container config: no example-node rule matched a disk content ID (disks created empty or by DeployLibraryItem have none)"},
 		}
 		for _, r := range rules {
 			if err := model.Map().VMRules.Add(r); err != nil {
@@ -300,13 +300,13 @@ func TestRun62FastDeployReplay(t *testing.T) {
 			if err := fm.MakeDirectory(ctx, "[LocalDS_0] "+dir, dc, true); err != nil {
 				t.Fatal(err)
 			}
-			if err := run62Copy(ctx, c, dc, src, "[LocalDS_0] "+dir+"/disk-0.vmdk"); err != nil {
+			if err := replayCopy(ctx, c, dc, src, "[LocalDS_0] "+dir+"/disk-0.vmdk"); err != nil {
 				t.Fatal(err)
 			}
 		}
 		create := func(f *object.Folder, name, dir, ns string) *object.VirtualMachine {
 			t.Helper()
-			task, err := f.CreateVM(ctx, *run62Spec(t, name, dir, ns), pool, nil)
+			task, err := f.CreateVM(ctx, *replaySpec(t, name, dir, ns), pool, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -340,16 +340,16 @@ func TestRun62FastDeployReplay(t *testing.T) {
 					continue
 				}
 				for _, r := range e.Results {
-					if r.Key == run62Lookaside {
+					if r.Key == replayLookaside {
 						return r
 					}
 				}
 			}
-			t.Fatalf("no %s result for rule %s", run62Lookaside, rule)
+			t.Fatalf("no %s result for rule %s", replayLookaside, rule)
 			return simulator.MatchResult{}
 		}
 
-		// Step 4: two concurrent copies of the same cache file; at least one succeeds (D-952-06).
+		// Step 4: two concurrent copies of the same cache file; at least one succeeds.
 		vdmDirs := "[LocalDS_0] vmi-cache-v1"
 		if err := object.NewFileManager(c).MakeDirectory(ctx, vdmDirs, dc, true); err != nil {
 			t.Fatal(err)
@@ -360,7 +360,7 @@ func TestRun62FastDeployReplay(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				errs[i] = run62Copy(ctx, c, dc, lp1, vdmDirs+"/disk.vmdk")
+				errs[i] = replayCopy(ctx, c, dc, lp1, vdmDirs+"/disk.vmdk")
 			}()
 		}
 		wg.Wait()
@@ -370,41 +370,41 @@ func TestRun62FastDeployReplay(t *testing.T) {
 
 		// Step 5: VM1 carries node v1; its ID survives upload and the DestSpec copies.
 		stage(vdmDirs+"/disk.vmdk", "1b37d647-0dc0-4edc-bb33-2ce46c1ec5b8")
-		vm1 := create(sup, "supervisor-wc4xf-fcxkf", "1b37d647-0dc0-4edc-bb33-2ce46c1ec5b8", run62NS)
+		vm1 := create(sup, "example-wc4xf-fcxkf", "1b37d647-0dc0-4edc-bb33-2ce46c1ec5b8", replayNS)
 		recs := records(vm1)
 		if len(recs) != 1 {
 			t.Fatalf("VM1 has %d lookaside records, want 1", len(recs))
 		}
-		if d := run62Prop(recs[0], "depth"); d != "0" {
+		if d := replayProp(recs[0], "depth"); d != "0" {
 			t.Errorf("VM1 depth = %q, want 0", d)
 		}
-		if id := run62Prop(recs[0], "ddb.longContentID"); id != run62IDV1 {
-			t.Errorf("VM1 ddb.longContentID = %q, want %q", id, run62IDV1)
+		if id := replayProp(recs[0], "ddb.longContentID"); id != replayIDV1 {
+			t.Errorf("VM1 ddb.longContentID = %q, want %q", id, replayIDV1)
 		}
-		if cid := run62Prop(recs[0], "cid"); cid != run62IDV1[24:] {
-			t.Errorf("VM1 cid = %q, want %q", cid, run62IDV1[24:])
+		if cid := replayProp(recs[0], "cid"); cid != replayIDV1[24:] {
+			t.Errorf("VM1 cid = %q, want %q", cid, replayIDV1[24:])
 		}
-		if v := run62Ec(ctx, t, c, vm1.Reference(), "RUN.container"); v != "node:v1" {
+		if v := replayEc(ctx, t, c, vm1.Reference(), "RUN.container"); v != "node:v1" {
 			t.Errorf("VM1 RUN.container = %q, want node:v1", v)
 		}
-		for _, o := range run62Spec(t, "supervisor-wc4xf-fcxkf", "1b37d647-0dc0-4edc-bb33-2ce46c1ec5b8", run62NS).ExtraConfig {
+		for _, o := range replaySpec(t, "example-wc4xf-fcxkf", "1b37d647-0dc0-4edc-bb33-2ce46c1ec5b8", replayNS).ExtraConfig {
 			ov := o.GetOptionValue()
-			if got := run62Ec(ctx, t, c, vm1.Reference(), ov.Key); got != fmt.Sprint(ov.Value) {
+			if got := replayEc(ctx, t, c, vm1.Reference(), ov.Key); got != fmt.Sprint(ov.Value) {
 				t.Errorf("VM1 %s = %q, want fixture value %q", ov.Key, got, ov.Value)
 			}
 		}
-		exps := explain("supervisor-wc4xf-fcxkf", simulator.VMRulePhasePowerOn)
-		if r := lookaside(exps, run62Node1); !r.Matched {
-			t.Errorf("%s lookaside Matched = false, want true", run62Node1)
+		exps := explain("example-wc4xf-fcxkf", simulator.VMRulePhasePowerOn)
+		if r := lookaside(exps, replayNode1); !r.Matched {
+			t.Errorf("%s lookaside Matched = false, want true", replayNode1)
 		}
-		if r := lookaside(exps, run62Node2); r.Matched {
-			t.Errorf("%s lookaside Matched = true, want false", run62Node2)
+		if r := lookaside(exps, replayNode2); r.Matched {
+			t.Errorf("%s lookaside Matched = true, want false", replayNode2)
 		}
 
 		// Step 6: VM2 from the item-2 disk takes the default node rule.
 		stage(lp2, "vm2")
-		vm2 := create(sup, "supervisor-vm2", "vm2", run62NS)
-		if v := run62Ec(ctx, t, c, vm2.Reference(), "RUN.container"); v != "node:default" {
+		vm2 := create(sup, "example-vm2", "vm2", replayNS)
+		if v := replayEc(ctx, t, c, vm2.Reference(), "RUN.container"); v != "node:default" {
 			t.Errorf("VM2 RUN.container = %q, want node:default", v)
 		}
 
@@ -423,8 +423,8 @@ func TestRun62FastDeployReplay(t *testing.T) {
 		if err = vm3Disk.Wait(ctx); err != nil {
 			t.Fatal(err)
 		}
-		vm3 := create(sup, "supervisor-vm3", "vm3", run62NS)
-		if v := run62Ec(ctx, t, c, vm3.Reference(), "RUN.container"); v != "" {
+		vm3 := create(sup, "example-vm3", "vm3", replayNS)
+		if v := replayEc(ctx, t, c, vm3.Reference(), "RUN.container"); v != "" {
 			t.Errorf("VM3 RUN.container = %q, want none", v)
 		}
 		pwr, err := vm3.PowerOn(ctx)
@@ -442,65 +442,65 @@ func TestRun62FastDeployReplay(t *testing.T) {
 			if !ok {
 				t.Fatalf("VM3 PowerOn fault = %T, want *types.GenericVmConfigFault", te.Fault())
 			}
-			for _, want := range []string{"sv2-require-container", "powerOn", "supervisor-vm3"} {
+			for _, want := range []string{"example-require-container", "powerOn", "example-vm3"} {
 				if !strings.Contains(f.Reason, want) {
 					t.Errorf("VM3 fault reason %q does not contain %q", f.Reason, want)
 				}
 			}
 		}
-		exps = explain("supervisor-vm3", simulator.VMRulePhasePowerOn)
+		exps = explain("example-vm3", simulator.VMRulePhasePowerOn)
 		for _, e := range exps {
-			if e.Rule == "sv2-require-container" && !e.Applies {
-				t.Errorf("sv2-require-container does not apply to supervisor-vm3")
+			if e.Rule == "example-require-container" && !e.Applies {
+				t.Errorf("example-require-container does not apply to example-vm3")
 			}
 		}
-		if r := lookaside(exps, "sv2-node-default"); !slices.Contains(r.Value.(types.ArrayOfString).String, "ddb.longContentID=<absent>") {
-			t.Errorf("VM3 sv2-node-default lookaside = %v, want ddb.longContentID=<absent>", r.Value)
+		if r := lookaside(exps, "example-node-default"); !slices.Contains(r.Value.(types.ArrayOfString).String, "ddb.longContentID=<absent>") {
+			t.Errorf("VM3 example-node-default lookaside = %v, want ddb.longContentID=<absent>", r.Value)
 		}
 		if state, err := vm3.PowerState(ctx); err != nil || state != types.VirtualMachinePowerStatePoweredOff {
 			t.Errorf("VM3 power state = %v, %v; want poweredOff", state, err)
 		}
 
 		// Step 8: a second session on I1 replaces disk1; VM4 takes node v2.
-		run62Upload(ctx, t, m, i1, run62File{run62Photon + "-disk1.vmdk", run62Stub(t, run62IDV2)})
+		replayUpload(ctx, t, m, i1, replayFile{replayPhoton + "-disk1.vmdk", replayStub(t, replayIDV2)})
 		vmi2 := "[LocalDS_0] vmi-cache-v2"
 		if err := object.NewFileManager(c).MakeDirectory(ctx, vmi2, dc, true); err != nil {
 			t.Fatal(err)
 		}
-		if err := run62Copy(ctx, c, dc, lp1, vmi2+"/disk.vmdk"); err != nil {
+		if err := replayCopy(ctx, c, dc, lp1, vmi2+"/disk.vmdk"); err != nil {
 			t.Fatal(err)
 		}
 		stage(vmi2+"/disk.vmdk", "vm4")
-		vm4 := create(sup, "supervisor-vm4", "vm4", run62NS)
-		if v := run62Ec(ctx, t, c, vm4.Reference(), "RUN.container"); v != "node:v2" {
+		vm4 := create(sup, "example-vm4", "vm4", replayNS)
+		if v := replayEc(ctx, t, c, vm4.Reference(), "RUN.container"); v != "node:v2" {
 			t.Errorf("VM4 RUN.container = %q, want node:v2", v)
 		}
 		recs = records(vm1)
-		if len(recs) != 1 || run62Prop(recs[0], "ddb.longContentID") != run62IDV1 {
+		if len(recs) != 1 || replayProp(recs[0], "ddb.longContentID") != replayIDV1 {
 			t.Errorf("VM1 records changed after session 2: %v", recs)
 		}
-		if v := run62Ec(ctx, t, c, vm1.Reference(), "RUN.container"); v != "node:v1" {
+		if v := replayEc(ctx, t, c, vm1.Reference(), "RUN.container"); v != "node:v1" {
 			t.Errorf("VM1 RUN.container = %q after session 2, want node:v1", v)
 		}
-		exps = explain("supervisor-wc4xf-fcxkf", simulator.VMRulePhasePowerOn)
-		if r := lookaside(exps, run62Node1); !r.Matched {
-			t.Errorf("VM1 %s lookaside Matched = false after session 2, want true", run62Node1)
+		exps = explain("example-wc4xf-fcxkf", simulator.VMRulePhasePowerOn)
+		if r := lookaside(exps, replayNode1); !r.Matched {
+			t.Errorf("VM1 %s lookaside Matched = false after session 2, want true", replayNode1)
 		}
-		if r := lookaside(exps, run62Node2); r.Matched {
-			t.Errorf("VM1 %s lookaside Matched = true after session 2, want false", run62Node2)
+		if r := lookaside(exps, replayNode2); r.Matched {
+			t.Errorf("VM1 %s lookaside Matched = true after session 2, want false", replayNode2)
 		}
 
 		// Step 9: the bootstrap VM has no namespace and takes the bootstrap image.
 		stage(vdmDirs+"/disk.vmdk", "vm5")
-		vm5 := create(sv2, "sv2-sim-test-bootstrap-vm", "vm5", "")
-		if v := run62Ec(ctx, t, c, vm5.Reference(), "RUN.container"); v != "sv2-sim-bootstrap:test" {
-			t.Errorf("VM5 RUN.container = %q, want sv2-sim-bootstrap:test", v)
+		vm5 := create(exFolder, "example-sim-test-bootstrap-vm", "vm5", "")
+		if v := replayEc(ctx, t, c, vm5.Reference(), "RUN.container"); v != "example-sim-bootstrap:test" {
+			t.Errorf("VM5 RUN.container = %q, want example-sim-bootstrap:test", v)
 		}
 
 		// Step 10: deploy I1 with DeployLibraryItem; the copied disk carries no content ID.
 		ref, err := vcenter.NewManager(rc).DeployLibraryItem(ctx, i1, vcenter.Deploy{
 			DeploymentSpec: vcenter.DeploymentSpec{
-				Name: "supervisor-vm6",
+				Name: "example-vm6",
 				NetworkMappings: []vcenter.NetworkMapping{{
 					Key:   "Management Network",
 					Value: dvpg.Reference().Value,
@@ -517,7 +517,7 @@ func TestRun62FastDeployReplay(t *testing.T) {
 			t.Error("VM6 has no lookaside records")
 		}
 		for _, r := range recs {
-			if id := run62Prop(r, "ddb.longContentID"); id != "" {
+			if id := replayProp(r, "ddb.longContentID"); id != "" {
 				t.Errorf("VM6 ddb.longContentID = %q, want none", id)
 			}
 		}

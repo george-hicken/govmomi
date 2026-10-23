@@ -68,7 +68,7 @@ type RouterInterface struct {
 
 	// Aliases are further addresses in CIDR form on this interface, in Address's subnet. An endpoint on the
 	// domain, such as vCenter on the management subnet, is served from the router on an alias, so the
-	// domain's guests reach it by ARP (spec 954 D-954-03).
+	// domain's guests reach it by ARP.
 	Aliases []string `json:"aliases,omitempty"`
 
 	// MTU overrides the domain MTU on this link. Zero keeps the domain MTU.

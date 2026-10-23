@@ -15,7 +15,7 @@ import (
 )
 
 const testTopologyYAML = `
-run: sv2-test
+run: ex-test
 underlays:
   - name: mgmt
     management: true
@@ -41,7 +41,7 @@ attachments:
 `
 
 const testTopologyJSON = `{
-  "run": "sv2-test",
+  "run": "ex-test",
   "underlays": [
     {"name": "mgmt", "management": true},
     {"name": "wl", "mtu": 1400},
@@ -112,16 +112,16 @@ func TestParseTopologyErrors(t *testing.T) {
 }
 
 func TestDomainKeys(t *testing.T) {
-	const run = "sv2-x"
+	const run = "ex-x"
 	tests := []struct {
 		in      string
 		key     string
 		netName string
 	}{
-		{"wl/v10", "wl/v10", "sv2-x-wl-v10"},
-		{"wl/v4094", "wl/v4094", "sv2-x-wl-v4094"},
-		{"mgmt/untagged", "mgmt/untagged", "sv2-x-mgmt-untagged"},
-		{"seg:abc-123", "seg:abc-123", "sv2-x-seg-abc-123"},
+		{"wl/v10", "wl/v10", "ex-x-wl-v10"},
+		{"wl/v4094", "wl/v4094", "ex-x-wl-v4094"},
+		{"mgmt/untagged", "mgmt/untagged", "ex-x-mgmt-untagged"},
+		{"seg:abc-123", "seg:abc-123", "ex-x-seg-abc-123"},
 	}
 	for _, tc := range tests {
 		d, err := parseDomain(tc.in)

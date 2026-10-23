@@ -80,7 +80,7 @@ func createSpec(user string, roleIDs ...string) map[string]authz.CreateSpec {
 func TestPermissionWire(t *testing.T) {
 	const (
 		permissionPath = "/rest/com/vmware/cis/authz/permission"
-		user           = `vsphere.local\wcp-cluster`
+		user           = `vsphere.local\svc-cluster`
 		globalID       = "username=" + user + ";doc=urn:acl:global:permissions"
 	)
 

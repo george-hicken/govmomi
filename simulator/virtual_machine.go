@@ -1480,7 +1480,7 @@ func (vm *VirtualMachine) create(ctx *Context, spec *types.VirtualMachineConfigS
 	// from the matched entry (including RUN.mountdmi, etc) are injected before
 	// the simVM is created.
 	// The registry options go to applyExtraConfig with the client's, for keys the client did not set,
-	// so an empty client ExtraConfig still gets them (O-9522-02) and the client wins on a shared key.
+	// so an empty client ExtraConfig still gets them and the client wins on a shared key.
 	applied := spec
 	if e := ctx.Map.ContainerImages.resolve(vm); e.OCIImage != "" {
 		client := make(map[string]bool, len(spec.ExtraConfig))

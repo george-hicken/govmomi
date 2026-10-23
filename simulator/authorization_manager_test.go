@@ -161,7 +161,7 @@ func TestAuthorizationManagerAddRolePrivileges(t *testing.T) {
 			"Global.LogEvent",
 			"ManagementServiceAccessGrants.Configure",
 			"ManagementServices.Configure",
-			// wcpsvc's wcp-rbac-op-privileges.xml
+			// Privilege list from the workload-management RBAC definitions
 			"IPAM.Edit",
 			"Namespaces.ConfigureAdmissionPolicy",
 			"Namespaces.Edit",
@@ -174,7 +174,7 @@ func TestAuthorizationManagerAddRolePrivileges(t *testing.T) {
 			"ContentLibrary.RemoveLibraryUsage",
 		}
 
-		if _, err := m.AddRole(ctx, "supervisor-role", privs); err != nil {
+		if _, err := m.AddRole(ctx, "example-role", privs); err != nil {
 			t.Errorf("AddRole(%v): %s", privs, err)
 		}
 

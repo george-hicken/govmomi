@@ -210,10 +210,10 @@ func (f *Folder) CreateFolder(ctx *Context, c *types.CreateFolder) soap.HasFault
 	return r
 }
 
-// CreateNamespaceFolder is the internal vCenter method wcpsvc and
-// wcp-namespace-operator use to create a Supervisor Namespace folder. It
+// CreateNamespaceFolder is the internal vCenter method that the workload-management service and
+// its namespace operator use to create a namespace folder. It
 // behaves as CreateFolder and additionally sets the folder's namespace
-// property, which supervisor-authz-service requires before it honours
+// property, which the namespace authz service requires before it honours
 // permissions on the folder.
 func (f *Folder) CreateNamespaceFolder(ctx *Context, c *internal.CreateNamespaceFolderRequest) soap.HasFault {
 	r := &internal.CreateNamespaceFolderBody{}
@@ -240,7 +240,7 @@ func (f *Folder) CreateNamespaceFolder(ctx *Context, c *internal.CreateNamespace
 
 // CreateExternallyManagedFolder is the internal vCenter method used to create
 // a folder that represents an object in an external system, such as the
-// vSphere Pod folder wcp-namespace-operator creates under each namespace
+// vSphere Pod folder the namespace operator creates under each namespace
 // folder. It behaves as CreateFolder and records the external ID and type.
 func (f *Folder) CreateExternallyManagedFolder(ctx *Context, c *internal.CreateExternallyManagedFolderRequest) soap.HasFault {
 	r := &internal.CreateExternallyManagedFolderBody{}

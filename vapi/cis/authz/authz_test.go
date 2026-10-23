@@ -21,11 +21,11 @@ import (
 )
 
 func TestPermissionID(t *testing.T) {
-	user := authz.Principal{Type: authz.PrincipalUser, UserName: `VSPHERE.LOCAL\wcp`}
+	user := authz.Principal{Type: authz.PrincipalUser, UserName: `VSPHERE.LOCAL\svc`}
 	group := authz.Principal{Type: authz.PrincipalGroup, GroupName: `VSPHERE.LOCAL\Administrators`}
 
 	id := authz.PermissionID(authz.GlobalPermissionsDoc, user)
-	assert.Equal(t, `username=VSPHERE.LOCAL\wcp;doc=urn:acl:global:permissions`, id)
+	assert.Equal(t, `username=VSPHERE.LOCAL\svc;doc=urn:acl:global:permissions`, id)
 	doc, p, ok := authz.ParsePermissionID(id)
 	assert.True(t, ok)
 	assert.Equal(t, authz.GlobalPermissionsDoc, doc)
@@ -50,7 +50,7 @@ func TestGlobalPermission(t *testing.T) {
 		require.NoError(t, rc.Login(ctx, simulator.DefaultLogin))
 
 		m := authz.NewManager(rc)
-		user := authz.Principal{Type: authz.PrincipalUser, UserName: `VSPHERE.LOCAL\wcp`}
+		user := authz.Principal{Type: authz.PrincipalUser, UserName: `VSPHERE.LOCAL\svc`}
 
 		ids, err := m.ListPermissions(ctx)
 		require.NoError(t, err)
