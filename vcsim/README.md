@@ -433,6 +433,17 @@ directly, rather than the vcsim binary.
 
 For more details on vcsim features, see the project [wiki](https://github.com/vmware/govmomi/wiki/vcsim-features).
 
+## Container VMs, networking and timing
+
+A simulated VM can be backed by a real container, and a topology file (`-topology`) can
+describe the L2 segments and routers those containers join. The docs below cover the
+container backing and its `RUN.*` options, the mapping from portgroups to container
+networks, running several instances on one host, and the delay flags.
+
+- [Container VMs, networking and topologies](docs/container-vms-and-networking.md)
+- [Timing settings](docs/timing-and-profiles.md): `-delay`, `-delay-jitter`, `-method-delay`
+  and the monitoring environment variables.
+
 ## License
 
 vcsim is available under the [Apache 2 license](../LICENSE).

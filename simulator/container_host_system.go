@@ -187,7 +187,7 @@ func createSimulationHost(ctx *Context, host *HostSystem) (*simHost, error) {
 
 	hName := host.Summary.Config.Name
 	hUuid := host.Summary.Hardware.Uuid
-	containerName := constructContainerName(hName, hUuid)
+	containerName := ctx.Map.containerName(hName, hUuid)
 
 	// create volumes and mounts
 	dockerVol, volCmds, err := createSimHostMounts(ctx, containerName, host.Config.FileSystemVolume.MountInfo)
@@ -204,7 +204,13 @@ func createSimulationHost(ctx *Context, host *HostSystem) (*simHost, error) {
 	execCmds = append(execCmds, netCmds...)
 
 	// create the container
-	sh.c, err = create(ctx, hName, hUuid, dockerNet, dockerVol, nil, dockerEnv, "alpine:3.20.3", []string{"sleep", "infinity"})
+	sh.c, err = create(ctx, hName, hUuid, "alpine:3.20.3", []string{"sleep", "infinity"}, createOptions{
+		Networks:          dockerNet,
+		Volumes:           dockerVol,
+		Env:               dockerEnv,
+		QuoteImageAndArgs: true,
+		RecreateIfExists:  true,
+	})
 	if err != nil {
 		return nil, err
 	}

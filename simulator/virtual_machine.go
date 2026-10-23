@@ -1344,7 +1344,7 @@ func (vm *VirtualMachine) createFile(ctx *Context, spec string, name string, reg
 	ds := vm.useDatastore(ctx, p.Datastore)
 
 	nhost := len(ds.Host)
-	if internal.IsDatastoreVSAN(ds.Datastore) && nhost < 3 {
+	if internal.IsDatastoreVSAN(ds.Summary.Type) && nhost < 3 {
 		fault := new(types.CannotCreateFile)
 		fault.FaultMessage = []types.LocalizableMessage{
 			{
@@ -1479,20 +1479,37 @@ func (vm *VirtualMachine) create(ctx *Context, spec *types.VirtualMachineConfigS
 	// images without modifying the code under test. All ExtraConfig entries
 	// from the matched entry (including RUN.mountdmi, etc) are injected before
 	// the simVM is created.
+	// The registry options go to applyExtraConfig with the client's, for keys the client did not set,
+	// so an empty client ExtraConfig still gets them and the client wins on a shared key.
+	applied := spec
 	if e := ctx.Map.ContainerImages.resolve(vm); e.OCIImage != "" {
-		vm.Config.ExtraConfig = append(
-			vm.Config.ExtraConfig,
-			&types.OptionValue{Key: ContainerBackingOptionKey, Value: e.OCIImage},
-		)
-		for k, v := range e.ExtraConfig {
-			vm.Config.ExtraConfig = append(
-				vm.Config.ExtraConfig,
-				&types.OptionValue{Key: k, Value: v},
-			)
+		client := make(map[string]bool, len(spec.ExtraConfig))
+		for _, o := range spec.ExtraConfig {
+			client[o.GetOptionValue().Key] = true
 		}
+
+		registryOpts := append([]types.BaseOptionValue{
+			&types.OptionValue{Key: ContainerBackingOptionKey, Value: e.OCIImage},
+		}, e.extraConfigFor(vm.Config.Name)...)
+
+		copied := *spec
+		copied.ExtraConfig = slices.Clone(spec.ExtraConfig)
+		for _, o := range registryOpts {
+			if !client[o.GetOptionValue().Key] {
+				copied.ExtraConfig = append(copied.ExtraConfig, o)
+			}
+		}
+		applied = &copied
 	}
 
-	return vm.applyExtraConfig(ctx, spec)
+	if err := vm.applyExtraConfig(ctx, applied); err != nil {
+		return err
+	}
+
+	if register {
+		return nil
+	}
+	return ctx.Map.VMRules.apply(ctx, vm, VMRulePhaseCreate)
 }
 
 var vmwOUI = net.HardwareAddr([]byte{0x0, 0xc, 0x29})
@@ -1763,6 +1780,10 @@ func (vm *VirtualMachine) configureDevice(
 		})
 
 		c := x.GetVirtualEthernetCard()
+		if old, ok := oldDevice.(types.BaseVirtualEthernetCard); ok && c.MacAddress == "" {
+			// An edit that leaves the MAC out keeps the vNIC's MAC.
+			c.MacAddress = old.GetVirtualEthernetCard().MacAddress
+		}
 		if c.MacAddress == "" {
 			if c.UnitNumber == nil {
 				devices.AssignController(device, controller)
@@ -1952,7 +1973,19 @@ func (vm *VirtualMachine) configureDevice(
 				info.FileName = filename
 			}
 
-			desc, err := vdmCreateVirtualDisk(ctx, spec.FileOperation, &types.CreateVirtualDisk_Task{
+			op := spec.FileOperation
+			if parent != "" && op == "" {
+				// A child of a parent disk that does not exist yet is created,
+				// as vSphere does when a linked clone is deployed (vm-operator
+				// FastDeploy, linked mode, sets no FileOperation).
+				if p, fault := ctx.Map.FileManager().resolve(ctx, &dc.Self, info.FileName); fault == nil {
+					if _, err := os.Stat(p); os.IsNotExist(err) {
+						op = types.VirtualDeviceConfigSpecFileOperationCreate
+					}
+				}
+			}
+
+			desc, err := vdmCreateVirtualDisk(ctx, op, &types.CreateVirtualDisk_Task{
 				Datacenter: &dc.Self,
 				Name:       info.FileName,
 				Spec: &types.FileBackedVirtualDiskSpec{
@@ -2065,6 +2098,30 @@ func (vm *VirtualMachine) configureDevice(
 		}
 	}
 
+	return nil
+}
+
+// liveNICState returns card's container-side state for a device change on vm, or the zero state when the change
+// does not reach a container.
+func (vm *VirtualMachine) liveNICState(ctx *Context, card *types.VirtualEthernetCard) (nicState, types.BaseMethodFault) {
+	if !vm.svm.live(ctx) {
+		return nicState{}, nil
+	}
+	st, err := vm.svm.nicStateOf(ctx, card)
+	if err != nil {
+		return nicState{}, newInvalidStateFault("%s: %s", vm.Name, err)
+	}
+	return st, nil
+}
+
+// applyLiveNIC moves a running container's interface between two states; see svm.applyNIC.
+func (vm *VirtualMachine) applyLiveNIC(ctx *Context, before, after nicState) types.BaseMethodFault {
+	if before == after || !vm.svm.live(ctx) {
+		return nil
+	}
+	if err := vm.svm.applyNIC(before, after); err != nil {
+		return newInvalidStateFault("%s: %s", vm.Name, err)
+	}
 	return nil
 }
 
@@ -2374,6 +2431,8 @@ func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMach
 	devices := object.VirtualDeviceList(vm.Config.Hardware.Device)
 
 	var err types.BaseMethodFault
+	// netChanged is set when a vNIC was added, removed or edited, so guest.net is rebuilt once at the end.
+	netChanged := false
 	for i, change := range spec.DeviceChange {
 		dspec := change.GetVirtualDeviceConfigSpec()
 		device := dspec.Device.GetVirtualDevice()
@@ -2420,6 +2479,16 @@ func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMach
 
 			devices = append(devices, dspec.Device)
 			change.Val = dspec.Device
+			if card, ok := dspec.Device.(types.BaseVirtualEthernetCard); ok {
+				after, fault := vm.liveNICState(ctx, card.GetVirtualEthernetCard())
+				if fault != nil {
+					return fault
+				}
+				if fault := vm.applyLiveNIC(ctx, nicState{}, after); fault != nil {
+					return fault
+				}
+				netChanged = true
+			}
 			if key != device.Key {
 				// Update ControllerKey refs
 				for i := range spec.DeviceChange {
@@ -2436,6 +2505,14 @@ func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMach
 				return invalid
 			}
 			rspec.Device = oldDevice
+			var before nicState
+			if card, ok := oldDevice.(types.BaseVirtualEthernetCard); ok {
+				st, fault := vm.liveNICState(ctx, card.GetVirtualEthernetCard())
+				if fault != nil {
+					return fault
+				}
+				before = st
+			}
 			devices = vm.removeDevice(ctx, devices, &rspec)
 			if device.DeviceInfo != nil {
 				device.DeviceInfo.GetDescription().Summary = "" // regenerate summary
@@ -2448,10 +2525,34 @@ func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMach
 
 			devices = append(devices, dspec.Device)
 			change.Val = dspec.Device
+			if card, ok := dspec.Device.(types.BaseVirtualEthernetCard); ok {
+				after, fault := vm.liveNICState(ctx, card.GetVirtualEthernetCard())
+				if fault != nil {
+					return fault
+				}
+				if fault := vm.applyLiveNIC(ctx, before, after); fault != nil {
+					return fault
+				}
+				netChanged = true
+			}
 		case types.VirtualDeviceConfigSpecOperationRemove:
 			change.Op = types.PropertyChangeOpRemove
 
+			var before nicState
+			if card, ok := devices.FindByKey(device.Key).(types.BaseVirtualEthernetCard); ok {
+				st, fault := vm.liveNICState(ctx, card.GetVirtualEthernetCard())
+				if fault != nil {
+					return fault
+				}
+				before = st
+			}
 			devices = vm.removeDevice(ctx, devices, dspec)
+			if _, ok := dspec.Device.(types.BaseVirtualEthernetCard); ok {
+				if fault := vm.applyLiveNIC(ctx, before, nicState{}); fault != nil {
+					return fault
+				}
+				netChanged = true
+			}
 		}
 
 		field.Key = device.Key
@@ -2462,6 +2563,12 @@ func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMach
 	if len(changes) != 0 {
 		change := types.PropertyChange{Name: field.Path, Val: []types.BaseVirtualDevice(devices)}
 		ctx.Update(vm, append(changes, change))
+	}
+
+	if netChanged && vm.svm.live(ctx) {
+		if err := vm.svm.syncNetworkConfigToVMGuestProperties(ctx, nil, nil); err != nil {
+			log.Printf("%s: guest.net after vNIC change: %s", vm.Name, err)
+		}
 	}
 
 	err = vm.updateDiskLayouts(ctx)
@@ -2508,6 +2615,10 @@ func (c *powerVMTask) Run(task *Task) (types.AnyType, types.BaseMethodFault) {
 	case types.VirtualMachinePowerStatePoweredOn:
 		if c.VirtualMachine.hostInMM(c.ctx) {
 			return nil, new(types.InvalidState)
+		}
+
+		if fault := c.ctx.Map.VMRules.apply(c.ctx, c.VirtualMachine, VMRulePhasePowerOn); fault != nil {
+			return nil, fault
 		}
 
 		err := c.svm.start(c.ctx)
@@ -2832,12 +2943,32 @@ func (vm *VirtualMachine) UpgradeVMTask(ctx *Context, req *types.UpgradeVM_Task)
 }
 
 func (vm *VirtualMachine) DestroyTask(ctx *Context, req *types.Destroy_Task) soap.HasFault {
-	dc := ctx.Map.getEntityDatacenter(vm)
-
 	task := CreateTask(vm, "destroy", func(t *Task) (types.AnyType, types.BaseMethodFault) {
+		if ctx.Map.Get(vm.Self) != vm {
+			return nil, &types.ManagedObjectNotFound{Obj: vm.Self}
+		}
+		dc := ctx.Map.getEntityDatacenter(vm)
 		if dc == nil {
 			return nil, &types.ManagedObjectNotFound{Obj: vm.Self} // If our Parent was destroyed, so were we.
 			// TODO: should this also trigger container removal?
+		}
+
+		if vm.Runtime.PowerState == types.VirtualMachinePowerStatePoweredOn {
+			return nil, &types.InvalidPowerState{
+				RequestedState: types.VirtualMachinePowerStatePoweredOff,
+				ExistingState:  vm.Runtime.PowerState,
+			}
+		}
+
+		// Keep the VM registered and its files intact until backing cleanup
+		// succeeds, so a failed removal can be retried through the same MoRef.
+		err := vm.svm.remove(ctx)
+		if err != nil {
+			return nil, &types.RuntimeFault{
+				MethodFault: types.MethodFault{
+					FaultCause: &types.LocalizedMethodFault{
+						Fault:            &types.SystemErrorFault{Reason: err.Error()},
+						LocalizedMessage: err.Error()}}}
 		}
 
 		r := vm.UnregisterVM(ctx, &types.UnregisterVM{
@@ -2861,15 +2992,6 @@ func (vm *VirtualMachine) DestroyTask(ctx *Context, req *types.Destroy_Task) soa
 			Name:       vm.Config.Files.LogDirectory,
 			Datacenter: &dc.Self,
 		})
-
-		err := vm.svm.remove(ctx)
-		if err != nil {
-			return nil, &types.RuntimeFault{
-				MethodFault: types.MethodFault{
-					FaultCause: &types.LocalizedMethodFault{
-						Fault:            &types.SystemErrorFault{Reason: err.Error()},
-						LocalizedMessage: err.Error()}}}
-		}
 
 		return nil, nil
 	})
@@ -3739,9 +3861,8 @@ func (vm *VirtualMachine) PromoteDisksTask(ctx *Context, req *types.PromoteDisks
 			}
 		}
 
-		// Built-in default delay. `simulator.TaskDelay` can be used to add additional time
-		// Translates to roughly 1s per 1GB
-		sleep := time.Duration(cap/units.MB) * time.Millisecond
+		// Built-in default delay, roughly 1s per GiB (PromoteDisksPerGiB). `simulator.TaskDelay` can be used to add additional time
+		sleep := promoteDelay(cap)
 		if sleep > 0 {
 			log.Printf("%s: sleep %s for %s", t.Info.DescriptionId, sleep, units.ByteSize(cap))
 			time.Sleep(sleep)

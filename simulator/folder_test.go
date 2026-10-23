@@ -13,6 +13,7 @@ import (
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/fault"
 	"github.com/vmware/govmomi/find"
+	"github.com/vmware/govmomi/internal"
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/simulator/esx"
 	"github.com/vmware/govmomi/simulator/vpx"
@@ -286,6 +287,152 @@ func TestFolderFaults(t *testing.T) {
 	if f.CreateDatacenter(nil, nil).Fault() == nil {
 		t.Error("expected fault")
 	}
+
+	if f.CreateNamespaceFolder(nil, nil).Fault() == nil {
+		t.Error("expected fault")
+	}
+
+	if f.CreateExternallyManagedFolder(nil, nil).Fault() == nil {
+		t.Error("expected fault")
+	}
+}
+
+func TestFolderCreateExternallyManagedFolder(t *testing.T) {
+	Test(func(ctx context.Context, c *vim25.Client) {
+		finder := find.NewFinder(c)
+		dc, err := finder.DefaultDatacenter(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		folders, err := dc.Folders(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ns, err := folders.VmFolder.CreateFolder(ctx, "ns1")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// As the namespace operator creates the vSphere Pod folder.
+		info := types.FolderExternallyManagedFolderInfo{
+			Id:   ns.Reference().Value + ":" + c.ServiceContent.About.InstanceUuid,
+			Type: string(types.FolderExternallyManagedFolderTypeVSPHERE_POD),
+		}
+		create := func() (types.ManagedObjectReference, error) {
+			res, err := internal.CreateExternallyManagedFolder(ctx, c, &internal.CreateExternallyManagedFolderRequest{
+				This: ns.Reference(),
+				Name: "vSphere Pods",
+				Info: info,
+			})
+			if err != nil {
+				return types.ManagedObjectReference{}, err
+			}
+			return res.Returnval, nil
+		}
+
+		ref, err := create()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		folder := Map(ctx).Get(ref).(*Folder)
+		if folder.Name != "vSphere Pods" {
+			t.Errorf("name = %q, want vSphere Pods", folder.Name)
+		}
+		if folder.externallyManaged == nil || *folder.externallyManaged != info {
+			t.Errorf("externallyManaged = %v, want %v", folder.externallyManaged, info)
+		}
+		if folder.Parent == nil || *folder.Parent != ns.Reference() {
+			t.Errorf("parent = %v, want %v", folder.Parent, ns.Reference())
+		}
+
+		_, err = create()
+		if !soap.IsSoapFault(err) {
+			t.Fatalf("expected SOAP fault, got %v", err)
+		}
+		dup, ok := soap.ToSoapFault(err).VimFault().(types.DuplicateName)
+		if !ok {
+			t.Fatalf("expected DuplicateName, got %#v", soap.ToSoapFault(err).VimFault())
+		}
+		if dup.Object != ref {
+			t.Errorf("DuplicateName.Object = %v, want %v", dup.Object, ref)
+		}
+	})
+}
+
+func TestFolderCreateNamespaceFolder(t *testing.T) {
+	Test(func(ctx context.Context, c *vim25.Client) {
+		finder := find.NewFinder(c)
+		dc, err := finder.DefaultDatacenter(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		folders, err := dc.Folders(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		create := func(name string) (types.ManagedObjectReference, error) {
+			res, err := internal.CreateNamespaceFolder(ctx, c, &internal.CreateNamespaceFolderRequest{
+				This:        folders.VmFolder.Reference(),
+				Name:        name,
+				NamespaceId: name,
+			})
+			if err != nil {
+				return types.ManagedObjectReference{}, err
+			}
+			return res.Returnval, nil
+		}
+
+		assertDuplicate := func(name string, want types.ManagedObjectReference) {
+			t.Helper()
+			_, err := create(name)
+			if !soap.IsSoapFault(err) {
+				t.Fatalf("expected SOAP fault, got %v", err)
+			}
+			dup, ok := soap.ToSoapFault(err).VimFault().(types.DuplicateName)
+			if !ok {
+				t.Fatalf("expected DuplicateName, got %#v", soap.ToSoapFault(err).VimFault())
+			}
+			if dup.Object != want {
+				t.Errorf("DuplicateName.Object = %v, want %v", dup.Object, want)
+			}
+		}
+
+		ref, err := create("ns1")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var folder mo.Folder
+		if err := object.NewFolder(c, ref).Properties(ctx, ref, []string{"name", "namespace", "childType"}, &folder); err != nil {
+			t.Fatal(err)
+		}
+		if folder.Name != "ns1" {
+			t.Errorf("name = %q, want ns1", folder.Name)
+		}
+		if folder.Namespace == nil || *folder.Namespace != "ns1" {
+			t.Errorf("namespace = %v, want ns1", folder.Namespace)
+		}
+		var parent mo.Folder
+		if err := folders.VmFolder.Properties(ctx, folders.VmFolder.Reference(), []string{"childType"}, &parent); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(folder.ChildType, parent.ChildType) {
+			t.Errorf("childType = %v, want %v", folder.ChildType, parent.ChildType)
+		}
+
+		assertDuplicate("ns1", ref)
+
+		// the namespace controller pre-creates the namespace folder with CreateFolder;
+		// the namespace operator adopts it from the DuplicateName fault.
+		pre, err := folders.VmFolder.CreateFolder(ctx, "ns2")
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertDuplicate("ns2", pre.Reference())
+	})
 }
 
 func TestRegisterVm(t *testing.T) {

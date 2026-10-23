@@ -157,6 +157,7 @@ func TestHostContainerBacking(t *testing.T) {
 	if !test.HasDocker() {
 		t.Skip("requires docker on linux")
 	}
+	requireContainerBridge(t)
 
 	m := ESX()
 
@@ -188,6 +189,7 @@ func TestMultipleSimHost(t *testing.T) {
 	if !test.HasDocker() {
 		t.Skip("requires docker on linux")
 	}
+	requireContainerBridge(t)
 
 	m := ESX()
 

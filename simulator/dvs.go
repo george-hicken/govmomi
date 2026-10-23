@@ -59,6 +59,7 @@ func (s *VmwareDistributedVirtualSwitch) addDVPortgroups(ctx *Context, specs []t
 
 	portgroups := s.Portgroup
 	portgroupNames := s.Summary.PortgroupName
+	uplinkChanged := false
 
 	for _, spec := range specs {
 		pg := &DistributedVirtualPortgroup{}
@@ -156,6 +157,17 @@ func (s *VmwareDistributedVirtualSwitch) addDVPortgroups(ctx *Context, specs []t
 			pg.PortKeys = append(pg.PortKeys, strconv.Itoa(i))
 		}
 
+		// The portgroup CreateDVSTask adds is the switch's uplink portgroup, which
+		// vCenter flags in its config and tags, and lists in the switch's config.
+		uplink := pg.Name == s.uplinkPortgroupName()
+		pg.Config.Uplink = types.NewBool(uplink)
+		if uplink {
+			pg.Tag = append(pg.Tag, types.Tag{Key: uplinkPortgroupTag})
+			config := s.Config.GetDVSConfigInfo()
+			config.UplinkPortgroup = append(config.UplinkPortgroup, pg.Self)
+			uplinkChanged = true
+		}
+
 		portgroups = append(portgroups, pg.Self)
 		portgroupNames = append(portgroupNames, pg.Name)
 
@@ -177,10 +189,14 @@ func (s *VmwareDistributedVirtualSwitch) addDVPortgroups(ctx *Context, specs []t
 		})
 	}
 
-	ctx.Update(s, []types.PropertyChange{
+	changes := []types.PropertyChange{
 		{Name: "portgroup", Val: portgroups},
 		{Name: "summary.portgroupName", Val: portgroupNames},
-	})
+	}
+	if uplinkChanged {
+		changes = append(changes, types.PropertyChange{Name: "config", Val: s.Config})
+	}
+	ctx.Update(s, changes)
 
 	return nil
 }
@@ -189,125 +205,9 @@ func (s *VmwareDistributedVirtualSwitch) ReconfigureDvsTask(ctx *Context, req *t
 	task := CreateTask(s, "reconfigureDvs", func(t *Task) (types.AnyType, types.BaseMethodFault) {
 		spec := req.Spec.GetDVSConfigSpec()
 
-		members := s.Summary.HostMember
-		configHosts := slices.Clone(s.Config.GetDVSConfigInfo().Host)
-
-		for _, member := range spec.Host {
-			h := ctx.Map.Get(member.Host)
-			if h == nil {
-				return nil, &types.ManagedObjectNotFound{Obj: member.Host}
-			}
-
-			host := h.(*HostSystem)
-
-			switch types.ConfigSpecOperation(member.Operation) {
-			case types.ConfigSpecOperationAdd:
-				if FindReference(s.Summary.HostMember, member.Host) != nil {
-					return nil, &types.AlreadyExists{Name: host.Name}
-				}
-
-				hostNetworks := append(host.Network, s.Portgroup...)
-				ctx.Update(host, []types.PropertyChange{
-					{Name: "network", Val: hostNetworks},
-				})
-
-				// Mirror what a real vCenter does on the host side when it joins
-				// a DVS: record a HostProxySwitch (with its uplink pnic backing)
-				// on HostSystem.Config.Network.ProxySwitch. Collectors that read
-				// the host's own proxySwitch list (rather than just the DVS's
-				// Summary.HostMember) need this to know which physical NICs back
-				// this switch on this host.
-				proxySwitch := types.HostProxySwitch{
-					DvsUuid: s.Uuid,
-					DvsName: s.Name,
-					Key:     s.Self.Value,
-					Pnic:    dvsUplinkPnics(host, member.Backing),
-				}
-				ctx.Update(host, []types.PropertyChange{
-					{Name: "config.network.proxySwitch", Val: append(host.Config.Network.ProxySwitch, proxySwitch)},
-				})
-
-				members = append(members, member.Host)
-				// A real vCenter always keeps DVSConfigInfo.Host in sync
-				// with Summary.HostMember -- a client reading config.host
-				// for host membership (rather than summary.hostMember)
-				// otherwise sees an empty list regardless of actual
-				// membership.
-				hostRef := member.Host
-				configHosts = append(configHosts, types.DistributedVirtualSwitchHostMember{
-					Config: types.DistributedVirtualSwitchHostMemberConfigInfo{
-						Host: &hostRef,
-					},
-				})
-				parent := ctx.Map.Get(*host.HostSystem.Parent)
-
-				var pgs []types.ManagedObjectReference
-				for _, ref := range s.Portgroup {
-					pg := ctx.Map.Get(ref).(*DistributedVirtualPortgroup)
-					pgs = append(pgs, ref)
-
-					pgHosts := append(pg.Host, member.Host)
-					ctx.Update(pg, []types.PropertyChange{
-						{Name: "host", Val: pgHosts},
-					})
-
-					cr := hostParent(ctx, &host.HostSystem)
-					if FindReference(cr.Network, ref) == nil {
-						computeNetworks := append(cr.Network, ref)
-						ctx.Update(parent, []types.PropertyChange{
-							{Name: "network", Val: computeNetworks},
-						})
-					}
-				}
-
-				ctx.postEvent(&types.DvsHostJoinedEvent{
-					DvsEvent:   s.event(ctx),
-					HostJoined: *host.eventArgument(),
-				})
-			case types.ConfigSpecOperationRemove:
-				for _, ref := range host.Vm {
-					vm := ctx.Map.Get(ref).(*VirtualMachine)
-					if pg := FindReference(vm.Network, s.Portgroup...); pg != nil {
-						return nil, &types.ResourceInUse{
-							Type: pg.Type,
-							Name: pg.Value,
-						}
-					}
-				}
-
-				RemoveReference(&members, member.Host)
-				configHosts = slices.DeleteFunc(configHosts, func(m types.DistributedVirtualSwitchHostMember) bool {
-					return m.Config.Host != nil && *m.Config.Host == member.Host
-				})
-
-				proxySwitches := slices.Clone(host.Config.Network.ProxySwitch)
-				proxySwitches = slices.DeleteFunc(proxySwitches, func(ps types.HostProxySwitch) bool {
-					return ps.DvsUuid == s.Uuid
-				})
-				ctx.Update(host, []types.PropertyChange{
-					{Name: "config.network.proxySwitch", Val: proxySwitches},
-				})
-
-				ctx.postEvent(&types.DvsHostLeftEvent{
-					DvsEvent: s.event(ctx),
-					HostLeft: *host.eventArgument(),
-				})
-			case types.ConfigSpecOperationEdit:
-				return nil, &types.NotSupported{}
-			}
+		if fault := s.reconfigureHosts(ctx, spec.Host); fault != nil {
+			return nil, fault
 		}
-
-		config := s.Config.GetDVSConfigInfo()
-		config.Host = configHosts
-
-		ctx.Update(s, []types.PropertyChange{
-			{Name: "summary.hostMember", Val: members},
-			{Name: "summary.numHosts", Val: int32(len(members))},
-			{Name: "config", Val: config},
-		})
-
-		// Invalidate FetchDVPorts cache: host membership changes affect uplink ports
-		s.FetchDVPortsResponse.Returnval = nil
 
 		ctx.postEvent(&types.DvsReconfiguredEvent{
 			DvsEvent:   s.event(ctx),
@@ -322,6 +222,132 @@ func (s *VmwareDistributedVirtualSwitch) ReconfigureDvsTask(ctx *Context, req *t
 			Returnval: task.Run(ctx),
 		},
 	}
+}
+
+// reconfigureHosts applies the host members of a DVS config spec: an added host joins the DVS and its portgroups,
+// a removed host leaves them, and the DVS's host list is updated to match. CreateDVS applies its members the same
+// way, so a DVS created with hosts has the host state of one reconfigured to them.
+func (s *VmwareDistributedVirtualSwitch) reconfigureHosts(ctx *Context, specs []types.DistributedVirtualSwitchHostMemberConfigSpec) types.BaseMethodFault {
+	members := s.Summary.HostMember
+	configHosts := slices.Clone(s.Config.GetDVSConfigInfo().Host)
+
+	for _, member := range specs {
+		h := ctx.Map.Get(member.Host)
+		if h == nil {
+			return &types.ManagedObjectNotFound{Obj: member.Host}
+		}
+
+		host := h.(*HostSystem)
+
+		switch types.ConfigSpecOperation(member.Operation) {
+		case types.ConfigSpecOperationAdd:
+			if FindReference(s.Summary.HostMember, member.Host) != nil {
+				return &types.AlreadyExists{Name: host.Name}
+			}
+
+			hostNetworks := append(host.Network, s.Portgroup...)
+			ctx.Update(host, []types.PropertyChange{
+				{Name: "network", Val: hostNetworks},
+			})
+
+			// Mirror what a real vCenter does on the host side when it joins
+			// a DVS: record a HostProxySwitch (with its uplink pnic backing)
+			// on HostSystem.Config.Network.ProxySwitch. Collectors that read
+			// the host's own proxySwitch list (rather than just the DVS's
+			// Summary.HostMember) need this to know which physical NICs back
+			// this switch on this host.
+			proxySwitch := types.HostProxySwitch{
+				DvsUuid: s.Uuid,
+				DvsName: s.Name,
+				Key:     s.Self.Value,
+				Pnic:    dvsUplinkPnics(host, member.Backing),
+			}
+			ctx.Update(host, []types.PropertyChange{
+				{Name: "config.network.proxySwitch", Val: append(host.Config.Network.ProxySwitch, proxySwitch)},
+			})
+
+			members = append(members, member.Host)
+			// A real vCenter always keeps DVSConfigInfo.Host in sync
+			// with Summary.HostMember -- a client reading config.host
+			// for host membership (rather than summary.hostMember)
+			// otherwise sees an empty list regardless of actual
+			// membership.
+			hostRef := member.Host
+			configHosts = append(configHosts, types.DistributedVirtualSwitchHostMember{
+				Config: types.DistributedVirtualSwitchHostMemberConfigInfo{
+					Host: &hostRef,
+				},
+			})
+			parent := ctx.Map.Get(*host.HostSystem.Parent)
+
+			var pgs []types.ManagedObjectReference
+			for _, ref := range s.Portgroup {
+				pg := ctx.Map.Get(ref).(*DistributedVirtualPortgroup)
+				pgs = append(pgs, ref)
+
+				pgHosts := append(pg.Host, member.Host)
+				ctx.Update(pg, []types.PropertyChange{
+					{Name: "host", Val: pgHosts},
+				})
+
+				cr := hostParent(ctx, &host.HostSystem)
+				if FindReference(cr.Network, ref) == nil {
+					computeNetworks := append(cr.Network, ref)
+					ctx.Update(parent, []types.PropertyChange{
+						{Name: "network", Val: computeNetworks},
+					})
+				}
+			}
+
+			ctx.postEvent(&types.DvsHostJoinedEvent{
+				DvsEvent:   s.event(ctx),
+				HostJoined: *host.eventArgument(),
+			})
+		case types.ConfigSpecOperationRemove:
+			for _, ref := range host.Vm {
+				vm := ctx.Map.Get(ref).(*VirtualMachine)
+				if pg := FindReference(vm.Network, s.Portgroup...); pg != nil {
+					return &types.ResourceInUse{
+						Type: pg.Type,
+						Name: pg.Value,
+					}
+				}
+			}
+
+			RemoveReference(&members, member.Host)
+			configHosts = slices.DeleteFunc(configHosts, func(m types.DistributedVirtualSwitchHostMember) bool {
+				return m.Config.Host != nil && *m.Config.Host == member.Host
+			})
+
+			proxySwitches := slices.Clone(host.Config.Network.ProxySwitch)
+			proxySwitches = slices.DeleteFunc(proxySwitches, func(ps types.HostProxySwitch) bool {
+				return ps.DvsUuid == s.Uuid
+			})
+			ctx.Update(host, []types.PropertyChange{
+				{Name: "config.network.proxySwitch", Val: proxySwitches},
+			})
+
+			ctx.postEvent(&types.DvsHostLeftEvent{
+				DvsEvent: s.event(ctx),
+				HostLeft: *host.eventArgument(),
+			})
+		case types.ConfigSpecOperationEdit:
+			return &types.NotSupported{}
+		}
+	}
+
+	config := s.Config.GetDVSConfigInfo()
+	config.Host = configHosts
+
+	ctx.Update(s, []types.PropertyChange{
+		{Name: "summary.hostMember", Val: members},
+		{Name: "summary.numHosts", Val: int32(len(members))},
+		{Name: "config", Val: s.Config},
+	})
+
+	// Invalidate FetchDVPorts cache: host membership changes affect uplink ports
+	s.FetchDVPortsResponse.Returnval = nil
+	return nil
 }
 
 // dvsUplinkPnics returns the physical NIC device keys to back a host's proxy
@@ -411,14 +437,22 @@ func (s *VmwareDistributedVirtualSwitch) dvPortgroups(ctx *Context, criteria *ty
 	return res
 }
 
-// uplinkPortgroup returns the DVS's auto-created uplink portgroup. It's
+// uplinkPortgroupTag is the system tag vCenter sets on a DVS's uplink portgroup.
+const uplinkPortgroupTag = "SYSTEM/DVS.UPLINKPG"
+
+// uplinkPortgroupName returns the name vCenter gives the uplink portgroup it creates with a DVS.
+func (s *VmwareDistributedVirtualSwitch) uplinkPortgroupName() string {
+	return s.Name + "-DVUplinks" + strings.TrimPrefix(s.Self.Value, "dvs")
+}
+
+// uplinkPortgroup returns the DVS's auto-created uplink portgroup. It'"'"'s
 // identified by name rather than a stored reference: CreateDVSTask (folder.go)
 // creates it via a nested AddDVPortgroupTask, which -- like all vcsim tasks --
 // completes asynchronously in its own goroutine after the creating task's
 // lock is released, so there's no point during DVS creation itself where the
 // new portgroup's reference is reliably available yet to store.
 func (s *VmwareDistributedVirtualSwitch) uplinkPortgroup(ctx *Context) *DistributedVirtualPortgroup {
-	name := s.Name + "-DVUplinks" + strings.TrimPrefix(s.Self.Value, "dvs")
+	name := s.uplinkPortgroupName()
 
 	for _, ref := range s.Portgroup {
 		if pg, ok := ctx.Map.Get(ref).(*DistributedVirtualPortgroup); ok && pg.Name == name {

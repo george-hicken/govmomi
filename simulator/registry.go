@@ -69,6 +69,9 @@ type Registry struct {
 	handlers map[types.ManagedObjectReference]RegisterObject
 	locks    map[types.ManagedObjectReference]*internal.ObjectLock
 
+	// eventWatch runs docker events for this registry's containers.
+	eventWatch eventWatcher
+
 	Namespace string
 	Path      string
 	Handler   func(*Context, *Method) (mo.Reference, types.BaseMethodFault)
@@ -77,10 +80,22 @@ type Registry struct {
 	tagManager tagManager
 
 	// ContainerImages maps VM config attributes to OCI container images.
-	// It is consulted during PowerOn to enable container-backed simulation
+	// It is consulted at VM create to enable container-backed simulation
 	// without requiring modifications to the code under test.
 	// See ContainerImageRegistry for details and usage examples.
 	ContainerImages ContainerImageRegistry
+
+	// VMRules are applied at VM create and power-on, after the client's spec.
+	// See VMRule for details.
+	VMRules VMRules
+
+	// underlay realises the Model's Topology. It is nil when no topology is loaded.
+	underlay *underlayRuntime
+
+	// run labels the containers this Registry creates, and lock is held for its life once it creates any.
+	runMu sync.Mutex
+	run   string
+	lock  *runLock
 }
 
 // tagManager is an interface to simplify internal interaction with the vapi tag manager simulator.
@@ -154,7 +169,7 @@ func (r *Registry) newReference(item mo.Reference) types.ManagedObjectReference 
 
 func (r *Registry) AlignCounter() error {
 	maxN := int64(0)
-	for ref, _ := range r.objects {
+	for ref := range r.objects {
 		prefix := valuePrefix(ref.Type)
 		suffix := strings.TrimPrefix(ref.Value, prefix)
 		n, err := strconv.ParseInt(suffix, 10, 64)
@@ -345,7 +360,13 @@ func (r *Registry) Update(ctx *Context, obj mo.Reference, changes []types.Proper
 
 	val := getManagedObject(obj).Addr().Interface().(mo.Reference)
 
-	mo.ApplyPropertyChange(val, changes)
+	if t, ok := obj.(*Task); ok {
+		t.infoMu.Lock()
+		mo.ApplyPropertyChange(val, changes)
+		t.infoMu.Unlock()
+	} else {
+		mo.ApplyPropertyChange(val, changes)
+	}
 
 	r.applyHandlers(func(o RegisterObject) {
 		o.UpdateObject(ctx, val, changes)
@@ -694,8 +715,11 @@ var enableLocker = os.Getenv("VCSIM_LOCKER") != "false"
 // WithLock holds a lock for the given object while then given function is run.
 func (r *Registry) WithLock(onBehalfOf *Context, obj mo.Reference, f func()) {
 	unlock := r.AcquireLock(onBehalfOf, obj)
+	// Deferred so a panic inside f releases the lock. ObjectLock.Release only
+	// clears heldBy once its refcount reaches zero, so an unwound-past unlock
+	// would leave the object permanently locked to every other caller.
+	defer unlock()
 	f()
-	unlock()
 }
 
 // AcquireLock acquires the lock for onBehalfOf then returns. The lock MUST be

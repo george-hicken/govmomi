@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vmware/govmomi/internal/version"
 	"github.com/vmware/govmomi/toolbox/hgfs"
 )
 
@@ -22,6 +23,14 @@ const (
 
 	// RPCIN_MAX_DELAY as defined in rpcChannelInt.h:
 	maxDelay = 10
+
+	// ToolsDescription starts the guestinfo.vmtools.description the toolbox
+	// reports, where vmtoolsd reports "open-vm-tools" or "VMware Tools".
+	ToolsDescription = "govmomi toolbox"
+
+	// DefaultGuestInfoInterval is vmtoolsd's guest info poll interval
+	// (guestInfoServer.c GUESTINFO_POLL_INTERVAL).
+	DefaultGuestInfoInterval = 30 * time.Second
 )
 
 var (
@@ -57,11 +66,46 @@ type Service struct {
 	Power   *PowerCommandHandler
 
 	PrimaryIP func() string
+
+	// GuestInfoInterval, when positive, makes the Service push guest info to
+	// the VMX as vmtoolsd's guestInfo plugin does: the DNS name and the NIC
+	// info, when the Service starts and then at this interval. Each is sent
+	// only when it differs from the last value the VMX accepted, or after a
+	// TCLO reset. When zero, the default, guest info is sent only in reply to
+	// reset and broadcastIP.
+	GuestInfoInterval time.Duration
+
+	// GuestInfoRetryInterval and GuestInfoRetryWindow, when both positive,
+	// gather guest info every GuestInfoRetryInterval from the start of the
+	// Service until the VMX accepts a NIC report with a global IPv4 address,
+	// or until GuestInfoRetryWindow has passed. The guest's address may not
+	// be configured yet when the Service starts. When either is zero, the
+	// default, there is no retry.
+	GuestInfoRetryInterval time.Duration
+	GuestInfoRetryWindow   time.Duration
+
+	// ReportVersion makes the Service report its version as guest variables
+	// when it starts, as vmtoolsd's ToolsCoreReportVersionData does:
+	// guestinfo.vmtools.description, versionString, versionNumber and
+	// buildNumber. The description starts with ToolsDescription, which lets
+	// the host tell the toolbox from vmtoolsd.
+	ReportVersion bool
+
+	// guestInfo holds the last guest info payload the VMX accepted, by
+	// GuestInfoType. It is used only from the Start goroutine.
+	guestInfo map[int][]byte
+
+	// noTCLO is set when the in-channel is the no-op channel, on which the
+	// VMX's Capabilities_Register can never arrive.
+	noTCLO bool
 }
 
 // NewService initializes a Service instance
 func NewService(rpcIn Channel, rpcOut Channel) *Service {
+	_, noTCLO := rpcIn.(*noopChannel)
+
 	s := &Service{
+		noTCLO:   noTCLO,
 		name:     "toolbox", // Same name used by vmtoolsd
 		in:       NewTraceChannel(rpcIn),
 		out:      &ChannelOut{NewTraceChannel(rpcOut)},
@@ -149,11 +193,58 @@ func (s *Service) Start() error {
 		// Note we Send(response) even when nil, to let the VMX know we are here
 		var response []byte
 
+		if s.ReportVersion {
+			s.reportVersion()
+		}
+		if s.noTCLO {
+			// vmtoolsd registers its capabilities, the tools version among
+			// them, when the VMX asks. Without a TCLO channel the VMX
+			// cannot ask, so register them now.
+			_, _ = s.CapabilitiesRegister(nil)
+		}
+
+		// Guest info is gathered on this goroutine, as vmtoolsd gathers on
+		// its main loop, so that requests on s.out are never concurrent.
+		var gather, retry, retryEnd <-chan time.Time
+		var retryTicker *time.Ticker
+		var retryTimer *time.Timer
+		// stopRetry ends the retry when it succeeds or times out, and on any
+		// exit from this goroutine, so that no timer outlives the Service.
+		stopRetry := func() {
+			if retryTicker != nil {
+				retryTicker.Stop()
+				retryTimer.Stop()
+			}
+			retry, retryEnd = nil, nil
+		}
+		defer stopRetry()
+
+		if s.GuestInfoInterval > 0 {
+			ticker := time.NewTicker(s.GuestInfoInterval)
+			defer ticker.Stop()
+			gather = ticker.C
+
+			accepted := s.gatherGuestInfo()
+			if !accepted && s.GuestInfoRetryInterval > 0 && s.GuestInfoRetryWindow > 0 {
+				retryTicker = time.NewTicker(s.GuestInfoRetryInterval)
+				retryTimer = time.NewTimer(s.GuestInfoRetryWindow)
+				retry, retryEnd = retryTicker.C, retryTimer.C
+			}
+		}
+
 		for {
 			select {
 			case <-s.stop:
 				s.stopChannel()
 				return
+			case <-retry:
+				if s.gatherGuestInfo() {
+					stopRetry()
+				}
+			case <-retryEnd:
+				stopRetry()
+			case <-gather:
+				s.gatherGuestInfo()
 			case <-time.After(time.Millisecond * 10 * s.delay):
 				if err = s.checkReset(); err != nil {
 					continue
@@ -234,6 +325,10 @@ func (s *Service) Dispatch(request []byte) []byte {
 
 // Reset is the default Handler for reset requests
 func (s *Service) Reset([]byte) ([]byte, error) {
+	// As guestInfoServer.c GuestInfoServerReset does, so that the next
+	// gather resends everything to a VMX that may have been restarted.
+	s.guestInfo = nil
+
 	s.SendGuestInfo() // Send the IP info ASAP
 
 	return []byte("ATR " + s.name), nil
@@ -319,6 +414,81 @@ func (s *Service) SendGuestInfo() {
 
 		if err != nil {
 			log.Printf("SendGuestInfo %d: %s", i, err)
+		}
+	}
+}
+
+// gatherGuestInfo sends each guest info value that has changed since the VMX
+// last accepted it, as guestInfoServer.c GuestInfoGather and
+// GuestInfoUpdateVMX do. A value the VMX does not accept is retried at the
+// next gather. It reports whether the VMX has accepted a NIC report with a
+// global IPv4 address, now or before.
+func (s *Service) gatherGuestInfo() bool {
+	if name, err := hostname(); err != nil {
+		log.Printf("gather guest info: hostname: %s", err)
+	} else {
+		// A text value, sent with its NUL terminator as vmtoolsd's
+		// SetGuestInfo does.
+		s.updateGuestInfo(GuestInfoDNSName, append([]byte(name), 0))
+	}
+
+	info := DefaultGuestNicInfo()
+	nics, err := EncodeXDR(info)
+	if err != nil {
+		log.Printf("gather guest info: nicinfo: %s", err)
+		return false
+	}
+	return s.updateGuestInfo(GuestInfoIPAddressV2, nics) && hasGlobalIPv4(info)
+}
+
+// hasGlobalIPv4 reports whether info has an IPv4 address that is neither
+// loopback nor link-local.
+func hasGlobalIPv4(info *GuestNicInfo) bool {
+	if info.V3 == nil {
+		return false
+	}
+	for _, nic := range info.V3.Nics {
+		for _, e := range nic.IPs {
+			if ip := e.Address.IP(); ip != nil && ip.To4() != nil && ip.IsGlobalUnicast() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// updateGuestInfo sends value as the guest info kind unless the VMX already
+// accepted it. It reports whether the VMX has accepted value.
+func (s *Service) updateGuestInfo(kind int, value []byte) bool {
+	if last, ok := s.guestInfo[kind]; ok && bytes.Equal(last, value) {
+		return true
+	}
+
+	if _, err := s.out.Request(GuestInfoCommand(kind, value)); err != nil {
+		log.Printf("SetGuestInfo %d: %s", kind, err)
+		return false
+	}
+
+	if s.guestInfo == nil {
+		s.guestInfo = make(map[int][]byte)
+	}
+	s.guestInfo[kind] = value
+	return true
+}
+
+// reportVersion sends the version guest variables vmtoolsd sends when it
+// starts (services/vmtoolsd/mainLoop.c ToolsCoreReportVersionData). A failure
+// is logged and not retried, as there.
+func (s *Service) reportVersion() {
+	vars := []string{
+		"description " + ToolsDescription + " " + version.ClientVersion,
+		"versionString " + version.ClientVersion,
+		fmt.Sprintf("versionNumber %d", toolsVersionUnmanaged),
+		"buildNumber 0",
+	}
+	for _, v := range vars {
+		if _, err := s.out.Request([]byte("info-set guestinfo.vmtools." + v)); err != nil {
+			log.Printf("report version: %s", err)
 		}
 	}
 }

@@ -52,10 +52,16 @@ func NewOptionManager(ref *types.ManagedObjectReference, setting []types.BaseOpt
 // This does _not_ construct the OptionManager for ConfigManager.advancedOption.
 func (m *OptionManager) init(r *Registry) {
 	if len(m.Setting) == 0 {
+		tmpl := esx.Setting
 		if r.IsVPX() {
-			m.Setting = vpx.Setting
-		} else {
-			m.Setting = esx.Setting
+			tmpl = vpx.Setting
+		}
+		// Copy the values: Service.NewServer rewrites the .uri settings in place, and the templates are shared by
+		// every Registry in the process.
+		m.Setting = make([]types.BaseOptionValue, 0, len(tmpl))
+		for _, o := range tmpl {
+			v := *o.GetOptionValue()
+			m.Setting = append(m.Setting, &v)
 		}
 	}
 }

@@ -10,7 +10,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"path"
@@ -61,6 +60,10 @@ type Model struct {
 
 	// Autostart will power on Model created VMs when true
 	Autostart bool `json:"-"`
+
+	// Topology, when set, describes the underlays, routers and pNIC attachments beneath the inventory.
+	// It is loaded from the vcsim -topology file; the default (nil) keeps today's behaviour.
+	Topology *Topology `json:"-"`
 
 	// Datacenter specifies the number of Datacenter entities to create
 	// Name prefix: DC, vcsim flag: -dc
@@ -493,7 +496,35 @@ func (m *Model) Create() error {
 	if err := m.createRootTempDir(ctx.Map.OptionManager()); err != nil {
 		return err
 	}
+	if err := m.startUnderlay(ctx); err != nil {
+		return err
+	}
 	return m.CreateInfrastructure(ctx)
+}
+
+// startUnderlay realises the Topology: it sweeps what a dead run left behind, then creates every router. Domain
+// networks are created as vNICs need them.
+func (m *Model) startUnderlay(ctx *Context) error {
+	if m.Topology == nil {
+		return nil
+	}
+
+	if err := ctx.Map.setRun(m.Topology.Run); err != nil {
+		return err
+	}
+	u, err := newUnderlayRuntime(m.Topology)
+	if err != nil {
+		return err
+	}
+	ctx.Map.adoptRunLock(u.lock)
+	for _, r := range m.Topology.Routers {
+		if err := u.StartRouter(r.Name); err != nil {
+			_ = u.Close()
+			return err
+		}
+	}
+	ctx.Map.underlay = u
+	return nil
 }
 
 func (m *Model) CreateInfrastructure(ctx *Context) error {
@@ -935,6 +966,17 @@ func (m *Model) Remove() {
 		}
 	}
 	ctx.Map.m.Unlock()
+	// A container whose removal failed still holds a watch; the watcher must not outlive the model.
+	ctx.Map.eventWatch.close()
+
+	// Containers go before routers and networks, which podman will not remove while they are in use.
+	if u := ctx.Map.underlay; u != nil {
+		if err := u.Close(); err != nil {
+			log.Printf("underlay teardown: %s", err)
+		}
+		ctx.Map.underlay = nil
+	}
+	ctx.Map.releaseRun()
 
 	_ = os.RemoveAll(m.dir)
 }
@@ -1029,7 +1071,7 @@ func (dc *DelayConfig) delay(method string) {
 		d += md
 	}
 	if dc.DelayJitter > 0 {
-		d += int(rand.NormFloat64() * dc.DelayJitter * float64(d))
+		d += int(normFloat64() * dc.DelayJitter * float64(d))
 	}
 	if d > 0 {
 		//fmt.Printf("Delaying method %s %d ms\n", method, d)

@@ -18,16 +18,22 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 var (
-	shell      = "/bin/sh"
-	eventWatch eventWatcher
+	shell = "/bin/sh"
 )
+
+// shellQuote quotes s as one word for bash, for create()'s bash -c string.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
 
 const (
 	deleteWithContainer = "lifecycle=container"
@@ -40,18 +46,39 @@ func init() {
 	}
 }
 
-// commandError logs and returns an error from a command execution failure, including stderr if available.
-func commandError(operation string, args []string, err error) error {
-	stderr := ""
-	if xerr, ok := err.(*exec.ExitError); ok {
-		stderr = strings.TrimSpace(string(xerr.Stderr))
+// exitErrStderr returns the trimmed stderr of a failed command, or "" if err
+// carries none.
+func exitErrStderr(err error) string {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return ""
 	}
-	var cmdErr error
-	if stderr != "" {
-		cmdErr = fmt.Errorf("%s %v failed: %s: %s", operation, args, err, stderr)
-	} else {
-		cmdErr = fmt.Errorf("%s %v failed: %s", operation, args, err)
+	return strings.TrimSpace(string(exitErr.Stderr))
+}
+
+// commandError keeps operation and failure classification without exposing
+// command arguments, runtime output, or error strings that may contain data.
+func commandError(operation string, err error) error {
+	var safe error
+	var exited *exec.ExitError
+	switch {
+	case errors.Is(err, context.Canceled):
+		safe = context.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		safe = context.DeadlineExceeded
+	case errors.As(err, &exited):
+		// Preserve the exit status for callers without retaining captured stderr.
+		safe = &exec.ExitError{ProcessState: exited.ProcessState}
+	case errors.Is(err, exec.ErrNotFound):
+		safe = exec.ErrNotFound
+	case errors.Is(err, os.ErrPermission):
+		safe = os.ErrPermission
+	case errors.Is(err, os.ErrNotExist):
+		safe = os.ErrNotExist
+	default:
+		safe = errors.New("command execution error")
 	}
+	cmdErr := fmt.Errorf("%s failed: %w", operation, safe)
 	log.Print(cmdErr)
 	return cmdErr
 }
@@ -59,9 +86,11 @@ func commandError(operation string, args []string, err error) error {
 type eventWatcher struct {
 	sync.Mutex
 
-	stdin   io.WriteCloser
-	stdout  io.ReadCloser
-	process *os.Process
+	// stdin and cmd are set while docker events runs. cmd leads its own process group, see startInOwnProcessGroup.
+	stdin io.WriteCloser
+	cmd   *exec.Cmd
+	// closed is set by close; a closed watcher starts no more docker events.
+	closed bool
 
 	// watches is a map of container IDs to container objects
 	watches map[string]*container
@@ -101,8 +130,16 @@ type containerDetails struct {
 	}
 }
 
-type unknownContainer error
-type uninitializedContainer error
+// uninitializedContainer is the error for an operation on a container that
+// has not been created, or no longer exists.
+type uninitializedContainer struct{ error }
+
+// isUninitializedContainer reports whether err is, or wraps, an
+// uninitializedContainer.
+func isUninitializedContainer(err error) bool {
+	var u uninitializedContainer
+	return errors.As(err, &u)
+}
 
 var sanitizeNameRx = regexp.MustCompile(`[\(\)\s]`)
 
@@ -110,12 +147,14 @@ func sanitizeName(name string) string {
 	return sanitizeNameRx.ReplaceAllString(name, "-")
 }
 
-func constructContainerName(name, uid string) string {
-	return fmt.Sprintf("vcsim-%s-%s", sanitizeName(name), uid)
+// constructContainerName names a VM or host container. The run id keeps names unique across the vcsim
+// instances on a host, so one instance can never address another's container by name.
+func constructContainerName(run, name, uid string) string {
+	return fmt.Sprintf("vcsim-%s-%s-%s", sanitizeName(run), sanitizeName(name), uid)
 }
 
-func constructVolumeName(containerName, uid, volumeName string) string {
-	return constructContainerName(containerName, uid) + "--" + sanitizeName(volumeName)
+func constructVolumeName(containerName, volumeName string) string {
+	return containerName + "--" + sanitizeName(volumeName)
 }
 
 func prefixToMask(prefix int) string {
@@ -220,9 +259,15 @@ func createVolume(volumeName string, labels []string, files []tarEntry) (uid str
 		cmd := exec.Command("docker", run...)
 		out, err := cmd.Output()
 		if err != nil {
-			return "", commandError("volume create", cmd.Args, err)
+			// Podman rejects volume create when the volume already exists; Docker is idempotent.
+			// Named volumes can be implicitly created by "docker create -v name:/path" so treat "already exists" as success.
+			if !strings.Contains(exitErrStderr(err), "already exists") {
+				return "", commandError("volume create", err)
+			}
+			uid = name // volume already exists; provided name is the uid
+		} else {
+			uid = strings.TrimSpace(string(out))
 		}
-		uid = strings.TrimSpace(string(out))
 
 		if name == "" {
 			name = uid
@@ -239,11 +284,12 @@ func createVolume(volumeName string, labels []string, files []tarEntry) (uid str
 	}
 
 	if err = cmd.Start(); err != nil {
-		return uid, commandError("volume population start", cmd.Args, err)
+		return uid, commandError("volume population start", err)
 	}
 
 	tw := tar.NewWriter(stdin)
 
+	var tarErr error
 	for _, file := range files {
 		header := file.header
 
@@ -259,7 +305,9 @@ func createVolume(volumeName string, labels []string, files []tarEntry) (uid str
 			header.Mode = 0444
 		}
 
-		tarErr := tw.WriteHeader(header)
+		if tarErr == nil {
+			tarErr = tw.WriteHeader(header)
+		}
 		if tarErr == nil {
 			_, tarErr = tw.Write(file.content)
 		}
@@ -268,12 +316,12 @@ func createVolume(volumeName string, labels []string, files []tarEntry) (uid str
 	err = nil
 	twErr := tw.Close()
 	stdinErr := stdin.Close()
-	if twErr != nil || stdinErr != nil {
-		err = fmt.Errorf("tw: {%s}, stdin: {%s}", twErr, stdinErr)
+	if tarErr != nil || twErr != nil || stdinErr != nil {
+		err = fmt.Errorf("tar: {%s}, tw: {%s}, stdin: {%s}", tarErr, twErr, stdinErr)
 	}
 
 	if waitErr := cmd.Wait(); waitErr != nil {
-		return uid, commandError("volume population", cmd.Args, waitErr)
+		return uid, commandError("volume population", waitErr)
 	}
 
 	return uid, err
@@ -360,27 +408,83 @@ func createBridge(bridgeName string, labels ...string) (string, error) {
 	return id, nil
 }
 
-// create
+// createOptions is the docker create configuration for create(). The
+// ExtraConfig keys that set it for a VM are documented on
+// ContainerBackingOptionKey.
+type createOptions struct {
+	// Networks are the bridges to connect the container to, without a MAC.
+	Networks []string
+	// NICs are the container's interfaces in device-key order; see networkArgs.
+	NICs []containerNIC
+	// Volumes are docker -v arguments, "source:destination[:options]".
+	Volumes []string
+	// Ports are docker -p arguments, "hostPort:containerPort".
+	Ports []string
+	// Env are environment variables in name=value form.
+	Env []string
+
+	// Privileged adds --privileged.
+	Privileged bool
+	// NestedContainers adds the flags a container needs to run containers
+	// itself, --privileged among them; see nestedContainerArgs.
+	NestedContainers bool
+	// NestedVolumes are the container paths that NestedContainers mounts as
+	// anonymous volumes, off the overlay root filesystem. nil means /var, as
+	// kind mounts it; an empty slice mounts none.
+	NestedVolumes []string
+	// CapAdd are capabilities to add, such as NET_RAW for ping.
+	CapAdd []string
+	// Sysctl runs the container under the RUN.sysctl overlay, with the
+	// overlay as its entrypoint, so args are the command it execs; see
+	// sysctlCreateArgs. The caller mounts the overlay's directory.
+	Sysctl bool
+
+	// QuoteImageAndArgs shell-quotes the image and each arg, for a command
+	// given as a JSON array, whose elements may contain shell metacharacters.
+	// Otherwise the image is a raw string of docker create arguments ending in
+	// the image, such as "-v '/path:/dst:ro' nginx", and is left for bash to
+	// split.
+	QuoteImageAndArgs bool
+	// RecreateIfExists removes any container with the same name first. A test
+	// killed by a timeout runs no cleanup and leaves its containers behind.
+	RecreateIfExists bool
+}
+
+// create allocates a container for the simulated VM.
 //   - name - pretty name, eg. vm name
 //   - id - uuid or similar - this is merged into container name rather than dictating containerID
-//   - networks - set of bridges to connect the container to
-//   - volumes - colon separated tuple of volume name to mount path. Passed directly to docker via -v so mount options can be postfixed.
-//   - env - array of environment vairables in name=value form
-//   - optsAndImage - pass-though options and must include at least the container image to use, including tag if necessary
+//   - image - the container image to use, including tag if necessary
 //   - args - the command+args to pass to the container
-func create(ctx *Context, name string, id string, networks []string, volumes []string, ports []string, env []string, image string, args []string) (*container, error) {
+//   - opts - see createOptions
+func create(ctx *Context, name string, id string, image string, args []string, opts createOptions) (*container, error) {
 	if len(image) == 0 {
 		return nil, errors.New("cannot create container backing without an image")
 	}
 
+	if err := ctx.Map.holdRun(); err != nil {
+		return nil, err
+	}
+	if err := sweepContainers(); err != nil {
+		log.Printf("container create: sweep stale containers: %s", err)
+	}
+
 	var c container
-	c.name = constructContainerName(name, id)
+	c.name = ctx.Map.containerName(name, id)
 	c.changes = make(chan struct{})
 
-	for i := range volumes {
-		// we'll pre-create anonymous volumes, simply for labelling consistency
-		volName := strings.Split(volumes[i], ":")
-		createVolume(volName[0], []string{deleteWithContainer, "container=" + c.name}, nil)
+	if opts.RecreateIfExists {
+		if err := ctx.Map.removeExistingContainer(c.name); err != nil {
+			return nil, err
+		}
+	}
+
+	for i := range opts.Volumes {
+		// Pre-create named Docker volumes for labelling consistency.
+		// Skip bind mounts (host paths starting with "/") — those already exist.
+		volName := strings.Split(opts.Volumes[i], ":")
+		if !strings.HasPrefix(volName[0], "/") {
+			createVolume(volName[0], []string{deleteWithContainer, "container=" + c.name}, nil)
+		}
 	}
 
 	// assemble env
@@ -389,41 +493,165 @@ func create(ctx *Context, name string, id string, networks []string, volumes []s
 	var dockerPort []string
 	var dockerEnv []string
 
-	for i := range env {
-		dockerEnv = append(dockerEnv, "--env", env[i])
+	for i := range opts.Env {
+		dockerEnv = append(dockerEnv, "--env", opts.Env[i])
 	}
 
-	for i := range volumes {
-		dockerVol = append(dockerVol, "-v", volumes[i])
+	for i := range opts.Volumes {
+		dockerVol = append(dockerVol, "-v", opts.Volumes[i])
 	}
 
-	for i := range ports {
-		dockerPort = append(dockerPort, "-p", ports[i])
+	for i := range opts.Ports {
+		dockerPort = append(dockerPort, "-p", opts.Ports[i])
 	}
 
-	for i := range networks {
-		dockerNet = append(dockerNet, "--network", networks[i])
+	dockerNet = networkArgs(opts.Networks, opts.NICs, runtimeNetwork())
+
+	run := []string{"docker", "create", "--name", c.name,
+		"--label", labelRun + "=" + ctx.Map.runID(), "--label", labelPID + "=" + strconv.Itoa(os.Getpid())}
+
+	if opts.Privileged || opts.NestedContainers {
+		run = append(run, "--privileged")
 	}
 
-	run := []string{"docker", "create", "--name", c.name}
+	for _, c := range opts.CapAdd {
+		run = append(run, "--cap-add", c)
+	}
+
+	if opts.Sysctl {
+		run = append(run, sysctlCreateArgs()...)
+	}
+
+	if opts.NestedContainers {
+		volumes := opts.NestedVolumes
+		if volumes == nil {
+			volumes = []string{"/var"}
+		}
+		run = append(run, nestedContainerArgs(volumes)...)
+		run = append(run, nestedModulesVolumes("/lib/modules")...)
+	} else {
+		// the host cgroup namespace gives access to every controller, cpuset included
+		run = append(run, "--cgroupns=host")
+	}
+
 	run = append(run, dockerNet...)
 	run = append(run, dockerVol...)
 	run = append(run, dockerPort...)
 	run = append(run, dockerEnv...)
-	run = append(run, image)
-	run = append(run, args...)
-
-	// this combines all the run options into a single string that's passed to /bin/bash -c as the single argument to force bash parsing.
-	// TODO: make this configurable behaviour so users also have the option of not escaping everything for bash
-	cmd := exec.Command(shell, "-c", strings.Join(run, " "))
+	cmd := containerCreateCommand(run, image, args, opts.QuoteImageAndArgs)
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, commandError("container create", cmd.Args, err)
+		return nil, commandError("container create", err)
 	}
 
 	c.id = strings.TrimSpace(string(out))
 
 	return &c, nil
+}
+
+// containerCreateCommand quotes generated options as individual words. The
+// legacy image suffix remains raw shell syntax; JSON image/args stay literal.
+func containerCreateCommand(run []string, image string, args []string, literalImage bool) *exec.Cmd {
+	words := make([]string, 0, len(run)+len(args)+1)
+	for _, word := range run {
+		words = append(words, shellQuote(word))
+	}
+	if literalImage {
+		words = append(words, shellQuote(image))
+		for _, arg := range args {
+			words = append(words, shellQuote(arg))
+		}
+	} else {
+		words = append(words, image)
+		words = append(words, args...)
+	}
+	return exec.Command(shell, "-c", strings.Join(words, " "))
+}
+
+// nestedContainerArgs returns the docker create flags a container needs to run
+// containers itself. They are adapted from kind, which runs Kubernetes nodes as
+// containers:
+// https://github.com/kubernetes-sigs/kind/blob/main/pkg/cluster/internal/providers/docker/provision.go
+//
+// Each of volumes is mounted as an anonymous volume. A volume is needed for any
+// path that must not be on the overlay root filesystem, as containerd's
+// overlayfs snapshotter cannot nest on overlay. The image's content under a
+// volume is copied into it when the container is created, so a volume over a
+// large path adds that copy to every start.
+func nestedContainerArgs(volumes []string) []string {
+	args := []string{
+		// a private cgroup namespace, so cgroup v2 can be delegated to nested containers
+		"--cgroupns=private",
+		// the syscalls systemd and containerd need
+		"--security-opt", "seccomp=unconfined",
+		"--security-opt", "apparmor=unconfined",
+		// systemd expects /tmp and /run to be tmpfs
+		"--tmpfs", "/tmp",
+		"--tmpfs", "/run",
+		// kernel modules, for iptables
+		"--volume", "/lib/modules:/lib/modules:ro",
+		// the fuse-overlayfs snapshotter
+		"--device", "/dev/fuse",
+	}
+	for _, v := range volumes {
+		args = append(args, "--volume", v)
+	}
+	return args
+}
+
+// nestedModulesVolumes returns the --volume flags that bind, read-only, the real
+// directory behind each symlink in the host's modules directory that points outside
+// it, at the path the link names. The /lib/modules bind mount alone exposes such a
+// link as dangling, as when a kernel package update replaces the running kernel's
+// directory with a link into /tmp: modprobe in the container then finds no modules.
+// The mount goes at the link's target rather than at the link's own path under
+// /lib/modules, because the read-only bind cannot take a new mount point beneath the
+// dangling link. Links into the modules directory itself are already visible, and
+// dangling links and links to anything but a directory are skipped.
+func nestedModulesVolumes(hostModules string) []string {
+	entries, err := os.ReadDir(hostModules)
+	if err != nil {
+		log.Printf("nested containers: reading %s: %s", hostModules, err)
+		return nil
+	}
+
+	var args []string
+	for _, e := range entries {
+		if e.Type()&os.ModeSymlink == 0 {
+			continue
+		}
+		link := filepath.Join(hostModules, e.Name())
+		dest, err := os.Readlink(link)
+		if err != nil {
+			log.Printf("nested containers: reading modules link %s: %s", link, err)
+			continue
+		}
+		if !filepath.IsAbs(dest) {
+			dest = path.Join(containerModules, dest)
+		}
+		real, err := filepath.EvalSymlinks(link)
+		if err != nil {
+			log.Printf("nested containers: skipping modules link %s: %s", link, err)
+			continue
+		}
+		if pathWithin(hostModules, real) || pathWithin(containerModules, dest) {
+			continue
+		}
+		if info, err := os.Stat(real); err != nil || !info.IsDir() {
+			continue
+		}
+		args = append(args, "--volume", real+":"+dest+":ro")
+	}
+	return args
+}
+
+// containerModules is the kernel module directory in a nested container, as bound from the host.
+const containerModules = "/lib/modules"
+
+// pathWithin reports whether p is dir or a path beneath it. Both must be clean absolute paths.
+func pathWithin(dir, p string) bool {
+	rel, err := filepath.Rel(dir, p)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // createVolume takes the specified files and writes them into a volume named for the container.
@@ -445,7 +673,7 @@ func (c *container) inspect() (out []byte, detail containerDetails, err error) {
 	c.Unlock()
 
 	if id == "" {
-		err = uninitializedContainer(errors.New("inspect of uninitialized container"))
+		err = uninitializedContainer{errors.New("inspect of uninitialized container")}
 		return
 	}
 
@@ -453,10 +681,8 @@ func (c *container) inspect() (out []byte, detail containerDetails, err error) {
 
 	cmd := exec.Command("docker", "inspect", c.id)
 	out, err = cmd.Output()
-	if eErr, ok := err.(*exec.ExitError); ok {
-		if strings.Contains(string(eErr.Stderr), "No such object") {
-			err = uninitializedContainer(errors.New("inspect of uninitialized container"))
-		}
+	if strings.Contains(exitErrStderr(err), "No such object") {
+		err = uninitializedContainer{errors.New("inspect of uninitialized container")}
 	}
 
 	if err != nil {
@@ -493,7 +719,7 @@ func (c *container) start(ctx *Context) error {
 	c.Unlock()
 
 	if id == "" {
-		return uninitializedContainer(errors.New("start of uninitialized container"))
+		return uninitializedContainer{errors.New("start of uninitialized container")}
 	}
 
 	start := "start"
@@ -536,7 +762,7 @@ func (c *container) pause(ctx *Context) error {
 	c.Unlock()
 
 	if id == "" {
-		return uninitializedContainer(errors.New("pause of uninitialized container"))
+		return uninitializedContainer{errors.New("pause of uninitialized container")}
 	}
 
 	cmd := exec.Command("docker", "pause", c.id)
@@ -555,7 +781,7 @@ func (c *container) restart(ctx *Context) error {
 	c.Unlock()
 
 	if id == "" {
-		return uninitializedContainer(errors.New("restart of uninitialized container"))
+		return uninitializedContainer{errors.New("restart of uninitialized container")}
 	}
 
 	cmd := exec.Command("docker", "restart", c.id)
@@ -574,7 +800,7 @@ func (c *container) stop(ctx *Context) error {
 	c.Unlock()
 
 	if id == "" {
-		return uninitializedContainer(errors.New("stop of uninitialized container"))
+		return uninitializedContainer{errors.New("stop of uninitialized container")}
 	}
 
 	cmd := exec.Command("docker", "stop", c.id)
@@ -599,7 +825,7 @@ func (c *container) exec(ctx *Context, args []string) (string, error) {
 	c.Unlock()
 
 	if id == "" {
-		return "", uninitializedContainer(errors.New("exec into uninitialized container"))
+		return "", uninitializedContainer{errors.New("exec into uninitialized container")}
 	}
 
 	args = append([]string{"exec", c.id}, args...)
@@ -644,9 +870,10 @@ func (c *container) remove(ctx *Context) error {
 	var rmverr error
 	if len(volumesToReap) > 0 {
 		run := []string{"volume", "rm", "-f"}
-		run = append(run, strings.Split(string(volumesToReap), "\n")...)
+		run = append(run, strings.Fields(string(volumesToReap))...)
 		cmd = exec.Command("docker", run...)
-		out, rmverr := cmd.Output()
+		var out []byte
+		out, rmverr = cmd.Output()
 		if rmverr != nil {
 			log.Printf("%s %s: %s, %s", c.name, cmd.Args, rmverr, out)
 		}
@@ -661,7 +888,7 @@ func (c *container) remove(ctx *Context) error {
 	var rmnerr error
 	if len(networksToReap) > 0 {
 		run := []string{"network", "rm", "-f"}
-		run = append(run, strings.Split(string(volumesToReap), "\n")...)
+		run = append(run, strings.Fields(string(networksToReap))...)
 		cmd = exec.Command("docker", run...)
 		rmnerr = cmd.Run()
 		if rmnerr != nil {
@@ -675,7 +902,7 @@ func (c *container) remove(ctx *Context) error {
 
 	if c.cancelWatch != nil {
 		c.cancelWatch()
-		eventWatch.ignore(c)
+		ctx.Map.eventWatch.ignore(c.id)
 	}
 	c.id = ""
 	return nil
@@ -684,14 +911,9 @@ func (c *container) remove(ctx *Context) error {
 // updated is a simple trigger allowing a caller to indicate that something has likely changed about the container
 // and interested parties should re-inspect as needed.
 func (c *container) updated() {
-	consolidationWindow := 250 * time.Millisecond
-	if d, err := time.ParseDuration(os.Getenv("VCSIM_EVENT_CONSOLIDATION_WINDOW")); err == nil {
-		consolidationWindow = d
-	}
-
 	select {
 	case c.changes <- struct{}{}:
-		time.Sleep(consolidationWindow)
+		time.Sleep(ContainerEventConsolidationWindow)
 		// as this is only a hint to avoid waiting for the full inspect interval, we don't care about accumulating
 		// multiple triggers. We do pause to allow large numbers of sequential updates to consolidate
 	default:
@@ -709,28 +931,27 @@ func (c *container) watchContainer(ctx *Context, updateFn func(*Context, []byte,
 	defer c.Unlock()
 
 	if c.id == "" {
-		return uninitializedContainer(errors.New("Attempt to watch uninitialized container"))
+		return uninitializedContainer{errors.New("Attempt to watch uninitialized container")}
 	}
 
+	eventWatch := &ctx.Map.eventWatch
 	eventWatch.watch(c)
 
 	cancelCtx, cancelFunc := context.WithCancel(ctx)
 	c.cancelWatch = cancelFunc
+	id := c.id
 
 	// Update the VM from the container at regular intervals until the done
 	// channel is closed.
 	go func() {
-		inspectInterval := 10 * time.Second
-		if d, err := time.ParseDuration(os.Getenv("VCSIM_INSPECT_INTERVAL")); err == nil {
-			inspectInterval = d
-		}
-		ticker := time.NewTicker(inspectInterval)
+		ticker := time.NewTicker(ContainerInspectInterval)
+		defer ticker.Stop()
 
 		update := func() {
 			out, details, err := c.inspect()
 			var rmErr error
 			var removing bool
-			if _, ok := err.(uninitializedContainer); ok {
+			if isUninitializedContainer(err) {
 				removing = true
 				rmErr = c.remove(ctx)
 			}
@@ -753,6 +974,7 @@ func (c *container) watchContainer(ctx *Context, updateFn func(*Context, []byte,
 			case <-ticker.C:
 				update()
 			case <-cancelCtx.Done():
+				eventWatch.ignore(id)
 				return
 			}
 		}
@@ -765,54 +987,61 @@ func (w *eventWatcher) watch(c *container) {
 	w.Lock()
 	defer w.Unlock()
 
+	if w.closed {
+		return
+	}
+
 	if w.watches == nil {
 		w.watches = make(map[string]*container)
 	}
 
 	w.watches[c.id] = c
 
-	if w.stdin == nil {
+	if w.cmd == nil {
 		cmd := exec.Command("docker", "events", "--format", "'{{.ID}}'", "--filter", "Type=container")
-		w.stdout, _ = cmd.StdoutPipe()
-		w.stdin, _ = cmd.StdinPipe()
+		startInOwnProcessGroup(cmd)
+		stdout, _ := cmd.StdoutPipe()
+		stdin, _ := cmd.StdinPipe()
 		err := cmd.Start()
 		if err != nil {
 			log.Printf("docker event watcher: %s %s", cmd.Args, err)
-			w.stdin = nil
-			w.stdout = nil
-			w.process = nil
-
 			return
 		}
 
-		w.process = cmd.Process
+		w.stdin = stdin
+		w.cmd = cmd
 
-		go w.monitor()
+		go w.monitor(cmd, stdout)
 	}
 }
 
-func (w *eventWatcher) ignore(c *container) {
+// ignore drops the watch for container id, and stops docker events once no watch is left.
+func (w *eventWatcher) ignore(id string) {
 	w.Lock()
+	defer w.Unlock()
 
-	delete(w.watches, c.id)
+	delete(w.watches, id)
 
-	if len(w.watches) == 0 && w.stdin != nil {
+	if len(w.watches) == 0 {
 		w.stop()
 	}
-
-	w.Unlock()
 }
 
-func (w *eventWatcher) monitor() {
+// close stops docker events and refuses further watches. Model.Remove calls it, so the watcher never outlives the
+// registry that started it, and a closed registry does not respawn it.
+func (w *eventWatcher) close() {
 	w.Lock()
-	watches := len(w.watches)
-	w.Unlock()
+	defer w.Unlock()
 
-	if watches == 0 {
-		return
-	}
+	w.closed = true
+	w.watches = nil
+	w.stop()
+}
 
-	scanner := bufio.NewScanner(w.stdout)
+// monitor dispatches container events from docker events' stdout until the scan ends. It then stops docker events
+// and reaps it. The stop happens before Wait, while the pid is still unreaped, so no stop can signal a recycled pid.
+func (w *eventWatcher) monitor(cmd *exec.Cmd, stdout io.Reader) {
+	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
 		id := strings.TrimSpace(scanner.Text())
 
@@ -825,16 +1054,104 @@ func (w *eventWatcher) monitor() {
 			go container.updated()
 		}
 	}
+
+	w.Lock()
+	if w.cmd == cmd {
+		w.stop()
+	}
+	w.Unlock()
+
+	_ = cmd.Wait()
 }
 
+// stop kills docker events and its process group, and clears w.cmd so the pid is never signalled again. The caller
+// holds w's lock.
 func (w *eventWatcher) stop() {
+	if w.cmd == nil {
+		return
+	}
 	if w.stdin != nil {
 		w.stdin.Close()
 		w.stdin = nil
 	}
-	if w.stdout != nil {
-		w.stdout.Close()
-		w.stdout = nil
+	_ = killProcessGroup(w.cmd.Process)
+	w.cmd = nil
+}
+
+// containerNetwork is what the container runtime can do for a container's
+// primary interface.
+type containerNetwork struct {
+	// rootlessPodman is true under rootless podman, whose default network
+	// cannot take --mac-address.
+	rootlessPodman bool
+	// pasta is true when podman's pasta network mode is installed.
+	pasta bool
+}
+
+var (
+	runtimeNetworkOnce sync.Once
+	runtimeNetworkInfo containerNetwork
+)
+
+// runtimeNetwork reports, once per process, what the docker CLI's runtime can
+// do for a container's primary interface.
+func runtimeNetwork() containerNetwork {
+	runtimeNetworkOnce.Do(func() {
+		// Docker's info has no such fields, so the template fails there.
+		out, err := exec.Command("docker", "info", "--format", "{{.Host.Security.Rootless}}").Output()
+		if err != nil || strings.TrimSpace(string(out)) != "true" {
+			return
+		}
+		runtimeNetworkInfo.rootlessPodman = true
+		out, err = exec.Command("docker", "info", "--format", "{{.Host.Pasta.Executable}}").Output()
+		runtimeNetworkInfo.pasta = err == nil && strings.TrimSpace(string(out)) != ""
+	})
+	return runtimeNetworkInfo
+}
+
+// containerNIC is one interface a container joins: a podman network, the MAC
+// the guest sees on it, and the interface name inside the container.
+type containerNIC struct {
+	// Network is the podman network. Empty means the runtime's default network,
+	// which takes the MAC only as described on networkArgs.
+	Network string
+	// MAC is given to the interface. Empty leaves it to the runtime.
+	MAC string
+	// Name is the interface name inside the container, eth<i>.
+	Name string
+}
+
+// networkArgs returns the docker create arguments that join networks, then
+// nics in the order given, each interface with its MAC and name.
+//
+// A named network's interface takes --network <net>:mac=<MAC>,interface_name=<name>,
+// as does the default bridge of rootful docker or podman with --mac-address.
+// Rootless podman's default network cannot: slirp4netns has no MAC option, and
+// pasta names the interface after the host's and picks a random MAC. So a
+// single NIC on the default network, with no named network, selects pasta with
+// both set. That is podman 5's default rootless network; on podman 4 it
+// replaces slirp4netns.
+func networkArgs(networks []string, nics []containerNIC, rt containerNetwork) []string {
+	var args []string
+	for _, n := range networks {
+		args = append(args, "--network", n)
 	}
-	w.process.Kill()
+	for _, nic := range nics {
+		switch {
+		case nic.Network != "":
+			spec := nic.Network
+			if nic.MAC != "" {
+				spec += ":mac=" + nic.MAC + ",interface_name=" + nic.Name
+			}
+			args = append(args, "--network", spec)
+		case nic.MAC == "":
+		case len(networks) > 0 || !rt.rootlessPodman:
+			args = append(args, "--mac-address", nic.MAC)
+		case rt.pasta && len(nics) == 1:
+			args = append(args, "--network", "pasta:--ns-ifname,eth0,--ns-mac-addr,"+nic.MAC)
+		default:
+			log.Printf("rootless podman without pasta: the container's primary interface cannot be given MAC %s", nic.MAC)
+		}
+	}
+	return args
 }

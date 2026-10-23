@@ -35,6 +35,7 @@ import (
 	_ "github.com/vmware/govmomi/ssoadmin/simulator"
 	_ "github.com/vmware/govmomi/sts/simulator"
 	_ "github.com/vmware/govmomi/vapi/appliance/simulator"
+	_ "github.com/vmware/govmomi/vapi/cis/authz/simulator"
 	_ "github.com/vmware/govmomi/vapi/cis/tasks/simulator"
 	_ "github.com/vmware/govmomi/vapi/cluster/simulator"
 	_ "github.com/vmware/govmomi/vapi/crypto/simulator"
@@ -71,6 +72,7 @@ func main() {
 	flag.IntVar(&model.Folder, "folder", model.Folder, "Number of folders")
 	hostIPBase := flag.String("host-ip-base", "", "Base IPv4 address to assign HostSystems from, incrementing by one per host (e.g. 10.20.8.0)")
 	flag.BoolVar(&model.Autostart, "autostart", model.Autostart, "Autostart model created VMs")
+	topologyFile := flag.String("topology", "", "Underlay topology file, YAML or JSON")
 	v := &model.ServiceContent.About.ApiVersion
 	flag.StringVar(v, "api-version", *v, "API version")
 	pv := &model.ServiceContent.About.Version
@@ -95,6 +97,14 @@ func main() {
 	flag.Float64Var(&model.DelayConfig.DelayJitter, "delay-jitter", model.DelayConfig.DelayJitter, "Delay jitter coefficient of variation (tip: 0.5 is a good starting value)")
 
 	flag.Parse()
+
+	if *topologyFile != "" {
+		topo, err := simulator.LoadTopology(*topologyFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		model.Topology = topo
+	}
 
 	if *trace != "" {
 		var err error

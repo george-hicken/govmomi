@@ -35,7 +35,7 @@ func NewServiceInstance(ctx *Context, content types.ServiceContent, folder mo.Fo
 	if content.About.ApiType == "HostAgent" {
 		CreateDefaultESX(ctx, f)
 	} else {
-		content.About.InstanceUuid = uuid.New().String()
+		s.Content.About.InstanceUuid = uuid.New().String()
 	}
 
 	refs := mo.References(content)

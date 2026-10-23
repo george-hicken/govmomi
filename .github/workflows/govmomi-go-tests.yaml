@@ -17,6 +17,13 @@ jobs:
       matrix:
         go-version: ["1.25", "1.26"]
         platform: [ubuntu-latest]
+        include:
+          # Run the container-backed simulator tests with rootless podman as the
+          # docker CLI too. The platform differs from the entries above so that
+          # this is an extra job rather than a change to one of them.
+          - go-version: "1.26"
+            platform: ubuntu-24.04
+            container-cli: podman
       fail-fast: false
 
     runs-on: ${{ matrix.platform }}
@@ -41,6 +48,14 @@ jobs:
           key: ${{ runner.os }}-go-${{ matrix.go-version }}-${{ hashFiles('**/go.sum') }}
           restore-keys: |
             ${{ runner.os }}-go-${{ matrix.go-version }}-
+
+      - name: Use podman as the docker CLI
+        if: matrix.container-cli == 'podman'
+        run: |
+          mkdir -p "$HOME/podman-docker"
+          printf '#!/bin/sh\nexec podman "$@"\n' > "$HOME/podman-docker/docker"
+          chmod +x "$HOME/podman-docker/docker"
+          echo "$HOME/podman-docker" >> "$GITHUB_PATH"
 
       - name: Run Tests
         env:

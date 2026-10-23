@@ -180,6 +180,7 @@ func tracef(format string, v ...any) {
 
 func (s *Service) call(ctx *Context, method *Method) soap.HasFault {
 	handler := ctx.Map.Get(method.This)
+	registeredHandler := handler
 	session := ctx.Session
 	ctx.Caller = &method.This
 
@@ -265,10 +266,34 @@ func (s *Service) call(ctx *Context, method *Method) soap.HasFault {
 	if m.Type().NumIn() == 2 {
 		args = append(args, reflect.ValueOf(ctx))
 	}
-	args = append(args, reflect.ValueOf(method.Body))
+	body := reflect.ValueOf(method.Body)
+	if in := m.Type().In(m.Type().NumIn() - 1); body.Type() != in {
+		// Another package linked into the process, such as a fork of vim25/types, can
+		// register its own type under the same name, so the decoder builds that type
+		// rather than the one the handler takes. Convert it when the layouts match.
+		if !body.Type().ConvertibleTo(in) {
+			msg := fmt.Sprintf("%s: request type %s does not match %s", method.Name, body.Type(), in)
+			log.Print(msg)
+			return &serverFaultBody{Reason: Fault(msg, &types.InvalidRequest{})}
+		}
+		body = body.Convert(in)
+	}
+	args = append(args, body)
+	var removed soap.HasFault
 	ctx.Map.WithLock(ctx, handler, func() {
+		// A VM may have been destroyed while this request waited for its lock.
+		// Recheck only its registry handler; custom and session handlers retain
+		// their existing dispatch behavior.
+		if _, ok := handler.(*VirtualMachine); ok && handler == registeredHandler && ctx.Map.Get(method.This) != handler {
+			fault := &types.ManagedObjectNotFound{Obj: method.This}
+			removed = &serverFaultBody{Reason: Fault("managed object not found", fault)}
+			return
+		}
 		res = m.Call(args)
 	})
+	if removed != nil {
+		return removed
+	}
 
 	return res[0].Interface().(soap.HasFault)
 }

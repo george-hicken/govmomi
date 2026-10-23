@@ -63,9 +63,11 @@ func NewHostSystem(ctx *Context, host mo.HostSystem) *HostSystem {
 	hs.Summary.Hardware = &hardware
 
 	if hs.Hardware == nil {
-		// shallow copy Hardware, as each host will be assigned its own .Uuid
-		info := *esx.HostHardwareInfo
-		hs.Hardware = &info
+		// deep copy Hardware, as each host will be assigned its own .Uuid, and CpuPkg is a slice that would
+		// otherwise alias the esx template
+		info := new(types.HostHardwareInfo)
+		deepCopy(esx.HostHardwareInfo, info)
+		hs.Hardware = info
 	}
 	if hs.Capability == nil {
 		capability := *esx.HostCapability
