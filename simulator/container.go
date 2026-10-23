@@ -56,15 +56,29 @@ func exitErrStderr(err error) string {
 	return strings.TrimSpace(string(exitErr.Stderr))
 }
 
-// commandError logs and returns an error from a command execution failure, including stderr if available.
-func commandError(operation string, args []string, err error) error {
-	stderr := exitErrStderr(err)
-	var cmdErr error
-	if stderr != "" {
-		cmdErr = fmt.Errorf("%s %v failed: %w: %s", operation, args, err, stderr)
-	} else {
-		cmdErr = fmt.Errorf("%s %v failed: %w", operation, args, err)
+// commandError keeps operation and failure classification without exposing
+// command arguments, runtime output, or error strings that may contain data.
+func commandError(operation string, err error) error {
+	var safe error
+	var exited *exec.ExitError
+	switch {
+	case errors.Is(err, context.Canceled):
+		safe = context.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		safe = context.DeadlineExceeded
+	case errors.As(err, &exited):
+		// Preserve the exit status for callers without retaining captured stderr.
+		safe = &exec.ExitError{ProcessState: exited.ProcessState}
+	case errors.Is(err, exec.ErrNotFound):
+		safe = exec.ErrNotFound
+	case errors.Is(err, os.ErrPermission):
+		safe = os.ErrPermission
+	case errors.Is(err, os.ErrNotExist):
+		safe = os.ErrNotExist
+	default:
+		safe = errors.New("command execution error")
 	}
+	cmdErr := fmt.Errorf("%s failed: %w", operation, safe)
 	log.Print(cmdErr)
 	return cmdErr
 }
@@ -248,7 +262,7 @@ func createVolume(volumeName string, labels []string, files []tarEntry) (uid str
 			// Podman rejects volume create when the volume already exists; Docker is idempotent.
 			// Named volumes can be implicitly created by "docker create -v name:/path" so treat "already exists" as success.
 			if !strings.Contains(exitErrStderr(err), "already exists") {
-				return "", commandError("volume create", cmd.Args, err)
+				return "", commandError("volume create", err)
 			}
 			uid = name // volume already exists; provided name is the uid
 		} else {
@@ -270,7 +284,7 @@ func createVolume(volumeName string, labels []string, files []tarEntry) (uid str
 	}
 
 	if err = cmd.Start(); err != nil {
-		return uid, commandError("volume population start", cmd.Args, err)
+		return uid, commandError("volume population start", err)
 	}
 
 	tw := tar.NewWriter(stdin)
@@ -307,7 +321,7 @@ func createVolume(volumeName string, labels []string, files []tarEntry) (uid str
 	}
 
 	if waitErr := cmd.Wait(); waitErr != nil {
-		return uid, commandError("volume population", cmd.Args, waitErr)
+		return uid, commandError("volume population", waitErr)
 	}
 
 	return uid, err
@@ -516,29 +530,34 @@ func create(ctx *Context, name string, id string, image string, args []string, o
 	run = append(run, dockerVol...)
 	run = append(run, dockerPort...)
 	run = append(run, dockerEnv...)
-	if opts.QuoteImageAndArgs {
-		// each element is one word, whatever shell metacharacters it holds
-		run = append(run, shellQuote(image))
-		for _, arg := range args {
-			run = append(run, shellQuote(arg))
-		}
-	} else {
-		// image is a raw string of docker arguments for bash to split, e.g. "-v '/path:/dst:ro' nginx"
-		run = append(run, image)
-		run = append(run, args...)
-	}
-
-	// this combines all the run options into a single string that's passed to /bin/bash -c as the single argument to force bash parsing.
-	// TODO: make this configurable behaviour so users also have the option of not escaping everything for bash
-	cmd := exec.Command(shell, "-c", strings.Join(run, " "))
+	cmd := containerCreateCommand(run, image, args, opts.QuoteImageAndArgs)
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, commandError("container create", cmd.Args, err)
+		return nil, commandError("container create", err)
 	}
 
 	c.id = strings.TrimSpace(string(out))
 
 	return &c, nil
+}
+
+// containerCreateCommand quotes generated options as individual words. The
+// legacy image suffix remains raw shell syntax; JSON image/args stay literal.
+func containerCreateCommand(run []string, image string, args []string, literalImage bool) *exec.Cmd {
+	words := make([]string, 0, len(run)+len(args)+1)
+	for _, word := range run {
+		words = append(words, shellQuote(word))
+	}
+	if literalImage {
+		words = append(words, shellQuote(image))
+		for _, arg := range args {
+			words = append(words, shellQuote(arg))
+		}
+	} else {
+		words = append(words, image)
+		words = append(words, args...)
+	}
+	return exec.Command(shell, "-c", strings.Join(words, " "))
 }
 
 // nestedContainerArgs returns the docker create flags a container needs to run
