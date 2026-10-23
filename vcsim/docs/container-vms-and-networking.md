@@ -25,13 +25,20 @@ through the `podman` CLI directly. Both must be on `PATH`.
 
 ## Diagrams
 
-### 1. One vcsim instance
+Each domain network is realised by the container runtime as a Linux bridge
+device. A container's interface is one end of a veth pair whose other end is a
+port of that bridge. The diagrams show that layer. Verified with podman on a
+throwaway `--internal` network: netavark creates the bridge (named `podman<N>`)
+inside the rootless network namespace when the first container attaches. The
+host end of each veth is a port of that bridge, and the container end is renamed
+to the `interface_name` given at attach (`eth<i>` or `r<i>`). The bridge is
+removed with its network. Under root podman the same objects are in the host
+network namespace.
 
-Each VM with a `RUN.container` option gets one container, created at first
-power-on. With a topology loaded, each connected virtual NIC becomes a container
-interface with the same MAC, on the network of its L2 domain, which is how a
-portgroup appears. Without a topology, the container joins the runtime's default
-network instead, with only the first NIC's MAC.
+### 1. One vcsim instance, one VM, one network
+
+Without a topology, the container joins the runtime's default network instead,
+and no bridge of vcsim's own is involved.
 
 ```mermaid
 flowchart LR
@@ -47,12 +54,16 @@ flowchart LR
     nicOne -->|"backed by"| pgOne
     vmOne -->|"runs on"| hostOne
   end
-  subgraph runtime ["container runtime (docker CLI, podman underneath)"]
+  subgraph runtime ["container runtime (network namespace of the engine)"]
     ctrOne["container vcsim-RUN-web-0-UUID (image from RUN.container)"]
-    ethOne["interface eth0, MAC from the vNIC"]
-    netOne["network RUN-mgmt-v10 (one per L2 domain)"]
-    ctrOne --> ethOne
-    ethOne -->|"joins"| netOne
+    ethOne["eth0 in the container, MAC of the vNIC"]
+    vethOne["veth pair: container end, host end"]
+    bridgeOne["bridge device podmanN"]
+    netOne["network RUN-wl-v10 (--internal, no IPAM)"]
+    ctrOne -->|"owns"| ethOne
+    ethOne -->|"veth peer"| vethOne
+    vethOne -->|"bridge port"| bridgeOne
+    netOne -->|"realised as"| bridgeOne
   end
   vmOne -.->|"power-on creates"| ctrOne
   pgOne -.->|"resolved through the topology's host uplinks"| netOne
@@ -60,9 +71,9 @@ flowchart LR
 
 ### 2. One VM with two NICs on two portgroups
 
-Each connected vNIC joins the network of its own L2 domain. Two vNICs on the
-same domain are refused at power-on, because a container joins a given network
-once.
+Each connected vNIC joins the network of its own L2 domain, so each gets its own
+bridge and veth pair. Two vNICs on the same domain are refused at power-on,
+because a container joins a given network once.
 
 ```mermaid
 flowchart LR
@@ -78,62 +89,151 @@ flowchart LR
   ctrTwo["container vcsim-RUN-app-1-UUID"]
   ethTwoA["eth0, MAC of key 4000"]
   ethTwoB["eth1, MAC of key 4001"]
+  vethTwoA["veth to bridge A"]
+  vethTwoB["veth to bridge B"]
+  bridgeTwoA["bridge podmanA"]
+  bridgeTwoB["bridge podmanB"]
   netTwoA["network RUN-wl-v10"]
   netTwoB["network RUN-wl-v20"]
-  ctrTwo --> ethTwoA
-  ctrTwo --> ethTwoB
-  ethTwoA -->|"joins"| netTwoA
-  ethTwoB -->|"joins"| netTwoB
-  pgTwoA -.->|"VLAN 10 on uplink vmnic1, underlay wl"| netTwoA
-  pgTwoB -.->|"VLAN 20 on uplink vmnic1, underlay wl"| netTwoB
+  ctrTwo -->|"owns"| ethTwoA
+  ctrTwo -->|"owns"| ethTwoB
+  ethTwoA -->|"veth peer"| vethTwoA
+  ethTwoB -->|"veth peer"| vethTwoB
+  vethTwoA -->|"bridge port"| bridgeTwoA
+  vethTwoB -->|"bridge port"| bridgeTwoB
+  netTwoA -->|"realised as"| bridgeTwoA
+  netTwoB -->|"realised as"| bridgeTwoB
+  pgTwoA -.->|"VLAN 10 on vmnic1, underlay wl"| netTwoA
+  pgTwoB -.->|"VLAN 20 on vmnic1, underlay wl"| netTwoB
 ```
 
 The `eth<i>` names follow the vNIC order (device key), counting every virtual
 Ethernet card, including disconnected ones. A disconnected vNIC does not join a
 network.
 
-### 3. Three vCenters, each with its own management network, and a routing container
+### 3. One instance with a topology: underlays, host uplinks and a vcsim router
 
-This is the usual shape for a multi-vCenter harness. Each vcsim instance has its
-own run label, so its networks and containers are separate. Nothing crosses
-between the instances' management networks unless something joins them. vcsim
-does not create that joining container: the harness does (see the section
-"Joining instances with a routing container").
+This is the same kind of instance as diagram 1, with a topology loaded. The
+topology declares two underlays. Host pNICs select an underlay through
+`attachments`, and a VLAN is a separate network on its underlay. The router is
+declared in the same topology, so vcsim creates it at `Create` and it joins two
+domains. Contrast this with diagram 4, where the routing container is created by
+the harness and joins networks of several instances.
+
+```mermaid
+flowchart LR
+  subgraph hostSide ["HostSystem esx-0 (simulated)"]
+    pnicZero["vmnic0 (no attachment: management default)"]
+    pnicOne["vmnic1 (attachment: underlay wl)"]
+  end
+  subgraph underlays ["topology underlays"]
+    ulMgmt["underlay mgmt (management: true)"]
+    ulWl["underlay wl (mtu 1400)"]
+  end
+  subgraph networks ["networks of run lab-a (podman, --internal)"]
+    netMgmt["network lab-a-mgmt-untagged"]
+    netWlTen["network lab-a-wl-v10"]
+    netWlTwenty["network lab-a-wl-v20"]
+  end
+  pnicZero -->|"underlay"| ulMgmt
+  pnicOne -->|"attachment"| ulWl
+  ulMgmt -->|"untagged domain"| netMgmt
+  ulWl -->|"VLAN 10"| netWlTen
+  ulWl -->|"VLAN 20"| netWlTwenty
+  rtrOne["router gw, container lab-a-rtr-gw, created by vcsim (forward: true)"]
+  rtrOne -->|"r0 10.10.0.1/24"| netWlTen
+  rtrOne -->|"r1 10.0.1.1/24"| netMgmt
+  vmAppOne["VM app-1 container (portgroup pg-app, VLAN 10)"]
+  vmMgmtOne["VM ops-1 container (portgroup pg-mgmt, untagged)"]
+  vmAppOne -->|"eth0"| netWlTen
+  vmMgmtOne -->|"eth0"| netMgmt
+```
+
+Each network shown here is a bridge in the runtime, with veth pairs as in
+diagram 1. The router's `r<i>` interfaces are veth ends on those bridges. The
+router's forwarding is what joins its two domains. Without `forward: true` it
+does not bridge them.
+
+### 4. Three vCenters: a management bridge each, a harness-created routing container, and an optional stretched network
+
+Each vcsim instance has its own run label, so its management network and its
+bridge are separate from the others. The routing container is created by the
+harness, not by vcsim. It is joined to each instance's management network by
+name, so it has one interface per management network. vcsim does not create this
+container, and a topology cannot name another run's network.
+
+A harness may need more than one such container. For example, a host-side
+endpoint that guests must reach on a management network can be served inside the
+routing container's namespace with `ListenRouter`, and the harness can dial guests
+through the same namespace with `DialRouter`. That endpoint is an address on the
+routing container's interface, not a separate container.
 
 ```mermaid
 flowchart LR
   subgraph instA ["vcsim instance A (run lab-a)"]
-    vmAOne["VM a-1 (container)"]
+    vmAOne["VM a-1 container"]
+    vmAStretch["VM a-2 container (stretched)"]
     netAOne["network lab-a-mgmt-untagged"]
-    vmAOne -->|"eth0"| netAOne
+    brAOne["bridge device podmanA (management)"]
+    netAOne -->|"realised as"| brAOne
+    vmAOne -->|"veth, eth0"| brAOne
   end
   subgraph instB ["vcsim instance B (run lab-b)"]
-    vmBOne["VM b-1 (container)"]
+    vmBOne["VM b-1 container"]
+    vmBStretch["VM b-2 container (stretched)"]
     netBOne["network lab-b-mgmt-untagged"]
-    vmBOne -->|"eth0"| netBOne
+    brBOne["bridge device podmanB (management)"]
+    netBOne -->|"realised as"| brBOne
+    vmBOne -->|"veth, eth0"| brBOne
   end
   subgraph instC ["vcsim instance C (run lab-c)"]
-    vmCOne["VM c-1 (container)"]
+    vmCOne["VM c-1 container"]
+    vmCStretch["VM c-2 container (stretched)"]
     netCOne["network lab-c-mgmt-untagged"]
-    vmCOne -->|"eth0"| netCOne
+    brCOne["bridge device podmanC (management)"]
+    netCOne -->|"realised as"| brCOne
+    vmCOne -->|"veth, eth0"| brCOne
   end
-  rtrGw["routing container rtr-gw (created by the harness, IPv4 forwarding on)"]
-  netAOne -->|"r0 10.0.1.1/24"| rtrGw
-  netBOne -->|"r1 10.0.2.1/24"| rtrGw
-  netCOne -->|"r2 10.0.3.1/24"| rtrGw
+  rtrGw["routing container rtr-gw (created by the harness, forwarding on)"]
+  rtrGw -->|"veth r0 10.0.1.1/24"| brAOne
+  rtrGw -->|"veth r1 10.0.2.1/24"| brBOne
+  rtrGw -->|"veth r2 10.0.3.1/24"| brCOne
+  epGw["endpoint of instance B, served with ListenRouter inside rtr-gw"]
+  epGw -.->|"alias on r1"| rtrGw
+  netStretch["optional stretched network, same name built by A, B and C"]
+  vmAStretch -.->|"optional"| netStretch
+  vmBStretch -.->|"optional"| netStretch
+  vmCStretch -.->|"optional"| netStretch
 ```
+
+Notes on this diagram:
+
+- The stretched network is optional. It exists only if the harness builds it, by
+  giving each instance a run and underlay name that produce the same network
+  name, as described under "Stretched networks". Its VMs reach each other over
+  one bridge, and nothing routes them, so the routing container is not on it.
+- A harness may need further routing or gateway containers beyond `rtr-gw`, for
+  example one per isolated domain, or one that NATs an endpoint to a host
+  address. The same rules apply: a container joins networks by name, and vcsim
+  only creates the routers its own topology declares.
+- Every VM on a management network needs its gateway set to the routing
+  container's address on that network (`10.0.1.1`, `10.0.2.1` or `10.0.3.1`), and
+  the address must be configured in the guest, because these networks have no
+  IPAM.
 
 ## Object mapping
 
 | vSphere or vcsim object | Container runtime object | When it is created | Notes |
 | --- | --- | --- | --- |
 | VirtualMachine with `RUN.container` | One container, `vcsim-<run>-<vm name>-<VM uid>` | First power-on | Read from the VM's ExtraConfig at that time; see [RUN.* keys](#run-keys). |
-| Virtual Ethernet card | Container interface `eth<i>` with the card's MAC | Power-on, and on connect or disconnect while running | `<i>` is the card's index in device-key order. |
+| Virtual Ethernet card | Container interface `eth<i>` (or the topology's name for it), with the card's MAC. It is one end of a veth pair whose other end is a port of the network's bridge. | Power-on, and on connect or disconnect while running | `<i>` is the card's index in device-key order. |
 | Portgroup (standard or distributed) | The network of an L2 domain (`<run>-<underlay>-v<N>`, or `-untagged`) | When a vNIC on the domain first needs it | The domain is resolved on the VM's host. Same portgroup on another host can resolve elsewhere. |
+| L2 domain network | A Linux bridge device (`podman<N>`, in the rootless network namespace under rootless podman), created by netavark at the first attach | First container attached to the network | Removed with the network. The network is `--internal`, so no gateway or NAT is set. |
 | NSX-backed opaque network or segment | Network `<run>-seg-<id>` | As above | Independent of any underlay. |
 | Host physical NIC (`vmnic<N>`) | Not a container object. It selects an underlay through `attachments`. | n/a | `vmnic0` with no attachment goes to the underlay marked `management`. Any other unmapped pNIC is an error. |
 | Underlay (topology) | A set of networks, one per VLAN plus the untagged domain | Lazily, per domain | Carries an MTU, if set, into every network it creates. |
-| Router (topology) | Container `<run>-rtr-<name>` from `busybox:latest`, one interface `r<i>` per router interface | At `Create`, before any VM starts | Forwarding and routes are set inside its network namespace. |
+| Router (topology) | Container `<run>-rtr-<name>` from `busybox:latest`, one interface `r<i>` per router interface, each a veth end on that domain's bridge | At `Create`, before any VM starts | Forwarding and routes are set inside its network namespace. |
+| Harness-created routing container | A container the harness starts with the container CLI, joined to networks by name, each interface a veth end on that network's bridge | Whenever the harness starts it | vcsim does not create it. See "Joining instances with a routing container". |
 | VM with no `RUN.container` | Nothing. The VM stays a pure simulation. | n/a | |
 | ESX host | Nothing by default | n/a | An ESX host has no container backing unless the host's advanced option `RUN.container` is set in its template. That path is internal and not covered here. |
 

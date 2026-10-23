@@ -441,7 +441,7 @@ container backing and its `RUN.*` options, the mapping from portgroups to contai
 networks, running several instances on one host, and the delay flags.
 
 - [Container VMs, networking and topologies](docs/container-vms-and-networking.md)
-- [Timing and profiles](docs/timing-and-profiles.md): `-delay`, `-delay-jitter`, `-method-delay`
+- [Timing settings](docs/timing-and-profiles.md): `-delay`, `-delay-jitter`, `-method-delay`
   and the monitoring environment variables.
 
 ## License
