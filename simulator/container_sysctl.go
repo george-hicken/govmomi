@@ -177,7 +177,7 @@ func imageArgv(image string, args []string) ([]string, error) {
 	cmd := exec.Command("docker", "image", "inspect", image)
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, commandError("image inspect", cmd.Args, err)
+		return nil, commandError("image inspect", err)
 	}
 
 	var inspected []struct {
