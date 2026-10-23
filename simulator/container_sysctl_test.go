@@ -205,3 +205,54 @@ func TestSysctlOverlayContainer(t *testing.T) {
 		}
 	})
 }
+
+// TestSysctlOverlayDropsSysAdmin runs a util-linux image, whose setpriv can drop CAP_SYS_ADMIN
+// from the bounding set, and checks that the overlay's drop reaches the workload. Skips when no
+// local photon image has such a setpriv.
+func TestSysctlOverlayDropsSysAdmin(t *testing.T) {
+	if !test.HasDocker() {
+		t.Skip("requires docker or podman (aliased as docker) on linux")
+	}
+	image := utilLinuxImage(t)
+
+	env := newVCSIMEnv(t)
+	_, vm := powerOnContainerVM(t, env, "sysctl-drop-test",
+		&types.OptionValue{Key: ContainerBackingOptionKey, Value: `["` + image + `","sh","-c",` + strconv.Quote(sleepForever) + `]`},
+		&types.OptionValue{Key: "RUN.sysctl", Value: "emulate=net.ipv4.tcp_mem"},
+	)
+	id := containerID(t, env, vm)
+
+	out, err := dockerExec(env.goCtx, id, "grep", "CapBnd", "/proc/1/status")
+	require.NoError(t, err)
+	fields := strings.Fields(out)
+	require.Len(t, fields, 2)
+	bnd, err := strconv.ParseUint(fields[1], 16, 64)
+	require.NoError(t, err)
+	const capSysAdmin = 21
+	assert.Zero(t, bnd&(1<<capSysAdmin), "CAP_SYS_ADMIN still in the workload's bounding set")
+}
+
+// utilLinuxImage returns the ID of a local photon image whose setpriv accepts --bounding-set,
+// or skips the test, naming the images it probed.
+func utilLinuxImage(t *testing.T) string {
+	t.Helper()
+	out, err := exec.Command("docker", "images", "--format", "{{.Repository}} {{.ID}}").Output()
+	if err != nil {
+		t.Skipf("listing local images: %v", err)
+	}
+	var probed []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		repo, id, ok := strings.Cut(line, " ")
+		if !ok || !strings.Contains(repo, "photon") {
+			continue
+		}
+		probe := exec.Command("docker", "run", "--rm", "--entrypoint", "sh", id, "-c",
+			"command -v setpriv >/dev/null && setpriv --help 2>&1 | grep -q -- --bounding-set")
+		if probe.Run() == nil {
+			return id
+		}
+		probed = append(probed, id)
+	}
+	t.Skipf("no local photon image has a util-linux setpriv with --bounding-set (probed %v)", probed)
+	return ""
+}
