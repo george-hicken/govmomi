@@ -434,6 +434,10 @@ type createOptions struct {
 	NestedVolumes []string
 	// CapAdd are capabilities to add, such as NET_RAW for ping.
 	CapAdd []string
+	// Sysctl runs the container under the RUN.sysctl overlay, with the
+	// overlay as its entrypoint, so args are the command it execs; see
+	// sysctlCreateArgs. The caller mounts the overlay's directory.
+	Sysctl bool
 
 	// QuoteImageAndArgs shell-quotes the image and each arg, for a command
 	// given as a JSON array, whose elements may contain shell metacharacters.
@@ -512,6 +516,10 @@ func create(ctx *Context, name string, id string, image string, args []string, o
 
 	for _, c := range opts.CapAdd {
 		run = append(run, "--cap-add", c)
+	}
+
+	if opts.Sysctl {
+		run = append(run, sysctlCreateArgs()...)
 	}
 
 	if opts.NestedContainers {

@@ -61,6 +61,19 @@ import (
 //     filesystem, writable and independent per container. An empty array
 //     mounts none. A value that does not parse leaves the default.
 //   - RUN.vmci (default false): serve GuestRPC to the guest, described below.
+//   - RUN.sysctl (default absent): "emulate=<key>,<key>...", host-global sysctl
+//     keys, such as net.ipv4.tcp_mem, that the guest writes in the container.
+//     Each is seeded with the host's value and its writes read back, without
+//     reaching the host. Namespaced keys, such as net.ipv4.conf.all.arp_ignore,
+//     take real writes in the container's own network namespace, and other
+//     host-global keys fail as the kernel fails them. The container's /proc/sys
+//     is unmasked, and NET_ADMIN is added, which the kernel needs for a namespaced
+//     net.* write. CAP_SYS_ADMIN is added for the overlay that mounts the emulated
+//     values, and the overlay drops it before the image's entrypoint runs, unless
+//     the container is privileged. RUN.sysctl needs RUN.container as a
+//     JSON array, the image present locally, and no "host" network, or power-on
+//     fails. An empty list unmasks /proc/sys and emulates nothing. EmulatedSysctls
+//     reports the seeds and the values read back, as SysctlEmulatedNotApplied.
 //   - RUN.port.<port>: publish container port <port> on the host port given as
 //     the value.
 //   - RUN.volume.<label>: add a mount, "source:destination[:options]" as for
@@ -152,6 +165,12 @@ type simVM struct {
 	// in this power-on, which then takes precedence over the container's
 	// observed network settings (spec 95 D-95-31).
 	toolsNicInfo atomic.Bool
+
+	// sysctlDir is the host directory mounted at sysctlOverlayDir when RUN.sysctl
+	// is set, and sysctl holds the seeded emulated keys. Like guestRPCDir, they
+	// live as long as the container.
+	sysctlDir string
+	sysctl    []sysctlValue
 }
 
 // createSimulationVM inspects the provided VirtualMachine and creates a simVM binding for it if
@@ -426,6 +445,7 @@ func (svm *simVM) start(ctx *Context) error {
 	var ports []string
 	var networks []string
 	var extraVolumes []string
+	var sysctl *sysctlPolicy
 	jsonArgs := false
 	mountDMI := true
 	mountMachineID := true
@@ -495,6 +515,15 @@ func (svm *simVM) start(ctx *Context) error {
 			continue
 		}
 
+		if val.Key == "RUN.sysctl" {
+			policy, err := parseSysctl(value)
+			if err != nil {
+				return fmt.Errorf("%s: %w", svm.vm.Name, err)
+			}
+			sysctl = &policy
+			continue
+		}
+
 		if strings.HasPrefix(val.Key, "RUN.port.") {
 			// ? would this not make more sense as a set of tuples in the value?
 			// or inlined into the RUN.container freeform string as is the case with the nginx volume in the examples?
@@ -538,7 +567,20 @@ func (svm *simVM) start(ctx *Context) error {
 	// when VMX_GUESTINFO=true.
 	env = append(env, "VMX_GUESTINFO=true")
 
+	if sysctl != nil {
+		// Without a privileged or nested container, the overlay drops the CAP_SYS_ADMIN it needs.
+		dropSysAdmin := !privileged && !nestedContainers
+		argv, err := svm.prepareSysctl(*sysctl, networks, args, jsonArgs, dropSysAdmin)
+		if err != nil {
+			return fmt.Errorf("%s: %w", svm.vm.Name, err)
+		}
+		args = append([]string{args[0]}, argv...)
+	}
+
 	volumes := []string{}
+	if sysctl != nil {
+		volumes = append(volumes, svm.sysctlDir+":"+sysctlOverlayDir+":ro")
+	}
 	if mountDMI {
 		volumes = append(volumes, constructVolumeName(ctx.Map.containerName(svm.vm.Name, svm.vm.uid.String()), "dmi")+":/sys/class/dmi/id")
 	}
@@ -581,6 +623,7 @@ func (svm *simVM) start(ctx *Context) error {
 	if err != nil {
 		svm.removeGuestRPC()
 		svm.removeMachineID()
+		svm.removeSysctl()
 		return err
 	}
 
@@ -594,12 +637,14 @@ func (svm *simVM) start(ctx *Context) error {
 		Privileged:        privileged,
 		NestedContainers:  nestedContainers,
 		NestedVolumes:     nestedVolumes,
+		Sysctl:            sysctl != nil,
 		QuoteImageAndArgs: jsonArgs,
 		RecreateIfExists:  true,
 	})
 	if err != nil {
 		svm.removeGuestRPC()
 		svm.removeMachineID()
+		svm.removeSysctl()
 		return err
 	}
 
@@ -762,6 +807,7 @@ func (svm *simVM) remove(ctx *Context) error {
 
 	defer svm.removeGuestRPC()
 	defer svm.removeMachineID()
+	defer svm.removeSysctl()
 
 	err := svm.c.remove(ctx)
 	if err != nil {
