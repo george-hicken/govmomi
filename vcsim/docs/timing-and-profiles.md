@@ -1,9 +1,11 @@
-# Timing and profiles
+# Timing settings
 
-vcsim answers requests as fast as it can unless told otherwise. It has no timing
-profile file and no profile flag. Timing is controlled by three kinds of setting:
+This page covers the timing settings of vcsim. Despite the file name, there is no
+timing profile file and no profile flag. A "profile" is a set of the settings
+below, chosen by the user. vcsim itself reads them one by one:
 
-1. Command-line flags that delay SOAP API responses and task bodies.
+1. Command-line flags that delay SOAP API responses, and task bodies through
+   `-method-delay`.
 2. Two environment variables that tune how container-backed VMs are monitored.
 3. Package variables in the Go API, for everything else.
 
@@ -140,10 +142,9 @@ A container-backed VM's power-on has three parts with different timing.
   Use the image's command for this, or make the harness wait for readiness.
 
 Power off and reset are real container operations (`docker stop`, `docker
-restart`). Their time comes from the engine. vcsim does not pass a stop timeout
-or stop signal, so an image whose PID 1 ignores SIGTERM takes the engine's default
-stop timeout, typically 10 seconds, before the container is killed. This is engine
-behaviour, not something vcsim sets.
+restart`). Their time comes from the engine. vcsim passes no stop timeout or stop
+signal. Checked with podman: a container whose PID 1 (`sleep`) ignores SIGTERM took
+10 seconds to stop, the engine's default, before it was killed.
 
 Pause (suspend) is `docker pause`.
 
@@ -187,6 +188,6 @@ Limits of the recipe:
 | `Incorrect method delay format.` | An entry has no colon, or is empty, such as a trailing comma. |
 | `Incorrect format of method-delay argument` | An entry's delay is not an integer, such as `500ms`. Use a plain number of milliseconds. |
 | Power-on slower than the API delays explain | Container start, image pull, or the IP poll (up to 2.5 s by default). |
-| Power-off takes about 10 seconds | The container's stop timeout. See above. |
+| Power-off takes about 10 seconds | The container's PID 1 ignores SIGTERM, so the engine waits its stop timeout (10 s by default). See above. |
 | Jitter seems to have no effect | `-delay` is zero and there is no `-method-delay` entry for the call, so there is nothing to jitter. |
 | Task delay did not apply | The key must match the task name, such as `PowerOn`, not `PowerOnVM_Task`. |
