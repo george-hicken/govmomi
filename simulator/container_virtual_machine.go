@@ -74,6 +74,15 @@ import (
 //     JSON array, the image present locally, and no "host" network, or power-on
 //     fails. An empty list unmasks /proc/sys and emulates nothing. EmulatedSysctls
 //     reports the seeds and the values read back, as SysctlEmulatedNotApplied.
+//   - RUN.guestIdentityFiles (default absent): "owned". The container owns
+//     /etc/hostname, /etc/hosts and /etc/resolv.conf from its image instead of
+//     the runtime's bind mounts, so the guest can replace them, and its hostname
+//     is set from the VM name, sanitised to a hostname. CAP_SYS_ADMIN is added,
+//     which sethostname needs in the container's UTS namespace, and it widens
+//     the container's privileges beyond that namespace. The container gets no
+//     DNS server (--dns none). Needs podman as the docker CLI, RUN.container
+//     and no "host" network, or power-on fails. Without the key the container
+//     is created as before.
 //   - RUN.port.<port>: publish container port <port> on the host port given as
 //     the value.
 //   - RUN.volume.<label>: add a mount, "source:destination[:options]" as for
@@ -453,6 +462,7 @@ func (svm *simVM) start(ctx *Context) error {
 	nestedContainers := false
 	nestedVolumes := []string{"/var"}
 	vmci := false
+	guestIdentity := false
 
 	// The keys are documented on ContainerBackingOptionKey.
 	for _, opt := range svm.vm.Config.ExtraConfig {
@@ -524,6 +534,14 @@ func (svm *simVM) start(ctx *Context) error {
 			continue
 		}
 
+		if val.Key == "RUN.guestIdentityFiles" {
+			if err := parseGuestIdentity(value); err != nil {
+				return fmt.Errorf("%s: %w", svm.vm.Name, err)
+			}
+			guestIdentity = true
+			continue
+		}
+
 		if strings.HasPrefix(val.Key, "RUN.port.") {
 			// ? would this not make more sense as a set of tuples in the value?
 			// or inlined into the RUN.container freeform string as is the case with the nginx volume in the examples?
@@ -567,9 +585,16 @@ func (svm *simVM) start(ctx *Context) error {
 	// when VMX_GUESTINFO=true.
 	env = append(env, "VMX_GUESTINFO=true")
 
+	if guestIdentity {
+		if err := guestIdentityPreflight(networks); err != nil {
+			return fmt.Errorf("%s: %w", svm.vm.Name, err)
+		}
+	}
+
 	if sysctl != nil {
 		// Without a privileged or nested container, the overlay drops the CAP_SYS_ADMIN it needs.
-		dropSysAdmin := !privileged && !nestedContainers
+		// RUN.guestIdentityFiles keeps it, which sethostname needs.
+		dropSysAdmin := !privileged && !nestedContainers && !guestIdentity
 		argv, err := svm.prepareSysctl(*sysctl, networks, args, jsonArgs, dropSysAdmin)
 		if err != nil {
 			return fmt.Errorf("%s: %w", svm.vm.Name, err)
@@ -628,18 +653,19 @@ func (svm *simVM) start(ctx *Context) error {
 	}
 
 	svm.c, err = create(ctx, svm.vm.Name, svm.vm.uid.String(), args[0], args[1:], createOptions{
-		Networks:          networks,
-		NICs:              nics,
-		CapAdd:            capAdd(ctx),
-		Volumes:           volumes,
-		Ports:             ports,
-		Env:               env,
-		Privileged:        privileged,
-		NestedContainers:  nestedContainers,
-		NestedVolumes:     nestedVolumes,
-		Sysctl:            sysctl != nil,
-		QuoteImageAndArgs: jsonArgs,
-		RecreateIfExists:  true,
+		Networks:           networks,
+		NICs:               nics,
+		CapAdd:             capAdd(ctx),
+		Volumes:            volumes,
+		Ports:              ports,
+		Env:                env,
+		Privileged:         privileged,
+		NestedContainers:   nestedContainers,
+		NestedVolumes:      nestedVolumes,
+		Sysctl:             sysctl != nil,
+		GuestIdentityFiles: guestIdentity,
+		QuoteImageAndArgs:  jsonArgs,
+		RecreateIfExists:   true,
 	})
 	if err != nil {
 		svm.removeGuestRPC()
