@@ -438,6 +438,9 @@ type createOptions struct {
 	// overlay as its entrypoint, so args are the command it execs; see
 	// sysctlCreateArgs. The caller mounts the overlay's directory.
 	Sysctl bool
+	// GuestIdentityFiles gives the container its own /etc/hostname, /etc/hosts
+	// and /etc/resolv.conf, and sets its hostname; see guestIdentityCreateArgs.
+	GuestIdentityFiles bool
 
 	// QuoteImageAndArgs shell-quotes the image and each arg, for a command
 	// given as a JSON array, whose elements may contain shell metacharacters.
@@ -521,6 +524,8 @@ func create(ctx *Context, name string, id string, image string, args []string, o
 	if opts.Sysctl {
 		run = append(run, sysctlCreateArgs()...)
 	}
+
+	run = append(run, guestIdentityCreateArgs(name, opts)...)
 
 	if opts.NestedContainers {
 		volumes := opts.NestedVolumes
@@ -1086,6 +1091,9 @@ type containerNetwork struct {
 	rootlessPodman bool
 	// pasta is true when podman's pasta network mode is installed.
 	pasta bool
+	// podman is true when the docker CLI is podman, rootful or rootless, which
+	// alone accepts podman's create flags such as --no-hostname.
+	podman bool
 }
 
 var (
@@ -1099,7 +1107,11 @@ func runtimeNetwork() containerNetwork {
 	runtimeNetworkOnce.Do(func() {
 		// Docker's info has no such fields, so the template fails there.
 		out, err := exec.Command("docker", "info", "--format", "{{.Host.Security.Rootless}}").Output()
-		if err != nil || strings.TrimSpace(string(out)) != "true" {
+		if err != nil {
+			return
+		}
+		runtimeNetworkInfo.podman = true
+		if strings.TrimSpace(string(out)) != "true" {
 			return
 		}
 		runtimeNetworkInfo.rootlessPodman = true
