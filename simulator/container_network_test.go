@@ -51,6 +51,21 @@ func TestNetworkArgs(t *testing.T) {
 			pasta,
 			[]string{"--network", "vcsim-wl-v10:mac=" + mac + ",interface_name=eth0"},
 		},
+		{
+			// A further vNIC on a joined network is a sub-interface made after start, not a second join.
+			"shared network NICs",
+			nil,
+			[]containerNIC{
+				{Network: "vcsim-wl-v10", MAC: mac, Name: "eth0"},
+				{Network: "vcsim-wl-v10", MAC: "00:50:56:00:00:01", Name: "eth1", Parent: "eth0"},
+				{Network: "vcsim-wl-v20", MAC: "00:50:56:00:00:02", Name: "eth2"},
+			},
+			pasta,
+			[]string{
+				"--network", "vcsim-wl-v10:mac=" + mac + ",interface_name=eth0",
+				"--network", "vcsim-wl-v20:mac=00:50:56:00:00:02,interface_name=eth2",
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -76,5 +91,29 @@ func requireContainerBridge(t *testing.T) {
 	t.Helper()
 	if !test.HasContainerBridge() {
 		t.Skip("this host's netavark/kernel cannot set up bridge firewalling (set NETAVARK_FW=none to skip that setup)")
+	}
+}
+
+func TestParseLinks(t *testing.T) {
+	out := `1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue qlen 1000\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+2: eth0@if4: <BROADCAST,MULTICAST,UP,LOWER_UP,M-DOWN> mtu 1400 qdisc noqueue qlen 1000\    link/ether 00:50:56:AA:BB:01 brd ff:ff:ff:ff:ff:ff
+3: eth1@eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1400 qdisc noqueue qlen 1000\    link/ether 00:50:56:aa:bb:cc brd ff:ff:ff:ff:ff:ff`
+	want := []netLink{
+		{name: "lo"},
+		{name: "eth0", parent: "if4", mac: "00:50:56:aa:bb:01"},
+		{name: "eth1", parent: "eth0", mac: "00:50:56:aa:bb:cc"},
+	}
+	links := parseLinks(out)
+	if !slices.Equal(links, want) {
+		t.Fatalf("parseLinks = %+v, want %+v", links, want)
+	}
+	if l, ok := linkByMAC(links, "00:50:56:AA:BB:CC"); !ok || l.name != "eth1" {
+		t.Errorf("linkByMAC = %+v, %v, want eth1", l, ok)
+	}
+	if _, ok := linkByMAC(links, ""); ok {
+		t.Errorf("linkByMAC matched an empty MAC")
+	}
+	if got := freeLinkName(links); got != "eth2" {
+		t.Errorf("freeLinkName = %q, want eth2", got)
 	}
 }

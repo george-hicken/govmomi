@@ -1131,6 +1131,10 @@ type containerNIC struct {
 	MAC string
 	// Name is the interface name inside the container, eth<i>.
 	Name string
+	// Parent, when set, is the name of the interface that joined Network for an
+	// earlier vNIC. This vNIC is then a macvlan sub-interface of Parent, created
+	// after start, because podman joins a container to a network once.
+	Parent string
 }
 
 // networkArgs returns the docker create arguments that join networks, then
@@ -1150,6 +1154,7 @@ func networkArgs(networks []string, nics []containerNIC, rt containerNetwork) []
 	}
 	for _, nic := range nics {
 		switch {
+		case nic.Parent != "":
 		case nic.Network != "":
 			spec := nic.Network
 			if nic.MAC != "" {

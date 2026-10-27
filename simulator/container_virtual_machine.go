@@ -442,10 +442,17 @@ func (svm *simVM) start(ctx *Context) error {
 		if err != nil {
 			log.Printf("%s %s: %s", svm.vm.Name, "start", err)
 			svm.stopGuestRPC()
-		} else {
-			svm.updateToolsStatus(ctx, false)
+			return err
 		}
+		svm.updateToolsStatus(ctx, false)
 
+		subs, err := svm.subNICs(ctx)
+		if err == nil {
+			err = svm.addSubNICs(subs)
+		}
+		if err != nil {
+			log.Printf("%s %s: %s", svm.vm.Name, "sub-interfaces", err)
+		}
 		return err
 	}
 
@@ -696,6 +703,11 @@ func (svm *simVM) start(ctx *Context) error {
 	}
 
 	svm.updateToolsStatus(ctx, false)
+
+	if err = svm.addSubNICs(nics); err != nil {
+		log.Printf("%s %s: %s", svm.vm.Name, "sub-interfaces", err)
+		return err
+	}
 
 	svm.vm.logPrintf("%s: %s", args, svm.c.id)
 

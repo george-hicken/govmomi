@@ -612,6 +612,107 @@ func spikeVMScenario(t *testing.T, ctx context.Context, c *vim25.Client, m *Mode
 		}
 	})
 
+	t.Run("shared network vNICs", func(t *testing.T) {
+		// k has three vNICs on one portgroup, as the FLB appliance has: the first joins the network, the others
+		// are its sub-interfaces.
+		spec := types.VirtualMachineConfigSpec{
+			Name:  "k",
+			Files: &types.VirtualMachineFileInfo{VmPathName: "[LocalDS_0] k"},
+			ExtraConfig: []types.BaseOptionValue{
+				&types.OptionValue{Key: ContainerBackingOptionKey, Value: `["busybox:latest","sleep","2147483647"]`},
+				&types.OptionValue{Key: "RUN.mountdmi", Value: "false"},
+			},
+		}
+		for i := range 3 {
+			d := nic(10, connected)
+			d.GetVirtualDeviceConfigSpec().Device.GetVirtualDevice().Key = int32(-1 - i)
+			spec.DeviceChange = append(spec.DeviceChange, d)
+		}
+		task, err := folders.VmFolder.CreateVM(ctx, spec, pool, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := task.WaitForResult(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		vm := object.NewVirtualMachine(c, info.Result.(types.ManagedObjectReference))
+		if task, err := vm.PowerOn(ctx); err != nil {
+			t.Fatal(err)
+		} else if err := task.Wait(ctx); err != nil {
+			t.Fatalf("power on k: %v", err)
+		}
+		id := spikeContainerID(t, m, vm.Reference())
+
+		nics := spikeNICs(t, ctx, vm)
+		if len(nics) != 3 {
+			t.Fatalf("k has %d vNICs, want 3", len(nics))
+		}
+		macs := make([]string, len(nics))
+		for i, d := range nics {
+			macs[i] = d.(types.BaseVirtualEthernetCard).GetVirtualEthernetCard().MacAddress
+			if got, want := spikeIface(t, id, macs[i]), fmt.Sprintf("eth%d", i); got != want {
+				t.Errorf("vNIC %d MAC %s is interface %q, want %q", i, macs[i], got, want)
+			}
+		}
+
+		spikeConfigureIface(t, id, macs[2], "10.10.0.20/24", "")
+		if err := spikePing(id, "10.10.0.3"); err != nil {
+			t.Errorf("k -> b on v10 through the sub-interface: %v", err)
+		}
+
+		// An edit moves the device to the end of the device list, so vNICs are found by MAC.
+		byMAC := func(mac string) types.BaseVirtualDevice {
+			for _, d := range spikeNICs(t, ctx, vm) {
+				if d.(types.BaseVirtualEthernetCard).GetVirtualEthernetCard().MacAddress == mac {
+					return d
+				}
+			}
+			t.Fatalf("k has no vNIC with MAC %s", mac)
+			return nil
+		}
+		setConnected := func(i int, on bool) {
+			dev := byMAC(macs[i])
+			dev.(types.BaseVirtualEthernetCard).GetVirtualEthernetCard().Connectable.Connected = on
+			spikeReconfigure(t, ctx, vm, &types.VirtualDeviceConfigSpec{
+				Operation: types.VirtualDeviceConfigSpecOperationEdit,
+				Device:    dev,
+			})
+		}
+
+		setConnected(1, false)
+		if dev := spikeIface(t, id, macs[1]); dev != "" {
+			t.Errorf("disconnected sub-interface vNIC still has interface %s", dev)
+		}
+		setConnected(1, true)
+		if spikeIface(t, id, macs[1]) == "" {
+			t.Errorf("reconnected sub-interface vNIC has no interface with MAC %s", macs[1])
+		}
+
+		// Disconnecting the vNIC that joined the network keeps the others: one rejoins, the rest are its sub-interfaces.
+		setConnected(0, false)
+		if dev := spikeIface(t, id, macs[0]); dev != "" {
+			t.Errorf("disconnected joined vNIC still has interface %s", dev)
+		}
+		for _, mac := range macs[1:] {
+			if spikeIface(t, id, mac) == "" {
+				t.Errorf("vNIC MAC %s lost its interface when the joined vNIC was disconnected", mac)
+			}
+		}
+		setConnected(0, true)
+		if spikeIface(t, id, macs[0]) == "" {
+			t.Errorf("reconnected vNIC has no interface with MAC %s", macs[0])
+		}
+
+		spikeReconfigure(t, ctx, vm, &types.VirtualDeviceConfigSpec{
+			Operation: types.VirtualDeviceConfigSpecOperationRemove,
+			Device:    byMAC(macs[2]),
+		})
+		if dev := spikeIface(t, id, macs[2]); dev != "" {
+			t.Errorf("interface %s with removed vNIC MAC %s survived the remove", dev, macs[2])
+		}
+	})
+
 	t.Run("forward false does not forward", func(t *testing.T) {
 		// Both routes are in place: each guest reaches its router, and the control pair on r4 forwards.
 		if err := spikePing(cc.id, "10.30.0.1"); err != nil {

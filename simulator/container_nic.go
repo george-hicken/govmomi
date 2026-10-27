@@ -5,8 +5,10 @@
 package simulator
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/vmware/govmomi/vim25/mo"
@@ -125,15 +127,16 @@ func capAdd(ctx *Context) []string {
 
 // containerNICs returns the interfaces the container joins at power-on, in device-key order, and sets each
 // vNIC's connected state from its startConnected flag. Without a topology it is the first vNIC's MAC on the
-// default network, as before. With one, each connected vNIC joins its own domain, and two vNICs on one domain
-// are refused because podman joins a container to a network once.
+// default network, as before. With one, the first connected vNIC on a domain joins the domain's network, and each
+// further vNIC on that domain is a macvlan sub-interface of the first one's interface, because podman joins a
+// container to a network once.
 func (svm *simVM) containerNICs(ctx *Context) ([]containerNIC, error) {
 	if ctx.Map.underlay == nil {
 		return []containerNIC{{MAC: firstNICMacAddress(svm.vm)}}, nil
 	}
 
 	var nics []containerNIC
-	domains := make(map[string]int32)
+	parents := make(map[string]string)
 	for i, card := range ethernetCards(svm.vm) {
 		if card.Connectable != nil {
 			card.Connectable.Connected = card.Connectable.StartConnected
@@ -146,41 +149,286 @@ func (svm *simVM) containerNICs(ctx *Context) ([]containerNIC, error) {
 		if err != nil {
 			return nil, err
 		}
-		if other, dup := domains[d.Key()]; dup {
-			return nil, fmt.Errorf("%s: nics %d and %d both join %s", svm.vm.Name, other, card.Key, d.Key())
-		}
-		domains[d.Key()] = card.Key
-
 		name, err := ctx.Map.underlay.Network(d)
 		if err != nil {
 			return nil, err
 		}
-		nics = append(nics, containerNIC{Network: name, MAC: card.MacAddress, Name: fmt.Sprintf("eth%d", i)})
+		nic := containerNIC{Network: name, MAC: card.MacAddress, Name: fmt.Sprintf("eth%d", i)}
+		if parent, ok := parents[d.Key()]; ok {
+			nic.Parent = parent
+		} else {
+			parents[d.Key()] = nic.Name
+		}
+		nics = append(nics, nic)
 	}
 	return nics, nil
 }
 
-// applyNIC moves a running container's interface from its before state to its after state: disconnect from
-// the old network, connect to the new one with the same MAC. podman names the new interface itself, so the
-// in-guest name can change on a move; guests find the interface by MAC.
-func (svm *simVM) applyNIC(before, after nicState) error {
-	moved := before.network != after.network || before.mac != after.mac
-	if before.attached && (!after.attached || moved) {
-		if _, err := podmanOutput("network", "disconnect", before.network, svm.c.id); err != nil {
-			return err
+// subNICs returns the vNICs the container would have as sub-interfaces at power-on, without changing any vNIC's
+// connected state. A container restarted in place lost them with its network namespace.
+func (svm *simVM) subNICs(ctx *Context) ([]containerNIC, error) {
+	if ctx.Map.underlay == nil {
+		return nil, nil
+	}
+	var nics []containerNIC
+	parents := make(map[string]string)
+	for i, card := range ethernetCards(svm.vm) {
+		if !nicConnected(card) {
+			continue
+		}
+		d, err := svm.domainOf(ctx, card)
+		if err != nil {
+			return nil, err
+		}
+		network, err := ctx.Map.underlay.Network(d)
+		if err != nil {
+			return nil, err
+		}
+		name := fmt.Sprintf("eth%d", i)
+		if parent, ok := parents[d.Key()]; ok {
+			nics = append(nics, containerNIC{Network: network, MAC: card.MacAddress, Name: name, Parent: parent})
+		} else {
+			parents[d.Key()] = name
 		}
 	}
-	if after.attached && (!before.attached || moved) {
-		args := []string{"network", "connect"}
-		if after.mac != "" {
-			args = append(args, "--mac-address", after.mac)
+	return nics, nil
+}
+
+// netLink is an interface in a container's network namespace.
+type netLink struct {
+	name   string
+	parent string
+	mac    string
+}
+
+// parseLinks parses `ip -o link` output.
+func parseLinks(out string) []netLink {
+	var links []netLink
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
 		}
-		args = append(args, after.network, svm.c.id)
-		if _, err := podmanOutput(args...); err != nil {
+		name, parent, _ := strings.Cut(strings.TrimSuffix(f[1], ":"), "@")
+		l := netLink{name: name, parent: parent}
+		for i := range f[:len(f)-1] {
+			if f[i] == "link/ether" {
+				l.mac = strings.ToLower(f[i+1])
+			}
+		}
+		links = append(links, l)
+	}
+	return links
+}
+
+// links returns the interfaces in the container's network namespace, and the namespace owner's PID.
+func (svm *simVM) links() ([]netLink, int, error) {
+	out, err := podmanOutput("inspect", "--format", "{{.State.Pid}}", svm.c.id)
+	if err != nil {
+		return nil, 0, err
+	}
+	pid, err := strconv.Atoi(out)
+	if err != nil || pid == 0 {
+		return nil, 0, fmt.Errorf("%s: container %s has no PID %q", svm.vm.Name, svm.c.id, out)
+	}
+	out, err = nsenter(pid, "", "ip", "-o", "link")
+	if err != nil {
+		return nil, 0, err
+	}
+	return parseLinks(out), pid, nil
+}
+
+// linkByMAC returns the interface with mac.
+func linkByMAC(links []netLink, mac string) (netLink, bool) {
+	for _, l := range links {
+		if l.mac != "" && strings.EqualFold(l.mac, mac) {
+			return l, true
+		}
+	}
+	return netLink{}, false
+}
+
+// addSubNICs creates the sub-interfaces among nics, each on its parent with its MAC. One whose MAC is already
+// present, as after an unpause, is left as is.
+func (svm *simVM) addSubNICs(nics []containerNIC) error {
+	var links []netLink
+	pid := 0
+	for _, nic := range nics {
+		if nic.Parent == "" {
+			continue
+		}
+		if pid == 0 {
+			var err error
+			if links, pid, err = svm.links(); err != nil {
+				return err
+			}
+		}
+		if _, ok := linkByMAC(links, nic.MAC); ok {
+			continue
+		}
+		// A container restarted in place may have rejoined under another name, so the parent is found by MAC.
+		if mac, joined, err := svm.joinedMAC(nic.Network); err != nil {
+			return err
+		} else if l, ok := linkByMAC(links, mac); joined && ok {
+			nic.Parent = l.name
+		}
+		if err := addMacvlan(pid, nic); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// addMacvlan creates nic as a macvlan sub-interface of its parent, in bridge mode so that it reaches the domain
+// like a joined interface, and brings it up as podman does the interfaces it joins. The macvlan is in the
+// container's namespace only, so it goes with the container.
+func addMacvlan(pid int, nic containerNIC) error {
+	args := []string{"ip", "link", "add", "link", nic.Parent, "name", nic.Name}
+	if nic.MAC != "" {
+		args = append(args, "address", nic.MAC)
+	}
+	args = append(args, "type", "macvlan", "mode", "bridge")
+	if _, err := nsenter(pid, "", args...); err != nil {
+		return err
+	}
+	_, err := nsenter(pid, "", "ip", "link", "set", "dev", nic.Name, "up")
+	return err
+}
+
+// joinedMAC returns the MAC of the container's interface on network, if the container has joined it.
+func (svm *simVM) joinedMAC(network string) (string, bool, error) {
+	out, err := podmanOutput("inspect", "--format", "{{json .NetworkSettings.Networks}}", svm.c.id)
+	if err != nil {
+		return "", false, err
+	}
+	var networks map[string]struct{ MacAddress string }
+	if err := json.Unmarshal([]byte(out), &networks); err != nil {
+		return "", false, fmt.Errorf("%s: networks of container %s: %w", svm.vm.Name, svm.c.id, err)
+	}
+	n, ok := networks[network]
+	return n.MacAddress, ok, nil
+}
+
+// applyNIC moves a running container's interface from its before state to its after state: leave the old
+// network, join the new one with the same MAC. A vNIC joins a network the container has not joined with podman,
+// which names the new interface itself, so the in-guest name can change on a move; guests find the interface by
+// MAC. A vNIC on a network the container has already joined is a macvlan sub-interface of that interface instead.
+func (svm *simVM) applyNIC(before, after nicState) error {
+	moved := before.network != after.network || before.mac != after.mac
+	if before.attached && (!after.attached || moved) {
+		if err := svm.leave(before); err != nil {
+			return err
+		}
+	}
+	if after.attached && (!before.attached || moved) {
+		return svm.join(after)
+	}
+	return nil
+}
+
+// join gives the container an interface for st.
+func (svm *simVM) join(st nicState) error {
+	mac, joined, err := svm.joinedMAC(st.network)
+	if err != nil {
+		return err
+	}
+	if !joined {
+		return svm.connect(st.network, st.mac)
+	}
+
+	links, pid, err := svm.links()
+	if err != nil {
+		return err
+	}
+	parent, ok := linkByMAC(links, mac)
+	if !ok {
+		return fmt.Errorf("%s: no interface with MAC %s on %s", svm.vm.Name, mac, st.network)
+	}
+	if _, ok := linkByMAC(links, st.mac); ok {
+		return nil
+	}
+	return addMacvlan(pid, containerNIC{MAC: st.mac, Name: freeLinkName(links), Parent: parent.name})
+}
+
+// leave removes the container's interface for st. A sub-interface is deleted. The joined interface is
+// disconnected, which deletes its sub-interfaces with it, so the first of them rejoins the network with its MAC
+// and the others are recreated on it.
+func (svm *simVM) leave(st nicState) error {
+	mac, joined, err := svm.joinedMAC(st.network)
+	if err != nil {
+		return err
+	}
+	links, pid, err := svm.links()
+	if err != nil {
+		return err
+	}
+	if !joined || !strings.EqualFold(mac, st.mac) {
+		l, ok := linkByMAC(links, st.mac)
+		if !ok {
+			return nil
+		}
+		_, err := nsenter(pid, "", "ip", "link", "del", "dev", l.name)
+		return err
+	}
+
+	var subs []netLink
+	if parent, ok := linkByMAC(links, mac); ok {
+		for _, l := range links {
+			if l.parent == parent.name {
+				subs = append(subs, l)
+			}
+		}
+	}
+	if _, err := podmanOutput("network", "disconnect", st.network, svm.c.id); err != nil {
+		return err
+	}
+	if len(subs) == 0 {
+		return nil
+	}
+	if err := svm.connect(st.network, subs[0].mac); err != nil {
+		return err
+	}
+	if len(subs) == 1 {
+		return nil
+	}
+	links, pid, err = svm.links()
+	if err != nil {
+		return err
+	}
+	parent, ok := linkByMAC(links, subs[0].mac)
+	if !ok {
+		return fmt.Errorf("%s: no interface with MAC %s on %s", svm.vm.Name, subs[0].mac, st.network)
+	}
+	for _, l := range subs[1:] {
+		if err := addMacvlan(pid, containerNIC{MAC: l.mac, Name: l.name, Parent: parent.name}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// connect joins the container to network with mac.
+func (svm *simVM) connect(network, mac string) error {
+	args := []string{"network", "connect"}
+	if mac != "" {
+		args = append(args, "--mac-address", mac)
+	}
+	args = append(args, network, svm.c.id)
+	_, err := podmanOutput(args...)
+	return err
+}
+
+// freeLinkName returns the first eth<n> not in links.
+func freeLinkName(links []netLink) string {
+	used := make(map[string]bool, len(links))
+	for _, l := range links {
+		used[l.name] = true
+	}
+	for n := 0; ; n++ {
+		if name := fmt.Sprintf("eth%d", n); !used[name] {
+			return name
+		}
+	}
 }
 
 // nicGuestInfo builds guest.net for a container VM with a topology: one entry per vNIC in device-key order, found
