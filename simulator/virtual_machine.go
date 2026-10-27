@@ -3358,6 +3358,22 @@ func (vm *VirtualMachine) customize(ctx *Context) types.BaseMethodFault {
 		return fault
 	}
 
+	if err := vm.svm.deployCustomization(vm.imc); err != nil {
+		vm.logPrintf("%s", err)
+
+		ctx.postEvent(&types.CustomizationUnknownFailure{
+			CustomizationFailed: types.CustomizationFailed{CustomizationEvent: event},
+		})
+
+		vm.imc = nil
+		changes = append(changes, types.PropertyChange{
+			Name: "guest.customizationInfo",
+			Val:  vm.customizationInfo(types.GuestInfoCustomizationStatusTOOLSDEPLOYPKG_FAILED, err.Error()),
+		})
+		ctx.Update(vm, changes)
+		return &types.SystemError{Reason: err.Error()}
+	}
+
 	hostname := ""
 	address := ""
 	guestNetChanged := false

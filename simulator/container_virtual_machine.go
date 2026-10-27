@@ -94,6 +94,17 @@ import (
 //     datasource reads, because it detects the container and skips
 //     vmware-rpctool.
 //
+// A CloudinitPrep customization (CustomizeVM_Task, or a clone's spec) is
+// delivered at the next power-on as Tools' deployPkg plugin delivers it: vcsim
+// writes the package vpxd builds, cust.cfg naming the metadata and userdata
+// files, to /var/run/vmware-imc in the started container. cloud-init's VMware
+// datasource reads it there when a deployPkg plugin (libdeployPkgPlugin.so) is
+// installed and the guest's cloud-init config allows it:
+// datasource.VMware.allow_raw_data must not be false, and ds-identify reports
+// the datasource for a package only with disable_vmware_customization: false.
+// Photon's stock config sets both against it. The guest needs sh and tar. Other
+// customization identities are not delivered to the guest.
+//
 // Each virtual Ethernet card is an interface of the container, eth<i> in
 // device-key order, with the card's MAC, as a guest on a real VM sees it, so a
 // guest that configures its network by that MAC, as cloud-init does, finds its
