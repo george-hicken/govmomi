@@ -184,3 +184,48 @@ func TestAuthorizationManagerAddRolePrivileges(t *testing.T) {
 		}
 	})
 }
+
+func TestAuthorizationManagerEntityNotFound(t *testing.T) {
+	Test(func(ctx context.Context, c *vim25.Client) {
+		m := object.NewAuthorizationManager(c)
+
+		folder, err := object.NewFolder(c, c.ServiceContent.RootFolder).CreateFolder(ctx, "authz-destroyed")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		task, err := folder.Destroy(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = task.Wait(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		refs := map[string]types.ManagedObjectReference{
+			"destroyed": folder.Reference(),
+			"unknown":   {Type: "Folder", Value: "group-d999999"},
+		}
+
+		for name, ref := range refs {
+			check := func(op string, err error) {
+				t.Helper()
+				if !fault.Is(err, &types.ManagedObjectNotFound{}) {
+					t.Errorf("%s(%s %s) err=%v, want ManagedObjectNotFound", op, name, ref, err)
+				}
+			}
+
+			_, err := m.RetrieveEntityPermissions(ctx, ref, false)
+			check("RetrieveEntityPermissions", err)
+
+			_, err = m.RetrieveEntityPermissions(ctx, ref, true)
+			check("RetrieveEntityPermissions(inherited)", err)
+
+			err = m.SetEntityPermissions(ctx, ref, []types.Permission{{Principal: "VSPHERE.LOCAL\\account-a", RoleId: -1}})
+			check("SetEntityPermissions", err)
+
+			err = m.RemoveEntityPermission(ctx, ref, "VSPHERE.LOCAL\\account-a", false)
+			check("RemoveEntityPermission", err)
+		}
+	})
+}

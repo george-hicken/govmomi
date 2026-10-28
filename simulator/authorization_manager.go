@@ -63,8 +63,25 @@ func (m *AuthorizationManager) init(r *Registry) {
 	}
 }
 
+// entity returns the registry object for ref. An unknown or destroyed moref, or one
+// that is not an entity, yields a ManagedObjectNotFound fault as vCenter does.
+func (m *AuthorizationManager) entity(ctx *Context, ref types.ManagedObjectReference) (mo.Entity, *soap.Fault) {
+	e, ok := ctx.Map.Get(ref).(mo.Entity)
+	if !ok {
+		return nil, Fault("", &types.ManagedObjectNotFound{Obj: ref})
+	}
+
+	return e, nil
+}
+
 func (m *AuthorizationManager) RetrieveEntityPermissions(ctx *Context, req *types.RetrieveEntityPermissions) soap.HasFault {
-	e := ctx.Map.Get(req.Entity).(mo.Entity)
+	body := &methods.RetrieveEntityPermissionsBody{}
+
+	e, fault := m.entity(ctx, req.Entity)
+	if fault != nil {
+		body.Fault_ = fault
+		return body
+	}
 
 	p := m.permissions[e.Reference()]
 
@@ -75,17 +92,21 @@ func (m *AuthorizationManager) RetrieveEntityPermissions(ctx *Context, req *type
 				break
 			}
 
-			e = ctx.Map.Get(parent.Reference()).(mo.Entity)
+			e, fault = m.entity(ctx, *parent)
+			if fault != nil {
+				body.Fault_ = fault
+				return body
+			}
 
 			p = append(p, m.permissions[e.Reference()]...)
 		}
 	}
 
-	return &methods.RetrieveEntityPermissionsBody{
-		Res: &types.RetrieveEntityPermissionsResponse{
-			Returnval: p,
-		},
+	body.Res = &types.RetrieveEntityPermissionsResponse{
+		Returnval: p,
 	}
+
+	return body
 }
 
 func (m *AuthorizationManager) RetrieveAllPermissions(req *types.RetrieveAllPermissions) soap.HasFault {
@@ -102,7 +123,14 @@ func (m *AuthorizationManager) RetrieveAllPermissions(req *types.RetrieveAllPerm
 	}
 }
 
-func (m *AuthorizationManager) RemoveEntityPermission(req *types.RemoveEntityPermission) soap.HasFault {
+func (m *AuthorizationManager) RemoveEntityPermission(ctx *Context, req *types.RemoveEntityPermission) soap.HasFault {
+	body := &methods.RemoveEntityPermissionBody{}
+
+	if _, fault := m.entity(ctx, req.Entity); fault != nil {
+		body.Fault_ = fault
+		return body
+	}
+
 	var p []types.Permission
 
 	for _, v := range m.permissions[req.Entity] {
@@ -114,14 +142,21 @@ func (m *AuthorizationManager) RemoveEntityPermission(req *types.RemoveEntityPer
 
 	m.permissions[req.Entity] = p
 
-	return &methods.RemoveEntityPermissionBody{
-		Res: &types.RemoveEntityPermissionResponse{},
-	}
+	body.Res = &types.RemoveEntityPermissionResponse{}
+
+	return body
 }
 
 // SetEntityPermissions adds each permission to the entity, or updates the
 // permission already present for the same principal and group.
-func (m *AuthorizationManager) SetEntityPermissions(req *types.SetEntityPermissions) soap.HasFault {
+func (m *AuthorizationManager) SetEntityPermissions(ctx *Context, req *types.SetEntityPermissions) soap.HasFault {
+	body := &methods.SetEntityPermissionsBody{}
+
+	if _, fault := m.entity(ctx, req.Entity); fault != nil {
+		body.Fault_ = fault
+		return body
+	}
+
 	entity := req.Entity
 	p := m.permissions[entity]
 
@@ -141,9 +176,9 @@ func (m *AuthorizationManager) SetEntityPermissions(req *types.SetEntityPermissi
 
 	m.permissions[entity] = p
 
-	return &methods.SetEntityPermissionsBody{
-		Res: &types.SetEntityPermissionsResponse{},
-	}
+	body.Res = &types.SetEntityPermissionsResponse{}
+
+	return body
 }
 
 func (m *AuthorizationManager) RetrieveRolePermissions(req *types.RetrieveRolePermissions) soap.HasFault {
