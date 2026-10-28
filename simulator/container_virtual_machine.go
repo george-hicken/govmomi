@@ -425,7 +425,23 @@ func (svm *simVM) biosUUID() uuid.UUID {
 	return svm.vm.uid
 }
 
-// populateDMI writes BIOS UUID DMI files to a container volume
+// dmiProductName returns /sys/class/dmi/id/product_name as ESXi presents it:
+// "VMware<hw>,1" (e.g. "VMware20,1") for EFI firmware and
+// "VMware Virtual Platform" for BIOS.
+func dmiProductName(firmware, version string) string {
+	if firmware == string(types.GuestOsDescriptorFirmwareTypeEfi) {
+		if hw, err := strconv.Atoi(strings.TrimPrefix(version, "vmx-")); err == nil && hw > 0 {
+			return fmt.Sprintf("VMware%d,1", hw)
+		}
+		return "VMware7,1"
+	}
+	return "VMware Virtual Platform"
+}
+
+// populateDMI writes DMI identity files to a container volume: the BIOS UUID
+// and serial, plus the vendor and product identity that cloud-init's VMware
+// datasource and systemd-detect-virt read, so guests detect VMware
+// independently of the host's own DMI.
 func (svm *simVM) populateDMI() error {
 	if svm.c == nil {
 		return nil
@@ -447,6 +463,14 @@ func (svm *simVM) populateDMI() error {
 			},
 			[]byte(productSerial(id)),
 		},
+	}
+	for _, f := range [][2]string{
+		{"sys_vendor", "VMware, Inc."},
+		{"product_name", dmiProductName(svm.vm.Config.Firmware, svm.vm.Config.Version)},
+		{"board_vendor", "Intel Corporation"},
+		{"chassis_asset_tag", "No Asset Tag"},
+	} {
+		files = append(files, tarEntry{&tar.Header{Name: f[0], Mode: 0444}, []byte(f[1] + "\n")})
 	}
 
 	_, err := svm.c.createVolume("dmi", []string{deleteWithContainer}, files)

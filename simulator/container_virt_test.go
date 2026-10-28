@@ -266,4 +266,18 @@ func TestVirtSystemdGuest(t *testing.T) {
 	out, err = dockerExec(env.goCtx, id, "cat", "/sys/class/dmi/id/product_uuid")
 	require.NoError(t, err)
 	assert.Equal(t, productUUID(simVM.svm.biosUUID()), out)
+
+	cfg := simVM.svm.vm.Config
+	for name, want := range map[string]string{
+		"sys_vendor":        "VMware, Inc.",
+		"product_name":      dmiProductName(cfg.Firmware, cfg.Version),
+		"board_vendor":      "Intel Corporation",
+		"chassis_asset_tag": "No Asset Tag",
+	} {
+		out, err = dockerExec(env.goCtx, id, "cat", "/sys/class/dmi/id/"+name)
+		require.NoError(t, err)
+		assert.Equal(t, want, strings.TrimSpace(out), name)
+	}
+	// cloud-init's DataSourceVMware.is_vmware_platform()
+	assert.Contains(t, strings.ToLower(dmiProductName(cfg.Firmware, cfg.Version)), "vmware")
 }
