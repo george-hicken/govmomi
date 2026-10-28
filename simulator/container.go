@@ -441,6 +441,9 @@ type createOptions struct {
 	// GuestIdentityFiles gives the container its own /etc/hostname, /etc/hosts
 	// and /etc/resolv.conf, and sets its hostname; see guestIdentityCreateArgs.
 	GuestIdentityFiles bool
+	// VMwareVirt hides the runtime's container marker from the guest's PID 1
+	// environment; see virtCreateArgs.
+	VMwareVirt bool
 
 	// QuoteImageAndArgs shell-quotes the image and each arg, for a command
 	// given as a JSON array, whose elements may contain shell metacharacters.
@@ -526,6 +529,7 @@ func create(ctx *Context, name string, id string, image string, args []string, o
 	}
 
 	run = append(run, guestIdentityCreateArgs(name, opts)...)
+	run = append(run, virtCreateArgs(opts)...)
 
 	if opts.NestedContainers {
 		volumes := opts.NestedVolumes

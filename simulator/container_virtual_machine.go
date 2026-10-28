@@ -83,6 +83,18 @@ import (
 //     DNS server (--dns none). Needs podman as the docker CLI, RUN.container
 //     and no "host" network, or power-on fails. Without the key the container
 //     is created as before.
+//   - RUN.virt (default "vmware"): what virtualization the guest detects.
+//     "vmware" makes it a VMware VM to the guest's own probes, as cloud-init
+//     and ds-identify run them: /usr/bin/systemd-detect-virt reports "vmware"
+//     and no container (a read-only shell script, unless a RUN.volume targets
+//     the path), and under podman PID 1's environment has no container=
+//     variable (--unsetenv container, unless RUN.env.container is set).
+//     systemd as PID 1 still finds /run/.containerenv and runs as in a
+//     container, so units' ConditionVirtualization= still sees the container.
+//     cloud-init then reads DMI, which in a container it ignores, and its
+//     VMware datasource takes guestinfo through vmware-rpctool and
+//     customization packages, which need a VMware platform. "container" leaves
+//     the runtime's detection, as before.
 //   - RUN.port.<port>: publish container port <port> on the host port given as
 //     the value.
 //   - RUN.volume.<label>: add a mount, "source:destination[:options]" as for
@@ -90,15 +102,17 @@ import (
 //   - RUN.env.<name>: set environment variable <name> to the value.
 //   - guestinfo.<key>: when the container is created, each becomes the
 //     environment variable VMX_GUESTINFO_<KEY>, and VMX_GUESTINFO=true is set.
-//     In a container this is the only guestinfo source cloud-init's VMware
-//     datasource reads, because it detects the container and skips
-//     vmware-rpctool.
+//     cloud-init's VMware datasource reads these before any other guestinfo
+//     source, on any platform. With RUN.virt=container they are its only
+//     source, because it detects the container and skips vmware-rpctool and
+//     customization packages.
 //
 // A CloudinitPrep customization (CustomizeVM_Task, or a clone's spec) is
 // delivered at the next power-on as Tools' deployPkg plugin delivers it: vcsim
 // writes the package vpxd builds, cust.cfg naming the metadata and userdata
 // files, to /var/run/vmware-imc in the started container. cloud-init's VMware
-// datasource reads it there when a deployPkg plugin (libdeployPkgPlugin.so) is
+// datasource reads it there when the guest detects a VMware platform (RUN.virt
+// and DMI, see above), a deployPkg plugin (libdeployPkgPlugin.so) is
 // installed and the guest's cloud-init config allows it:
 // datasource.VMware.allow_raw_data must not be false, and ds-identify reports
 // the datasource for a package only with disable_vmware_customization: false.
@@ -191,6 +205,10 @@ type simVM struct {
 	// live as long as the container.
 	sysctlDir string
 	sysctl    []sysctlValue
+
+	// vmwareVirt is RUN.virt=vmware, kept for later starts of the container,
+	// which must find the detect-virt shim it mounts.
+	vmwareVirt bool
 }
 
 // createSimulationVM inspects the provided VirtualMachine and creates a simVM binding for it if
@@ -445,6 +463,12 @@ func (svm *simVM) start(ctx *Context) error {
 			return err
 		}
 
+		if svm.vmwareVirt {
+			if _, err := detectVirtShim(); err != nil {
+				return err
+			}
+		}
+
 		if err := svm.startGuestRPC(ctx); err != nil {
 			return err
 		}
@@ -481,6 +505,7 @@ func (svm *simVM) start(ctx *Context) error {
 	nestedVolumes := []string{"/var"}
 	vmci := false
 	guestIdentity := false
+	vmwareVirt := true
 
 	// The keys are documented on ContainerBackingOptionKey.
 	for _, opt := range svm.vm.Config.ExtraConfig {
@@ -549,6 +574,15 @@ func (svm *simVM) start(ctx *Context) error {
 				return fmt.Errorf("%s: %w", svm.vm.Name, err)
 			}
 			sysctl = &policy
+			continue
+		}
+
+		if val.Key == "RUN.virt" {
+			v, err := parseVirt(value)
+			if err != nil {
+				return fmt.Errorf("%s: %w", svm.vm.Name, err)
+			}
+			vmwareVirt = v
 			continue
 		}
 
@@ -629,6 +663,15 @@ func (svm *simVM) start(ctx *Context) error {
 	}
 	volumes = append(volumes, extraVolumes...)
 
+	if vmwareVirt {
+		mounts, err := virtMounts(svm.vm.Config.ExtraConfig)
+		if err != nil {
+			return fmt.Errorf("%s: %w", svm.vm.Name, err)
+		}
+		volumes = append(volumes, mounts...)
+	}
+	svm.vmwareVirt = vmwareVirt
+
 	if mountMachineID {
 		mounts, err := svm.carryBIOSUUID(selectBIOSUUIDCarrier())
 		if err != nil {
@@ -682,6 +725,7 @@ func (svm *simVM) start(ctx *Context) error {
 		NestedVolumes:      nestedVolumes,
 		Sysctl:             sysctl != nil,
 		GuestIdentityFiles: guestIdentity,
+		VMwareVirt:         vmwareVirt,
 		QuoteImageAndArgs:  jsonArgs,
 		RecreateIfExists:   true,
 	})
