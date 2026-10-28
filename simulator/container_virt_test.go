@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -98,16 +99,35 @@ func TestVirtCreateArgs(t *testing.T) {
 }
 
 func TestVirtMounts(t *testing.T) {
+	podman := runtimeNetwork().podman
 	mounts, err := virtMounts(nil)
 	require.NoError(t, err)
-	require.Len(t, mounts, 1)
+	if podman {
+		require.Len(t, mounts, 2)
+		assert.True(t, strings.HasSuffix(mounts[1], ":"+containerMarkerPath+":ro"), mounts[1])
+		file, _, _ := strings.Cut(mounts[1], ":")
+		content, err := os.ReadFile(file)
+		require.NoError(t, err)
+		assert.Equal(t, "podman", string(content))
+	} else {
+		require.Len(t, mounts, 1)
+	}
 	assert.True(t, strings.HasSuffix(mounts[0], ":"+detectVirtPath+":ro"), mounts[0])
 
 	mounts, err = virtMounts([]types.BaseOptionValue{
 		&types.OptionValue{Key: "RUN.volume.virt", Value: "/bin/true:" + detectVirtPath + ":ro"},
+		&types.OptionValue{Key: "RUN.volume.ctr", Value: "/etc/hostname:" + containerMarkerPath + ":ro"},
 	})
 	require.NoError(t, err)
 	assert.Empty(t, mounts)
+
+	// A user's container= is kept, so systemd writes the marker itself.
+	mounts, err = virtMounts([]types.BaseOptionValue{
+		&types.OptionValue{Key: "RUN.env.container", Value: "lxc"},
+	})
+	require.NoError(t, err)
+	require.Len(t, mounts, 1)
+	assert.True(t, strings.HasSuffix(mounts[0], ":"+detectVirtPath+":ro"), mounts[0])
 }
 
 // pid1Container prints PID 1's container= variable, or nothing.
@@ -136,6 +156,12 @@ func TestVirtContainer(t *testing.T) {
 			out, err = dockerExec(env.goCtx, id, "sh", "-c", pid1Container)
 			require.NoError(t, err)
 			assert.Empty(t, out, "PID 1 must have no container= variable")
+
+			if runtimeNetwork().podman {
+				out, err = dockerExec(env.goCtx, id, "cat", containerMarkerPath)
+				require.NoError(t, err)
+				assert.Equal(t, "podman", out, "the container marker systemd would write")
+			}
 		}
 		check()
 
@@ -154,6 +180,8 @@ func TestVirtContainer(t *testing.T) {
 
 		_, err := dockerExec(env.goCtx, id, "test", "-e", detectVirtPath)
 		assert.Error(t, err, "no shim with RUN.virt=container")
+		_, err = dockerExec(env.goCtx, id, "test", "-e", containerMarkerPath)
+		assert.Error(t, err, "no container marker mount with RUN.virt=container")
 
 		if runtimeNetwork().podman {
 			out, err := dockerExec(env.goCtx, id, "sh", "-c", pid1Container)
@@ -189,4 +217,53 @@ func TestVirtContainer(t *testing.T) {
 		require.NotNil(t, fault.FaultCause)
 		assert.Contains(t, fault.FaultCause.LocalizedMessage, "RUN.virt")
 	})
+}
+
+// TestVirtSystemdGuest pins the guest a systemd container-backed VM sees with
+// the RUN.virt defaults, so that a change to RUN.virt cannot silently change
+// it: it detects a VMware VM and no container, PID 1 has no container=
+// variable, /run/systemd/container still names the runtime, systemd boots,
+// and DMI carries the VM's BIOS UUID. vcsim provides no DMI product_name.
+// It uses vmciSystemdInitImage, a debian image with systemd as PID 1.
+func TestVirtSystemdGuest(t *testing.T) {
+	if !test.HasDocker() {
+		t.Skip("requires docker or podman (aliased as docker) on linux")
+	}
+	buildVMCISystemdInitImage(t)
+
+	env := newVCSIMEnv(t)
+	_, simVM := powerOnContainerVM(t, env, "virt-systemd-test",
+		&types.OptionValue{Key: ContainerBackingOptionKey, Value: `["` + vmciSystemdInitImage + `"]`})
+	id := containerID(t, env, simVM)
+
+	// systemd in a container typically finishes booting in 2 to 30 seconds.
+	var state string
+	require.Eventually(t, func() bool {
+		state, _ = dockerExec(env.goCtx, id, "systemctl", "is-system-running")
+		return state == "running" || state == "degraded"
+	}, 2*time.Minute, time.Second, "systemctl is-system-running")
+	assert.NotEqual(t, "offline", state)
+
+	out, err := dockerExec(env.goCtx, id, "systemd-detect-virt")
+	require.NoError(t, err)
+	assert.Equal(t, "vmware", out)
+
+	out, _ = dockerExec(env.goCtx, id, "systemd-detect-virt", "--container")
+	assert.Equal(t, "none", out)
+
+	out, err = dockerExec(env.goCtx, id, "sh", "-c", pid1Container)
+	require.NoError(t, err)
+	assert.Empty(t, out, "PID 1 must have no container= variable")
+
+	want := "docker"
+	if runtimeNetwork().podman {
+		want = "podman"
+	}
+	out, err = dockerExec(env.goCtx, id, "cat", containerMarkerPath)
+	require.NoError(t, err)
+	assert.Equal(t, want, out)
+
+	out, err = dockerExec(env.goCtx, id, "cat", "/sys/class/dmi/id/product_uuid")
+	require.NoError(t, err)
+	assert.Equal(t, productUUID(simVM.svm.biosUUID()), out)
 }

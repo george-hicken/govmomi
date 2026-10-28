@@ -88,7 +88,10 @@ import (
 //     and ds-identify run them: /usr/bin/systemd-detect-virt reports "vmware"
 //     and no container (a read-only shell script, unless a RUN.volume targets
 //     the path), and under podman PID 1's environment has no container=
-//     variable (--unsetenv container, unless RUN.env.container is set).
+//     variable (--unsetenv container, unless RUN.env.container is set);
+//     vcsim then mounts /run/systemd/container read-only with "podman", the
+//     marker systemd would have written from that variable (unless a
+//     RUN.volume targets the path).
 //     systemd as PID 1 still finds /run/.containerenv and runs as in a
 //     container, so units' ConditionVirtualization= still sees the container.
 //     cloud-init then reads DMI, which in a container it ignores, and its

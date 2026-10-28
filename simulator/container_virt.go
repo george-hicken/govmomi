@@ -70,52 +70,91 @@ esac
 exit 1
 `
 
-// detectVirtShim returns a host file holding detectVirtScript, writing it if
-// it is missing. The file is named by its content, so every vcsim process
-// shares one, and it is replaced by rename, so a container never mounts a
-// partly written file. It is checked at every start, as a temporary directory
-// may be cleaned while a powered-off VM still names it.
-func detectVirtShim() (string, error) {
-	sum := sha256.Sum256([]byte(detectVirtScript))
-	file := filepath.Join(os.TempDir(), "vcsim-systemd-detect-virt-"+hex.EncodeToString(sum[:6]))
+// containerMarkerPath is where systemd as PID 1 records the container manager
+// it detected from the container= variable. RUN.virt=vmware unsets that
+// variable under podman, so vcsim provides the file instead; a guest that
+// reads it, as the Supervisor bootstrapper does, still finds its runtime.
+// Neither podman nor systemd creates /run/host/container-manager, so vcsim
+// does not either.
+const containerMarkerPath = "/run/systemd/container"
+
+// hostShim returns a host file holding content, writing it if it is missing.
+// The file is named by its content, so every vcsim process shares one, and it
+// is replaced by rename, so a container never mounts a partly written file. It
+// is checked at every start, as a temporary directory may be cleaned while a
+// powered-off VM still names it.
+func hostShim(name, content string, mode os.FileMode) (string, error) {
+	sum := sha256.Sum256([]byte(content))
+	file := filepath.Join(os.TempDir(), "vcsim-"+name+"-"+hex.EncodeToString(sum[:6]))
 	if _, err := os.Stat(file); err == nil {
 		return file, nil
 	}
 
-	tmp, err := os.CreateTemp(os.TempDir(), "vcsim-systemd-detect-virt-*")
+	tmp, err := os.CreateTemp(os.TempDir(), "vcsim-"+name+"-*")
 	if err != nil {
-		return "", fmt.Errorf("systemd-detect-virt: %w", err)
+		return "", fmt.Errorf("%s: %w", name, err)
 	}
 	defer os.Remove(tmp.Name())
 
-	_, err = tmp.WriteString(detectVirtScript)
+	_, err = tmp.WriteString(content)
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
 	if err == nil {
-		err = os.Chmod(tmp.Name(), 0755)
+		err = os.Chmod(tmp.Name(), mode)
 	}
 	if err == nil {
 		err = os.Rename(tmp.Name(), file)
 	}
 	if err != nil {
-		return "", fmt.Errorf("systemd-detect-virt: %w", err)
+		return "", fmt.Errorf("%s: %w", name, err)
 	}
 
 	return file, nil
 }
 
-// virtMounts returns the mount of the detect-virt shim for RUN.virt=vmware,
-// unless a RUN.volume already targets detectVirtPath.
+// detectVirtShim returns the host file holding detectVirtScript.
+func detectVirtShim() (string, error) {
+	return hostShim("systemd-detect-virt", detectVirtScript, 0755)
+}
+
+// virtMounts returns the mounts for RUN.virt=vmware: the detect-virt shim and,
+// when virtCreateArgs unsets container=, the container marker systemd would
+// have written from it. Each is skipped when a RUN.volume already targets its
+// path.
 func virtMounts(extraConfig []types.BaseOptionValue) ([]string, error) {
-	if hasVolumeDest(extraConfig, detectVirtPath) {
-		return nil, nil
+	var mounts []string
+	if !hasVolumeDest(extraConfig, detectVirtPath) {
+		file, err := detectVirtShim()
+		if err != nil {
+			return nil, err
+		}
+		mounts = append(mounts, file+":"+detectVirtPath+":ro")
 	}
-	file, err := detectVirtShim()
-	if err != nil {
-		return nil, err
+
+	if unsetsContainerEnv(extraConfig) && !hasVolumeDest(extraConfig, containerMarkerPath) {
+		file, err := hostShim("systemd-container", "podman", 0644)
+		if err != nil {
+			return nil, err
+		}
+		mounts = append(mounts, file+":"+containerMarkerPath+":ro")
 	}
-	return []string{file + ":" + detectVirtPath + ":ro"}, nil
+
+	return mounts, nil
+}
+
+// unsetsContainerEnv reports whether virtCreateArgs removes container= for a
+// VM with this extraConfig: under podman, unless RUN.env.container is set.
+func unsetsContainerEnv(extraConfig []types.BaseOptionValue) bool {
+	if !runtimeNetwork().podman {
+		return false
+	}
+	for _, opt := range extraConfig {
+		if val := opt.GetOptionValue(); val != nil && val.Key == "RUN.env.container" {
+			return false
+		}
+	}
+	return true
 }
 
 // virtCreateArgs returns the create flags for RUN.virt=vmware. Podman puts
