@@ -179,6 +179,14 @@ func TestVirtContainer(t *testing.T) {
 		vm := object.NewVirtualMachine(env.client.Client, info.Result.(types.ManagedObjectReference))
 		task, err = vm.PowerOn(env.goCtx)
 		require.NoError(t, err)
-		assert.ErrorContains(t, task.Wait(env.goCtx), "RUN.virt")
+		_, err = task.WaitForResult(env.goCtx, nil)
+		require.Error(t, err)
+		// The power-on fault carries the reason in its cause.
+		var taskErr interface{ Fault() types.BaseMethodFault }
+		require.ErrorAs(t, err, &taskErr)
+		fault, ok := taskErr.Fault().(*types.MissingPowerOnConfiguration)
+		require.True(t, ok, "%T", taskErr.Fault())
+		require.NotNil(t, fault.FaultCause)
+		assert.Contains(t, fault.FaultCause.LocalizedMessage, "RUN.virt")
 	})
 }
