@@ -17,6 +17,7 @@ import (
 const (
 	zonesPath        = "/api/vcenter/consumption-domains/zones"
 	associationsPath = "/api/vcenter/consumption-domains/zones/cluster"
+	placementPath    = "/placement/namespaces"
 )
 
 func init() {
@@ -37,6 +38,7 @@ type ZoneData struct {
 type Handler struct {
 	URL  *url.URL
 	data map[string]*ZoneData
+	reg  *simulator.Registry
 }
 
 // New creates a Handler instance
@@ -50,6 +52,7 @@ func New(u *url.URL) *Handler {
 // Register Consumption Domains API paths with the vapi simulator's http.ServeMux
 func (h *Handler) Register(s *simulator.Service, r *simulator.Registry) {
 	if r.IsVPX() {
+		h.reg = r
 		s.HandleFunc(zonesPath, h.zones)
 		s.HandleFunc(zonesPath+"/", h.zones)
 		s.HandleFunc(associationsPath, h.associations)
@@ -60,6 +63,11 @@ func (h *Handler) Register(s *simulator.Service, r *simulator.Registry) {
 func (h *Handler) zones(w http.ResponseWriter, r *http.Request) {
 	subpath := r.URL.Path[len(zonesPath):]
 	zoneId := strings.Replace(subpath, "/", "", -1)
+
+	if subpath == placementPath {
+		h.placeNamespaces(w, r)
+		return
+	}
 
 	switch r.Method {
 	case http.MethodGet:
