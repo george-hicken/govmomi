@@ -89,6 +89,10 @@ type Registry struct {
 	// See VMRule for details.
 	VMRules VMRules
 
+	// Tickets and Endpoints are this instance's ticket and host endpoint registries, for extensions.
+	Tickets   *TicketRegistry
+	Endpoints *EndpointRegistry
+
 	// underlay realises the Model's Topology. It is nil when no topology is loaded.
 	underlay *underlayRuntime
 
@@ -114,6 +118,9 @@ func NewRegistry() *Registry {
 		objects:  make(map[types.ManagedObjectReference]mo.Reference),
 		handlers: make(map[types.ManagedObjectReference]RegisterObject),
 		locks:    make(map[types.ManagedObjectReference]*internal.ObjectLock),
+
+		Tickets:   new(TicketRegistry),
+		Endpoints: new(EndpointRegistry),
 
 		Namespace: vim25.Namespace,
 		Path:      vim25.Path,

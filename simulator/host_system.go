@@ -513,6 +513,7 @@ func (h *HostSystem) DestroyTask(ctx *Context, req *types.Destroy_Task) soap.Has
 
 		f := ctx.Map.getEntityParent(h, "Folder").(*Folder)
 		folderRemoveChild(ctx, &f.Folder, h.Reference())
+		ctx.Map.Endpoints.Stop(h.Self)
 		err := h.sh.remove(ctx)
 
 		if err != nil {

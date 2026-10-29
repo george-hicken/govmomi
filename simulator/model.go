@@ -968,6 +968,7 @@ func (m *Model) Remove() {
 	ctx.Map.m.Unlock()
 	// A container whose removal failed still holds a watch; the watcher must not outlive the model.
 	ctx.Map.eventWatch.close()
+	ctx.Map.Endpoints.StopAll()
 
 	// Containers go before routers and networks, which podman will not remove while they are in use.
 	if u := ctx.Map.underlay; u != nil {
