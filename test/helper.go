@@ -32,7 +32,7 @@ const ContainerTestsEnv = "VCSIM_CONTAINER_TESTS"
 func RequireContainerOptIn(t testing.TB) {
 	t.Helper()
 	if os.Getenv(ContainerTestsEnv) != "1" {
-		t.Skip("container test: opt-in via the kit podman gate (VCSIM_CONTAINER_TESTS / SV2_PODMAN_TESTS), which holds the shared fullsim lock")
+		t.Skipf("container test: set %s=1 to run", ContainerTestsEnv)
 	}
 }
 
