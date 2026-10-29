@@ -6,9 +6,9 @@ package toolbox_test
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/exec"
+	"testing"
 
 	"github.com/vmware/govmomi/find"
 	"github.com/vmware/govmomi/guest/toolbox"
@@ -18,12 +18,10 @@ import (
 	"github.com/vmware/govmomi/vim25/types"
 )
 
+// ExampleClient_Run starts a container, so it has no Output comment: go test only compiles it,
+// and TestExampleClient_Run runs it behind the container opt-in.
 func ExampleClient_Run() {
 	simulator.Run(func(ctx context.Context, c *vim25.Client) error {
-		if !test.HasDocker() {
-			fmt.Println("Linux")
-			return nil
-		}
 		vm, err := find.NewFinder(c).VirtualMachine(ctx, "DC0_H0_VM0")
 		if err != nil {
 			return err
@@ -46,6 +44,12 @@ func ExampleClient_Run() {
 
 		return tools.Run(ctx, cmd)
 	})
-	// Output:
-	// Linux
+}
+
+func TestExampleClient_Run(t *testing.T) {
+	test.RequireContainerOptIn(t)
+	if !test.HasDocker() {
+		t.Skip("docker is not on PATH")
+	}
+	ExampleClient_Run()
 }

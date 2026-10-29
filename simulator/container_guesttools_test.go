@@ -23,6 +23,7 @@ import (
 // and guest network identity come from what it reports, through power
 // operations.
 func TestVMCI_ToolboxDaemon(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}

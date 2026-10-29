@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/vmware/govmomi"
@@ -75,14 +76,11 @@ func Example_setVirtualMachineProperties() {
 	// Output: ip is 10.0.0.42
 }
 
-// Tie a docker container to the lifecycle of a vcsim VM
+// Tie a docker container to the lifecycle of a vcsim VM. It starts a container, so it has no
+// Output comment: go test only compiles it, and TestExample_runContainer runs it behind the
+// container opt-in.
 func Example_runContainer() {
 	simulator.Test(func(ctx context.Context, c *vim25.Client) {
-		if !test.HasDocker() || !test.HasContainerBridge() {
-			fmt.Println("0 diff")
-			return
-		}
-
 		finder := find.NewFinder(c)
 		pool, _ := finder.ResourcePool(ctx, "DC0_H0/Resources")
 		dc, err := finder.Datacenter(ctx, "DC0")
@@ -176,5 +174,12 @@ func Example_runContainer() {
 
 		fmt.Printf("%d diff", buf.Len()-len(fcontent))
 	})
-	// Output: 0 diff
+}
+
+func TestExample_runContainer(t *testing.T) {
+	test.RequireContainerOptIn(t)
+	if !test.HasDocker() || !test.HasContainerBridge() {
+		t.Skip("docker or a container bridge network is unavailable")
+	}
+	Example_runContainer()
 }

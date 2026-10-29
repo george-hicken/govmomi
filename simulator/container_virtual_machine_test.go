@@ -111,6 +111,7 @@ func validateNginxContainer(t *testing.T, vm *object.VirtualMachine, expected st
 // 3. Confirm docker container present that matches expectations
 func TestCreateVMWithContainerBacking(t *testing.T) {
 	Test(func(ctx context.Context, c *vim25.Client) {
+		test.RequireContainerOptIn(t)
 		if !test.HasDocker() {
 			t.Skip("requires docker on linux")
 			return
@@ -192,6 +193,7 @@ func TestCreateVMWithContainerBacking(t *testing.T) {
 // 4. Confirm docker container present that matches expectations
 func TestUpdateVMAddContainerBacking(t *testing.T) {
 	Test(func(ctx context.Context, c *vim25.Client) {
+		test.RequireContainerOptIn(t)
 		if !test.HasDocker() {
 			t.Skip("requires docker on linux")
 			return
@@ -268,6 +270,7 @@ func TestUpdateVMAddContainerBacking(t *testing.T) {
 // and summary.guest report the tools state of the container backing the VM,
 // and no tools version, since no tools have reported one.
 func TestContainerVMToolsStatus(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}
@@ -300,6 +303,7 @@ func TestContainerVMToolsStatus(t *testing.T) {
 
 // TestVMRulePowerOnStartsContainer checks that a powerOn VMRule patching RUN.container starts the container.
 func TestVMRulePowerOnStartsContainer(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}

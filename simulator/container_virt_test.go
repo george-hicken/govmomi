@@ -134,6 +134,7 @@ func TestVirtMounts(t *testing.T) {
 const pid1Container = `tr '\0' '\n' </proc/1/environ | grep '^container=' || true`
 
 func TestVirtContainer(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}
@@ -226,6 +227,7 @@ func TestVirtContainer(t *testing.T) {
 // and DMI carries the VM's BIOS UUID. vcsim provides no DMI product_name.
 // It uses vmciSystemdInitImage, a debian image with systemd as PID 1.
 func TestVirtSystemdGuest(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}

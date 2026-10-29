@@ -89,6 +89,7 @@ func requirePasta(t *testing.T) {
 // network, which needs netavark's nftables firewall support on this host.
 func requireContainerBridge(t *testing.T) {
 	t.Helper()
+	test.RequireContainerOptIn(t)
 	if !test.HasContainerBridge() {
 		t.Skip("this host's netavark/kernel cannot set up bridge firewalling (set NETAVARK_FW=none to skip that setup)")
 	}

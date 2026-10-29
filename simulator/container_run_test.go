@@ -61,6 +61,7 @@ func waitForFile(t *testing.T, path string, timeout time.Duration) string {
 // TestContainerRunTwoModels runs two Models in one process, each with a VM of the same name and paths. Each VM's
 // container is labelled with its own run, and neither Model's teardown removes the other's container.
 func TestContainerRunTwoModels(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}
@@ -92,6 +93,7 @@ func TestContainerRunTwoModels(t *testing.T) {
 // TestContainerRunRecreateRefusesLiveRun checks that RecreateIfExists does not remove a container that a live run
 // owns, even under the same name, and that the container survives the refusal.
 func TestContainerRunRecreateRefusesLiveRun(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}
@@ -115,6 +117,7 @@ func TestContainerRunRecreateRefusesLiveRun(t *testing.T) {
 // TestContainerRunSecondProcess starts a second process that creates a VM with the same name and paths. Each
 // process's container survives the other's creation and teardown.
 func TestContainerRunSecondProcess(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}
@@ -159,6 +162,7 @@ func TestContainerRunChild(t *testing.T) {
 // TestContainerRunSweepStale checks that a container of a run whose lock is free is swept, and that a container
 // of a run whose lock is held is kept.
 func TestContainerRunSweepStale(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}

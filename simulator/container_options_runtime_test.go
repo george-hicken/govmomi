@@ -18,11 +18,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/vmware/govmomi/test"
 )
 
 // TestContainerStructuredOptionsRuntime uses an explicitly selected local image.
 // It never pulls an image, starts a service, or joins an external network.
 func TestContainerStructuredOptionsRuntime(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if os.Getenv("VCSIM_OPTIONS_RUNTIME") != "1" {
 		t.Skip("set VCSIM_OPTIONS_RUNTIME=1 with a local immutable shell image")
 	}

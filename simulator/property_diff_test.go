@@ -685,6 +685,7 @@ func TestPropertyDiff_SummaryGuest(t *testing.T) {
 // the expected network property changes when powered on, including detailed Guest.Net info.
 func TestContainerVMNetworkPropertyChanges(t *testing.T) {
 	Test(func(ctx context.Context, c *vim25.Client) {
+		test.RequireContainerOptIn(t)
 		if !test.HasDocker() {
 			t.Skip("requires docker on linux")
 			return

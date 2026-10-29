@@ -80,6 +80,7 @@ const guestIdentityMounts = `for f in /etc/hostname /etc/hosts /etc/resolv.conf;
 	`awk -v f="$f" 'BEGIN{m="owned"} $5==f {m="mounted"} END{print f, m}' /proc/self/mountinfo; done`
 
 func TestGuestIdentityFilesContainer(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}

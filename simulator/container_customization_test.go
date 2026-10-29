@@ -61,6 +61,7 @@ func TestCloudinitPrepPackage(t *testing.T) {
 // datasource reads it, including after the container is restarted with a new
 // customization.
 func TestCloudinitPrepContainerDelivery(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}
@@ -146,6 +147,7 @@ func TestCloudinitPrepContainerDelivery(t *testing.T) {
 // TestCloudinitPrepContainerDeliveryFailure checks that a guest that cannot
 // take the package fails the customization, not the power-on.
 func TestCloudinitPrepContainerDeliveryFailure(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}

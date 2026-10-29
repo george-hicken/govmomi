@@ -154,6 +154,7 @@ func TestPerHostOptionManager(t *testing.T) {
 }
 
 func TestHostContainerBacking(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker on linux")
 	}
@@ -186,6 +187,7 @@ func TestHostContainerBacking(t *testing.T) {
 }
 
 func TestMultipleSimHost(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker on linux")
 	}

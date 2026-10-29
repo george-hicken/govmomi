@@ -138,6 +138,7 @@ const sleepForever = "trap exit TERM; sleep infinity & wait"
 // here stderr also carries the docker CLI's own messages, so only stdout and
 // the exit status are checked.
 func TestVMCI_ToolboxBinary_GuestInfoRoundTrip(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}
@@ -217,6 +218,7 @@ func TestVMCI_NestedContainers_GuestInfoRoundTrip(t *testing.T) {
 }
 
 func testSystemdUnitWritesGuestInfo(t *testing.T, option string) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}
@@ -238,6 +240,7 @@ func testSystemdUnitWritesGuestInfo(t *testing.T, option string) {
 // TestContainerGuestRPC_MultiVM pins that concurrent container-backed VMs each
 // reach only their own guestinfo.
 func TestContainerGuestRPC_MultiVM(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}

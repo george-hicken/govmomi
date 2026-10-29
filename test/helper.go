@@ -24,6 +24,18 @@ import (
 	"github.com/vmware/govmomi/vim25/types"
 )
 
+// ContainerTestsEnv, set to 1, opts in to tests that start docker or podman containers.
+const ContainerTestsEnv = "VCSIM_CONTAINER_TESTS"
+
+// RequireContainerOptIn skips t unless ContainerTestsEnv=1, so a plain go test never starts
+// containers on a host whose container runtime other work is using.
+func RequireContainerOptIn(t testing.TB) {
+	t.Helper()
+	if os.Getenv(ContainerTestsEnv) != "1" {
+		t.Skip("container test: opt-in via the kit podman gate (VCSIM_CONTAINER_TESTS / SV2_PODMAN_TESTS), which holds the shared fullsim lock")
+	}
+}
+
 func HasDocker() bool {
 	if runtime.GOOS != "linux" {
 		return false

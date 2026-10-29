@@ -124,6 +124,7 @@ func hostSysctl(t *testing.T, key string) string {
 // writes are real, emulated writes read back, undeclared host-global writes fail, and the
 // host's values do not change. It needs docker or podman.
 func TestSysctlOverlayContainer(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}
@@ -210,6 +211,7 @@ func TestSysctlOverlayContainer(t *testing.T) {
 // from the bounding set, and checks that the overlay's drop reaches the workload. Skips when no
 // local photon image has such a setpriv.
 func TestSysctlOverlayDropsSysAdmin(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}

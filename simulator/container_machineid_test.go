@@ -70,6 +70,7 @@ func requireMachineID(t *testing.T, env *vcSimEnv, vm *VirtualMachine, want stri
 // own BIOS UUID as its machine ID, from first power-on, after config.uuid is
 // reconfigured, and that the host file goes with the VM.
 func TestContainerVM_MachineID(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}
@@ -110,6 +111,7 @@ func TestContainerVM_MachineID(t *testing.T) {
 // TestContainerVM_MachineIDOptOut checks that RUN.machineId=false, and a
 // RUN.volume at a machine ID path, leave the image's file in place.
 func TestContainerVM_MachineIDOptOut(t *testing.T) {
+	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}
