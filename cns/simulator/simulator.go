@@ -39,7 +39,6 @@ func New() *simulator.Registry {
 	r.Put(&CnsVolumeManager{
 		ManagedObjectReference: cns.CnsVolumeManagerInstance,
 		volumes:                make(map[vim25types.ManagedObjectReference]map[cnstypes.CnsVolumeId]*cnstypes.CnsVolume),
-		attachments:            make(map[cnstypes.CnsVolumeId]vim25types.ManagedObjectReference),
 		snapshots:              make(map[cnstypes.CnsVolumeId]map[cnstypes.CnsSnapshotId]*cnstypes.CnsSnapshot),
 	})
 
@@ -48,12 +47,9 @@ func New() *simulator.Registry {
 
 type CnsVolumeManager struct {
 	vim25types.ManagedObjectReference
-	volumes     map[vim25types.ManagedObjectReference]map[cnstypes.CnsVolumeId]*cnstypes.CnsVolume
-	attachments map[cnstypes.CnsVolumeId]vim25types.ManagedObjectReference
-	snapshots   map[cnstypes.CnsVolumeId]map[cnstypes.CnsSnapshotId]*cnstypes.CnsSnapshot
+	volumes   map[vim25types.ManagedObjectReference]map[cnstypes.CnsVolumeId]*cnstypes.CnsVolume
+	snapshots map[cnstypes.CnsVolumeId]map[cnstypes.CnsSnapshotId]*cnstypes.CnsSnapshot
 }
-
-const simulatorDiskUUID = "6000c298595bf4575739e9105b2c0c2d"
 
 func (m *CnsVolumeManager) findDisk(vctx *simulator.Context, createSpec cnstypes.CnsVolumeCreateSpec) (*vim25types.VStorageObject, vim25types.BaseMethodFault) {
 	vsom := vctx.Map.VStorageObjectManager()
@@ -344,6 +340,10 @@ func (m *CnsVolumeManager) CnsDeleteVolume(ctx *simulator.Context, req *cnstypes
 		for ds, volumes := range m.volumes {
 			if _, ok := volumes[volumeId]; ok {
 				found = true
+				if req.DeleteDisk && len(simulator.FCDHolders(vctx, vim25types.ID(volumeId))) != 0 {
+					res.Fault = &vim25types.LocalizedMethodFault{Fault: new(vim25types.InvalidState)}
+					break
+				}
 				delete(m.volumes[ds], volumeId)
 
 				if req.DeleteDisk {
@@ -419,21 +419,17 @@ func (m *CnsVolumeManager) CnsAttachVolume(ctx *simulator.Context, req *cnstypes
 			return nil, &vim25types.InvalidArgument{InvalidProperty: "CnsAttachVolumeSpec"}
 		}
 		operationResult := []cnstypes.BaseCnsVolumeOperationResult{}
-		for _, attachSpec := range req.AttachSpecs {
-			node := vctx.Map.Get(attachSpec.Vm).(*simulator.VirtualMachine)
-			if existing, ok := m.attachments[attachSpec.VolumeId]; !ok {
-				m.attachments[attachSpec.VolumeId] = node.Self
-			} else if existing != node.Self {
-				return nil, &vim25types.ResourceInUse{
-					Name: attachSpec.VolumeId.Id,
-				}
+		for _, spec := range req.AttachSpecs {
+			res := &cnstypes.CnsVolumeAttachResult{
+				CnsVolumeOperationResult: cnstypes.CnsVolumeOperationResult{VolumeId: spec.VolumeId},
 			}
-			operationResult = append(operationResult, &cnstypes.CnsVolumeAttachResult{
-				CnsVolumeOperationResult: cnstypes.CnsVolumeOperationResult{
-					VolumeId: attachSpec.VolumeId,
-				},
-				DiskUUID: simulatorDiskUUID,
-			})
+			disk, fault := m.attach(vctx, spec)
+			if fault != nil {
+				res.Fault = &vim25types.LocalizedMethodFault{Fault: fault}
+			} else {
+				res.DiskUUID = simulator.DiskUUID(disk)
+			}
+			operationResult = append(operationResult, res)
 		}
 
 		return &cnstypes.CnsVolumeOperationBatchResult{
@@ -450,22 +446,18 @@ func (m *CnsVolumeManager) CnsAttachVolume(ctx *simulator.Context, req *cnstypes
 
 // CnsDetachVolume simulates DetachVolume call for simulated vc
 func (m *CnsVolumeManager) CnsDetachVolume(ctx *simulator.Context, req *cnstypes.CnsDetachVolume) soap.HasFault {
+	vctx := ctx.For(vim25.Path)
 	task := simulator.CreateTask(m, "CnsDetachVolume", func(*simulator.Task) (vim25types.AnyType, vim25types.BaseMethodFault) {
 		if len(req.DetachSpecs) == 0 {
 			return nil, &vim25types.InvalidArgument{InvalidProperty: "CnsDetachVolumeSpec"}
 		}
 		operationResult := []cnstypes.BaseCnsVolumeOperationResult{}
-		for _, detachSpec := range req.DetachSpecs {
-			if _, ok := m.attachments[detachSpec.VolumeId]; ok {
-				delete(m.attachments, detachSpec.VolumeId)
-				operationResult = append(operationResult, &cnstypes.CnsVolumeOperationResult{
-					VolumeId: detachSpec.VolumeId,
-				})
-			} else {
-				return nil, &vim25types.InvalidArgument{
-					InvalidProperty: detachSpec.VolumeId.Id,
-				}
+		for _, spec := range req.DetachSpecs {
+			res := &cnstypes.CnsVolumeOperationResult{VolumeId: spec.VolumeId}
+			if fault := m.detach(vctx, spec); fault != nil {
+				res.Fault = &vim25types.LocalizedMethodFault{Fault: fault}
 			}
+			operationResult = append(operationResult, res)
 		}
 
 		return &cnstypes.CnsVolumeOperationBatchResult{
@@ -477,6 +469,59 @@ func (m *CnsVolumeManager) CnsDetachVolume(ctx *simulator.Context, req *cnstypes
 			Returnval: task.Run(ctx),
 		},
 	}
+}
+
+// hasVolume reports whether the volume is a CNS volume.
+func (m *CnsVolumeManager) hasVolume(id cnstypes.CnsVolumeId) bool {
+	for _, volumes := range m.volumes {
+		if _, ok := volumes[id]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// attach attaches one volume through the simulator's FCD attach, faulting per volume.
+func (m *CnsVolumeManager) attach(vctx *simulator.Context, spec cnstypes.CnsVolumeAttachDetachSpec) (*vim25types.VirtualDisk, vim25types.BaseMethodFault) {
+	vm, ok := vctx.Map.Get(spec.Vm).(*simulator.VirtualMachine)
+	if !ok {
+		return nil, &vim25types.ManagedObjectNotFound{Obj: spec.Vm}
+	}
+	if !m.hasVolume(spec.VolumeId) {
+		return nil, new(vim25types.NotFound)
+	}
+	return vm.AttachFCD(vctx, simulator.FCDAttachSpec{
+		ID:            vim25types.ID(spec.VolumeId),
+		ControllerKey: spec.ControllerKey,
+		UnitNumber:    spec.UnitNumber,
+		DiskMode:      spec.DiskMode,
+		Sharing:       spec.Sharing,
+	})
+}
+
+// detach detaches one volume from the spec's VM, or from its holders when the spec names none.
+func (m *CnsVolumeManager) detach(vctx *simulator.Context, spec cnstypes.CnsVolumeAttachDetachSpec) vim25types.BaseMethodFault {
+	if !m.hasVolume(spec.VolumeId) {
+		return new(vim25types.NotFound)
+	}
+	id := vim25types.ID(spec.VolumeId)
+	holders := simulator.FCDHolders(vctx, id)
+	if spec.Vm.Value != "" {
+		vm, ok := vctx.Map.Get(spec.Vm).(*simulator.VirtualMachine)
+		if !ok {
+			return &vim25types.ManagedObjectNotFound{Obj: spec.Vm}
+		}
+		holders = []*simulator.VirtualMachine{vm}
+	}
+	if len(holders) == 0 {
+		return new(vim25types.NotFound)
+	}
+	for _, vm := range holders {
+		if fault := vm.DetachFCD(vctx, id); fault != nil {
+			return fault
+		}
+	}
+	return nil
 }
 
 // CnsExtendVolume simulates ExtendVolume call for simulated vc

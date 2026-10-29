@@ -2009,22 +2009,25 @@ func (vm *VirtualMachine) configureDevice(
 			ds := vm.findDatastore(ctx, p.Datastore)
 			info.Datastore = &ds.Self
 
-			if oldDevice != nil {
-				if oldDisk, ok := oldDevice.(*types.VirtualDisk); ok {
-					// add previous capacity to datastore freespace
-					ctx.WithLock(ds, func() {
-						ds.Summary.FreeSpace += getDiskSize(oldDisk)
-						ds.Info.GetDatastoreInfo().FreeSpace = ds.Summary.FreeSpace
-					})
+			// An FCD's space is its own: attaching or detaching it moves none.
+			if _, fcd := fcdByFile(ctx, info.FileName); !fcd {
+				if oldDevice != nil {
+					if oldDisk, ok := oldDevice.(*types.VirtualDisk); ok {
+						// add previous capacity to datastore freespace
+						ctx.WithLock(ds, func() {
+							ds.Summary.FreeSpace += getDiskSize(oldDisk)
+							ds.Info.GetDatastoreInfo().FreeSpace = ds.Summary.FreeSpace
+						})
+					}
 				}
-			}
 
-			// then subtract new capacity from datastore freespace
-			// XXX: compare disk size and free space until windows stat is supported
-			ctx.WithLock(ds, func() {
-				ds.Summary.FreeSpace -= getDiskSize(x)
-				ds.Info.GetDatastoreInfo().FreeSpace = ds.Summary.FreeSpace
-			})
+				// then subtract new capacity from datastore freespace
+				// XXX: compare disk size and free space until windows stat is supported
+				ctx.WithLock(ds, func() {
+					ds.Summary.FreeSpace -= getDiskSize(x)
+					ds.Info.GetDatastoreInfo().FreeSpace = ds.Summary.FreeSpace
+				})
+			}
 
 			vm.updateDiskLayouts(ctx)
 
@@ -2471,6 +2474,13 @@ func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMach
 				return invalid
 			}
 
+			disk, isDisk := dspec.Device.(*types.VirtualDisk)
+			if isDisk {
+				if fault := vm.checkFCDHold(ctx, disk); fault != nil {
+					return fault
+				}
+			}
+
 			key := device.Key
 			err = vm.configureDevice(ctx, devices, dspec, nil)
 			if err != nil {
@@ -2478,6 +2488,9 @@ func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMach
 			}
 
 			devices = append(devices, dspec.Device)
+			if isDisk && disk.VDiskId != nil {
+				addFCDConsumer(ctx, *disk.VDiskId, vm.Config.Uuid)
+			}
 			change.Val = dspec.Device
 			if card, ok := dspec.Device.(types.BaseVirtualEthernetCard); ok {
 				after, fault := vm.liveNICState(ctx, card.GetVirtualEthernetCard())
@@ -2545,6 +2558,9 @@ func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMach
 					return fault
 				}
 				before = st
+			}
+			if disk, ok := devices.FindByKey(device.Key).(*types.VirtualDisk); ok && disk.VDiskId != nil {
+				removeFCDConsumer(ctx, disk.VDiskId, vm.Config.Uuid)
 			}
 			devices = vm.removeDevice(ctx, devices, dspec)
 			if _, ok := dspec.Device.(types.BaseVirtualEthernetCard); ok {
@@ -2979,6 +2995,15 @@ func (vm *VirtualMachine) DestroyTask(ctx *Context, req *types.Destroy_Task) soa
 			return nil, r.Fault().VimFault().(types.BaseMethodFault)
 		}
 
+		// Detach FCDs first, so removing the other devices with destroy keeps their files
+		for _, d := range object.VirtualDeviceList(vm.Config.Hardware.Device).SelectByType((*types.VirtualDisk)(nil)) {
+			if id := d.(*types.VirtualDisk).VDiskId; id != nil {
+				if fault := vm.DetachFCD(ctx, *id); fault != nil {
+					return nil, fault
+				}
+			}
+		}
+
 		// Remove all devices
 		devices := object.VirtualDeviceList(vm.Config.Hardware.Device)
 		spec, _ := devices.ConfigSpec(types.VirtualDeviceConfigSpecOperationRemove)
@@ -3051,6 +3076,9 @@ func (vm *VirtualMachine) UnregisterVM(ctx *Context, c *types.UnregisterVM) soap
 	for _, dvs := range dvsToInvalidate {
 		dvs.FetchDVPortsResponse.Returnval = nil
 	}
+
+	// An unregistered VM holds no FCD
+	removeFCDConsumer(ctx, nil, vm.Config.Uuid)
 
 	ctx.postEvent(&types.VmRemovedEvent{VmEvent: vm.event(ctx)})
 	if f, ok := asFolderMO(ctx.Map.getEntityParent(vm, "Folder")); ok {
@@ -3798,16 +3826,16 @@ func (vm *VirtualMachine) fcd(ctx *Context, ds types.ManagedObjectReference, id 
 
 func (vm *VirtualMachine) AttachDiskTask(ctx *Context, req *types.AttachDisk_Task) soap.HasFault {
 	task := CreateTask(vm, "attachDisk", func(t *Task) (types.AnyType, types.BaseMethodFault) {
-		fcd := vm.fcd(ctx, req.Datastore, req.DiskId)
-		if fcd == nil {
-			return nil, new(types.InvalidArgument)
+		spec := FCDAttachSpec{
+			ID:         req.DiskId,
+			Datastore:  req.Datastore,
+			UnitNumber: req.UnitNumber,
 		}
-
-		fcd.Config.ConsumerId = []types.ID{{Id: vm.Config.Uuid}}
-
-		// TODO: add device
-
-		return nil, nil
+		if req.ControllerKey != 0 {
+			spec.ControllerKey = &req.ControllerKey
+		}
+		_, fault := vm.AttachFCD(ctx, spec)
+		return nil, fault
 	})
 
 	return &methods.AttachDisk_TaskBody{
@@ -3819,16 +3847,7 @@ func (vm *VirtualMachine) AttachDiskTask(ctx *Context, req *types.AttachDisk_Tas
 
 func (vm *VirtualMachine) DetachDiskTask(ctx *Context, req *types.DetachDisk_Task) soap.HasFault {
 	task := CreateTask(vm, "detachDisk", func(t *Task) (types.AnyType, types.BaseMethodFault) {
-		fcd := vm.fcd(ctx, types.ManagedObjectReference{}, req.DiskId)
-		if fcd == nil {
-			return nil, new(types.InvalidArgument)
-		}
-
-		fcd.Config.ConsumerId = nil
-
-		// TODO: remove device
-
-		return nil, nil
+		return nil, vm.DetachFCD(ctx, req.DiskId)
 	})
 
 	return &methods.DetachDisk_TaskBody{

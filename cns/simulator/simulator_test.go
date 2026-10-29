@@ -6,6 +6,8 @@ package simulator
 
 import (
 	"context"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -13,8 +15,8 @@ import (
 	"github.com/vmware/govmomi"
 	"github.com/vmware/govmomi/cns"
 	cnstypes "github.com/vmware/govmomi/cns/types"
+	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/simulator"
-	"github.com/vmware/govmomi/task"
 	vim25types "github.com/vmware/govmomi/vim25/types"
 	"github.com/vmware/govmomi/vslm"
 )
@@ -284,6 +286,11 @@ func TestSimulator(t *testing.T) {
 	detachVolumeOperationRes := detachTaskResult.GetCnsVolumeOperationResult()
 	if detachVolumeOperationRes.Fault != nil {
 		t.Fatalf("Failed to detach volume: fault=%+v", detachVolumeOperationRes.Fault)
+	}
+	for _, d := range nodeVM.Config.Hardware.Device {
+		if disk, ok := d.(*vim25types.VirtualDisk); ok && disk.VDiskId != nil && disk.VDiskId.Id == createVolumeOperationRes.VolumeId.Id {
+			t.Fatal("detach with no Vm left the device")
+		}
 	}
 
 	// Query
@@ -596,149 +603,259 @@ func TestSimulator(t *testing.T) {
 
 }
 
-// TestCnsAttachVolumeIdempotent verifies that re-attaching a volume that is
-// already attached to the same VM succeeds instead of faulting with
-// ResourceInUse. The vSphere CSI driver's ControllerPublishVolume is expected
-// to be safely retryable (e.g. after a controller leader-election failover
-// replays its queue), so a retry targeting the same VM must be a no-op
-// success, not a permanent failure. Attaching to a different VM while still
-// attached elsewhere must still fault.
-func TestCnsAttachVolumeIdempotent(t *testing.T) {
-	ctx := context.Background()
+// attachEnv drives CNS attach and detach against a VPX model.
+type attachEnv struct {
+	t     *testing.T
+	ctx   context.Context
+	model *simulator.Model
+	cns   *cns.Client
+	vms   []*simulator.VirtualMachine
+}
 
+func testAttach(t *testing.T, f func(*attachEnv)) {
+	t.Helper()
+	ctx := context.Background()
 	model := simulator.VPX()
 	defer model.Remove()
-
 	if err := model.Create(); err != nil {
 		t.Fatal(err)
 	}
-
 	s := model.Service.NewServer()
 	defer s.Close()
-
 	model.Service.RegisterSDK(New())
 
 	c, err := govmomi.NewClient(ctx, s.URL, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	cnsClient, err := cns.NewClient(ctx, c.Client)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	datastore := model.Map().Any("Datastore").(*simulator.Datastore)
+	e := &attachEnv{t: t, ctx: ctx, model: model, cns: cnsClient}
+	for _, ref := range model.Map().All("VirtualMachine") {
+		e.vms = append(e.vms, ref.(*simulator.VirtualMachine))
+	}
+	slices.SortFunc(e.vms, func(a, b *simulator.VirtualMachine) int { return strings.Compare(a.Name, b.Name) })
+	f(e)
+}
 
-	var capacityInMb int64 = 1024
-	createSpecList := []cnstypes.CnsVolumeCreateSpec{
-		{
-			Name:       "test-idempotent-attach",
-			VolumeType: "TestVolumeType",
-			Datastores: []vim25types.ManagedObjectReference{
-				datastore.Self,
-			},
-			BackingObjectDetails: &cnstypes.CnsBlockBackingDetails{
-				CnsBackingObjectDetails: cnstypes.CnsBackingObjectDetails{
-					CapacityInMb: capacityInMb,
-				},
-			},
-			Profile: []vim25types.BaseVirtualMachineProfileSpec{
-				&vim25types.VirtualMachineDefinedProfileSpec{
-					ProfileId: uuid.New().String(),
-				},
-			},
+func (e *attachEnv) createVolume(name string) cnstypes.CnsVolumeId {
+	e.t.Helper()
+	ds := e.model.Map().Any("Datastore").(*simulator.Datastore)
+	res := e.results(e.cns.CreateVolume(e.ctx, []cnstypes.CnsVolumeCreateSpec{{
+		Name:       name,
+		VolumeType: "BLOCK",
+		Datastores: []vim25types.ManagedObjectReference{ds.Self},
+		BackingObjectDetails: &cnstypes.CnsBlockBackingDetails{
+			CnsBackingObjectDetails: cnstypes.CnsBackingObjectDetails{CapacityInMb: 10},
 		},
+	}}))
+	if res[0].GetCnsVolumeOperationResult().Fault != nil {
+		e.t.Fatal(res[0].GetCnsVolumeOperationResult().Fault)
 	}
-	createTask, err := cnsClient.CreateVolume(ctx, createSpecList)
-	if err != nil {
-		t.Fatal(err)
-	}
-	createTaskInfo, err := cns.GetTaskInfo(ctx, createTask)
-	if err != nil {
-		t.Fatal(err)
-	}
-	createTaskResult, err := cns.GetTaskResult(ctx, createTaskInfo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	createVolumeOperationRes := createTaskResult.GetCnsVolumeOperationResult()
-	if createVolumeOperationRes.Fault != nil {
-		t.Fatalf("Failed to create volume: fault=%+v", createVolumeOperationRes.Fault)
-	}
-	volumeId := createVolumeOperationRes.VolumeId
+	return res[0].GetCnsVolumeOperationResult().VolumeId
+}
 
-	nodeVM := model.Map().Any("VirtualMachine").(*simulator.VirtualMachine)
-	attachSpecList := []cnstypes.CnsVolumeAttachDetachSpec{
-		{
-			VolumeId: volumeId,
-			Vm:       nodeVM.Self,
-		},
+// results waits for a CNS task, which must succeed, and returns its per-volume results.
+func (e *attachEnv) results(t *object.Task, err error) []cnstypes.BaseCnsVolumeOperationResult {
+	e.t.Helper()
+	if err != nil {
+		e.t.Fatal(err)
 	}
+	info, err := cns.GetTaskInfo(e.ctx, t)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	batch, ok := info.Result.(cnstypes.CnsVolumeOperationBatchResult)
+	if !ok {
+		e.t.Fatalf("result %T", info.Result)
+	}
+	return batch.VolumeResults
+}
 
-	// First attach succeeds.
-	attachTask, err := cnsClient.AttachVolume(ctx, attachSpecList)
-	if err != nil {
-		t.Fatal(err)
-	}
-	attachTaskInfo, err := cns.GetTaskInfo(ctx, attachTask)
-	if err != nil {
-		t.Fatal(err)
-	}
-	attachTaskResult, err := cns.GetTaskResult(ctx, attachTaskInfo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fault := attachTaskResult.GetCnsVolumeOperationResult().Fault; fault != nil {
-		t.Fatalf("Failed first attach: fault=%+v", fault)
-	}
+func (e *attachEnv) attach(specs ...cnstypes.CnsVolumeAttachDetachSpec) []cnstypes.BaseCnsVolumeOperationResult {
+	e.t.Helper()
+	return e.results(e.cns.AttachVolume(e.ctx, specs))
+}
 
-	// Retrying the attach to the SAME VM must also succeed (idempotent), not
-	// fault with ResourceInUse.
-	retryTask, err := cnsClient.AttachVolume(ctx, attachSpecList)
-	if err != nil {
-		t.Fatal(err)
-	}
-	retryTaskInfo, err := cns.GetTaskInfo(ctx, retryTask)
-	if err != nil {
-		t.Fatal(err)
-	}
-	retryTaskResult, err := cns.GetTaskResult(ctx, retryTaskInfo)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fault := retryTaskResult.GetCnsVolumeOperationResult().Fault; fault != nil {
-		t.Fatalf("Retrying attach to the same VM should be idempotent, got fault=%+v", fault)
-	}
+func (e *attachEnv) detach(specs ...cnstypes.CnsVolumeAttachDetachSpec) []cnstypes.BaseCnsVolumeOperationResult {
+	e.t.Helper()
+	return e.results(e.cns.DetachVolume(e.ctx, specs))
+}
 
-	// Attaching to a DIFFERENT VM while still attached elsewhere must still fault.
-	otherVM, ok := model.Map().Any("VirtualMachine").(*simulator.VirtualMachine)
-	if ok {
-		for _, ref := range model.Map().All("VirtualMachine") {
-			vm := ref.(*simulator.VirtualMachine)
-			if vm.Self != nodeVM.Self {
-				otherVM = vm
-				break
+func spec(id cnstypes.CnsVolumeId, vm *simulator.VirtualMachine) cnstypes.CnsVolumeAttachDetachSpec {
+	return cnstypes.CnsVolumeAttachDetachSpec{VolumeId: id, Vm: vm.Self}
+}
+
+func diskOf(vm *simulator.VirtualMachine, id cnstypes.CnsVolumeId) *vim25types.VirtualDisk {
+	for _, d := range vm.Config.Hardware.Device {
+		if disk, ok := d.(*vim25types.VirtualDisk); ok && disk.VDiskId != nil && disk.VDiskId.Id == id.Id {
+			return disk
+		}
+	}
+	return nil
+}
+
+func diskCount(vm *simulator.VirtualMachine) int {
+	return len(object.VirtualDeviceList(vm.Config.Hardware.Device).SelectByType((*vim25types.VirtualDisk)(nil)))
+}
+
+func requireNoFault(t *testing.T, res cnstypes.BaseCnsVolumeOperationResult) {
+	t.Helper()
+	if f := res.GetCnsVolumeOperationResult().Fault; f != nil {
+		t.Fatalf("fault %T", f.Fault)
+	}
+}
+
+func requireVolumeFault[T vim25types.BaseMethodFault](t *testing.T, res cnstypes.BaseCnsVolumeOperationResult) {
+	t.Helper()
+	f := res.GetCnsVolumeOperationResult().Fault
+	if f == nil {
+		t.Fatal("no fault")
+	}
+	if _, ok := f.Fault.(T); !ok {
+		var want T
+		t.Fatalf("want %T, got %T", want, f.Fault)
+	}
+}
+
+func diskUUID(res cnstypes.BaseCnsVolumeOperationResult) string {
+	return res.(*cnstypes.CnsVolumeAttachResult).DiskUUID
+}
+
+func TestCnsAttachVolume(t *testing.T) {
+	t.Run("C1 one volume", func(t *testing.T) {
+		testAttach(t, func(e *attachEnv) {
+			vm, id := e.vms[0], e.createVolume("c1")
+			res := e.attach(spec(id, vm))
+			requireNoFault(t, res[0])
+			disk := diskOf(vm, id)
+			if disk == nil || diskUUID(res[0]) != simulator.DiskUUID(disk) || diskUUID(res[0]) == "" {
+				t.Fatalf("disk %v, DiskUUID %q", disk, diskUUID(res[0]))
 			}
-		}
-	}
-	if otherVM.Self != nodeVM.Self {
-		conflictTask, err := cnsClient.AttachVolume(ctx, []cnstypes.CnsVolumeAttachDetachSpec{
-			{VolumeId: volumeId, Vm: otherVM.Self},
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, err = cns.GetTaskInfo(ctx, conflictTask)
-		if err == nil {
-			t.Fatalf("Expected ResourceInUse attaching to a different VM while already attached elsewhere")
-		}
-		taskErr, ok := err.(task.Error)
-		if !ok {
-			t.Fatalf("Expected a task.Error, got %T: %+v", err, err)
-		}
-		if _, ok := taskErr.Fault().(*vim25types.ResourceInUse); !ok {
-			t.Fatalf("Expected ResourceInUse fault, got %+v", taskErr.Fault())
-		}
-	}
+	})
+
+	t.Run("C2 two volumes in one call", func(t *testing.T) {
+		testAttach(t, func(e *attachEnv) {
+			vm, n := e.vms[0], diskCount(e.vms[0])
+			res := e.attach(spec(e.createVolume("c2a"), vm), spec(e.createVolume("c2b"), vm))
+			requireNoFault(t, res[0])
+			requireNoFault(t, res[1])
+			if diskUUID(res[0]) == diskUUID(res[1]) || diskCount(vm) != n+2 {
+				t.Fatalf("DiskUUIDs %q %q, disks %d", diskUUID(res[0]), diskUUID(res[1]), diskCount(vm))
+			}
+		})
+	})
+
+	// C3 and C4 replace TestCnsAttachVolumeIdempotent.
+	t.Run("C3 same attach twice", func(t *testing.T) {
+		testAttach(t, func(e *attachEnv) {
+			vm, id := e.vms[0], e.createVolume("c3")
+			first := e.attach(spec(id, vm))
+			n := diskCount(vm)
+			again := e.attach(spec(id, vm))
+			requireNoFault(t, again[0])
+			if diskUUID(first[0]) != diskUUID(again[0]) || diskCount(vm) != n {
+				t.Fatal("retry changed the VM")
+			}
+		})
+	})
+
+	t.Run("C4 attach to another VM", func(t *testing.T) {
+		testAttach(t, func(e *attachEnv) {
+			id := e.createVolume("c4")
+			requireNoFault(t, e.attach(spec(id, e.vms[0]))[0])
+			n := diskCount(e.vms[1])
+			requireVolumeFault[*vim25types.ResourceInUse](t, e.attach(spec(id, e.vms[1]))[0])
+			if diskCount(e.vms[1]) != n {
+				t.Fatal("conflicting attach changed the other VM")
+			}
+		})
+	})
+
+	t.Run("C5 free and conflicting volumes in one call", func(t *testing.T) {
+		testAttach(t, func(e *attachEnv) {
+			busy, free := e.createVolume("c5-busy"), e.createVolume("c5-free")
+			requireNoFault(t, e.attach(spec(busy, e.vms[0]))[0])
+			res := e.attach(spec(free, e.vms[1]), spec(busy, e.vms[1]))
+			requireNoFault(t, res[0])
+			if d := diskOf(e.vms[1], free); d == nil || diskUUID(res[0]) != simulator.DiskUUID(d) {
+				t.Fatal("free volume not attached")
+			}
+			requireVolumeFault[*vim25types.ResourceInUse](t, res[1])
+		})
+	})
+
+	t.Run("C6 placement and modes from the spec", func(t *testing.T) {
+		testAttach(t, func(e *attachEnv) {
+			vm, id := e.vms[0], e.createVolume("c6")
+			controller := diskOfAny(vm).ControllerKey
+			s := spec(id, vm)
+			s.ControllerKey, s.UnitNumber = &controller, vim25types.NewInt32(5)
+			s.DiskMode = string(vim25types.VirtualDiskModeIndependent_persistent)
+			s.Sharing = string(vim25types.VirtualDiskSharingSharingNone)
+			requireNoFault(t, e.attach(s)[0])
+			d := diskOf(vm, id)
+			b := d.Backing.(*vim25types.VirtualDiskFlatVer2BackingInfo)
+			if d.ControllerKey != controller || *d.UnitNumber != 5 || b.DiskMode != s.DiskMode || b.Sharing != s.Sharing {
+				t.Fatalf("device %d:%d %s %s", d.ControllerKey, *d.UnitNumber, b.DiskMode, b.Sharing)
+			}
+		})
+	})
+
+	t.Run("C7 unknown VM and volume", func(t *testing.T) {
+		testAttach(t, func(e *attachEnv) {
+			id := e.createVolume("c7")
+			res := e.attach(cnstypes.CnsVolumeAttachDetachSpec{
+				VolumeId: id,
+				Vm:       vim25types.ManagedObjectReference{Type: "VirtualMachine", Value: "vm-unknown"},
+			}, spec(cnstypes.CnsVolumeId{Id: "unknown"}, e.vms[0]))
+			requireVolumeFault[*vim25types.ManagedObjectNotFound](t, res[0])
+			requireVolumeFault[*vim25types.NotFound](t, res[1])
+		})
+	})
+}
+
+func TestCnsDetachVolume(t *testing.T) {
+	t.Run("C8 detach then attach elsewhere", func(t *testing.T) {
+		testAttach(t, func(e *attachEnv) {
+			id := e.createVolume("c8")
+			requireNoFault(t, e.attach(spec(id, e.vms[0]))[0])
+			requireNoFault(t, e.detach(spec(id, e.vms[0]))[0])
+			if diskOf(e.vms[0], id) != nil {
+				t.Fatal("device remains")
+			}
+			requireNoFault(t, e.attach(spec(id, e.vms[1]))[0])
+		})
+	})
+
+	t.Run("C9 detach of an unheld volume", func(t *testing.T) {
+		testAttach(t, func(e *attachEnv) {
+			requireVolumeFault[*vim25types.NotFound](t, e.detach(spec(e.createVolume("c9"), e.vms[0]))[0])
+		})
+	})
+
+	t.Run("C11 delete while attached", func(t *testing.T) {
+		testAttach(t, func(e *attachEnv) {
+			id := e.createVolume("c11")
+			requireNoFault(t, e.attach(spec(id, e.vms[0]))[0])
+			del := func() []cnstypes.BaseCnsVolumeOperationResult {
+				return e.results(e.cns.DeleteVolume(e.ctx, []cnstypes.CnsVolumeId{id}, true))
+			}
+			requireVolumeFault[*vim25types.InvalidState](t, del()[0])
+			q, err := e.cns.QueryVolume(e.ctx, &cnstypes.CnsQueryFilter{VolumeIds: []cnstypes.CnsVolumeId{id}})
+			if err != nil || len(q.Volumes) != 1 {
+				t.Fatalf("volume gone after refused delete: %v", err)
+			}
+			requireNoFault(t, e.detach(spec(id, e.vms[0]))[0])
+			requireNoFault(t, del()[0])
+		})
+	})
+}
+
+func diskOfAny(vm *simulator.VirtualMachine) *vim25types.VirtualDisk {
+	return object.VirtualDeviceList(vm.Config.Hardware.Device).SelectByType((*vim25types.VirtualDisk)(nil))[0].(*vim25types.VirtualDisk)
 }
