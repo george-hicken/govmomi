@@ -74,8 +74,9 @@ type Registry struct {
 
 	Namespace string
 	Path      string
-	Handler   func(*Context, *Method) (mo.Reference, types.BaseMethodFault)
-	Cookie    func(*Context) string
+	// Handler, if set, may supply the object that handles a method, or a fault; its object wins over the session's.
+	Handler func(*Context, *Method) (mo.Reference, types.BaseMethodFault)
+	Cookie  func(*Context) string
 
 	tagManager tagManager
 

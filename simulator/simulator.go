@@ -213,8 +213,9 @@ func (s *Service) call(ctx *Context, method *Method) soap.HasFault {
 			return &serverFaultBody{Reason: Fault("", fault)}
 		}
 	} else {
-		// Prefer the Session.Registry, ServiceContent.PropertyCollector filter field for example is per-session
-		if h := session.Get(method.This); h != nil {
+		// Prefer the Session.Registry, ServiceContent.PropertyCollector filter field for example is per-session,
+		// unless Registry.Handler chose the handler.
+		if h := session.Get(method.This); h != nil && handler == registeredHandler {
 			handler = h
 		}
 	}
