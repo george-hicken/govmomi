@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/vmware/govmomi/find"
+	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/property"
 	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/methods"
@@ -92,6 +93,8 @@ func TestDestroyVMUpdatesHostVm(t *testing.T) {
 // proves the table detects a mutator that skips the update.
 func TestRegistryReferenceMutatorsUpdate(t *testing.T) {
 	m := VPX()
+	m.Datastore = 2
+	m.Pool = 1
 	defer m.Remove()
 	if err := m.Create(); err != nil {
 		t.Fatal(err)
@@ -102,6 +105,7 @@ func TestRegistryReferenceMutatorsUpdate(t *testing.T) {
 	r := m.Map()
 
 	ref := types.ManagedObjectReference{Type: "VirtualMachine", Value: "vm-fu125"}
+	moved := relocateRows(ctx, t, c, r)
 	host := r.Any("HostSystem").(*HostSystem)
 	dvs := r.Any("VmwareDistributedVirtualSwitch").(*VmwareDistributedVirtualSwitch)
 	vm := r.Any("VirtualMachine").(*VirtualMachine)
@@ -181,6 +185,10 @@ func TestRegistryReferenceMutatorsUpdate(t *testing.T) {
 		{"ContainerView leave", membership,
 			func() { folderRemoveChild(sim, &root.Folder, joined) },
 			member(types.ObjectUpdateKindLeave), true},
+		moved("RelocateVM_Task host", true, false, false),
+		moved("RelocateVM_Task pool", false, true, false),
+		moved("RelocateVM_Task datastore", false, false, true),
+		moved("RelocateVM_Task host, pool and datastore", true, true, true),
 		// Control: the mutation bypasses updateField, so no client sees it.
 		{"control: bypasses updateField", func() types.PropertyFilterSpec { return prop(vm, "datastore") },
 			func() { r.WithLock(sim, vm, func() { vm.Datastore = append(vm.Datastore, ref) }) },
@@ -193,6 +201,117 @@ func TestRegistryReferenceMutatorsUpdate(t *testing.T) {
 				t.Errorf("collector saw the change: %t, want %t", got, test.want)
 			}
 		})
+	}
+}
+
+// relocateRow is a TestRegistryReferenceMutatorsUpdate row.
+type relocateRow = struct {
+	name   string
+	spec   func() types.PropertyFilterSpec
+	mutate func()
+	seen   func([]types.ObjectUpdate) bool
+	want   bool
+}
+
+// relocateRows returns a builder of rows that relocate a cluster VM to another host, pool and/or
+// datastore. Each row's collector must see the VM leave each source's vm list, join the
+// destination's, and the VM's own property (runtime.host when the host moves) change.
+func relocateRows(ctx context.Context, t *testing.T, c *vim25.Client, r *Registry) func(name string, host, pool, ds bool) relocateRow {
+	var vm *VirtualMachine
+	for _, o := range r.All("VirtualMachine") {
+		if v := o.(*VirtualMachine); v.Runtime.Host != nil && r.Get(*v.Runtime.Host).(*HostSystem).Parent.Type == "ClusterComputeResource" {
+			vm = v
+		}
+	}
+	other := func(kind string, cur types.ManagedObjectReference, ok func(mo.Reference) bool) types.ManagedObjectReference {
+		for _, o := range r.All(kind) {
+			if o.Reference() != cur && ok(o) {
+				return o.Reference()
+			}
+		}
+		t.Fatalf("no other %s", kind)
+		return cur
+	}
+	cluster := r.Get(*r.Get(*vm.Runtime.Host).(*HostSystem).Parent)
+	inCluster := func(o mo.Reference) bool {
+		switch o := o.(type) {
+		case *HostSystem:
+			return *o.Parent == cluster.Reference()
+		case *ResourcePool:
+			return o.Owner == cluster.Reference()
+		}
+		return true
+	}
+	hasVM := func(val any) bool {
+		switch refs := val.(type) {
+		case types.ArrayOfManagedObjectReference:
+			return slices.Contains(refs.ManagedObjectReference, vm.Self)
+		case *types.ArrayOfManagedObjectReference:
+			return slices.Contains(refs.ManagedObjectReference, vm.Self)
+		case *[]types.ManagedObjectReference:
+			return slices.Contains(*refs, vm.Self)
+		}
+		return false
+	}
+	return func(name string, host, pool, ds bool) relocateRow {
+		type move struct{ src, dst types.ManagedObjectReference }
+		var moves []move
+		var spec types.VirtualMachineRelocateSpec
+		var vmPath string
+		return relocateRow{name: name,
+			spec: func() types.PropertyFilterSpec {
+				moves = nil
+				spec = types.VirtualMachineRelocateSpec{}
+				add := func(src, dst types.ManagedObjectReference, path string) *types.ManagedObjectReference {
+					moves = append(moves, move{src, dst})
+					vmPath = path
+					return &dst
+				}
+				if ds {
+					spec.Datastore = add(vm.Datastore[0], other("Datastore", vm.Datastore[0], inCluster), "datastore")
+				}
+				if pool {
+					spec.Pool = add(*vm.ResourcePool, other("ResourcePool", *vm.ResourcePool, inCluster), "resourcePool")
+				}
+				if host {
+					spec.Host = add(*vm.Runtime.Host, other("HostSystem", *vm.Runtime.Host, inCluster), "runtime.host")
+				}
+				fs := types.PropertyFilterSpec{
+					ObjectSet: []types.ObjectSpec{{Obj: vm.Self}},
+					PropSet:   []types.PropertySpec{{Type: "VirtualMachine", PathSet: []string{vmPath}}},
+				}
+				for _, mv := range moves {
+					fs.ObjectSet = append(fs.ObjectSet, types.ObjectSpec{Obj: mv.src}, types.ObjectSpec{Obj: mv.dst})
+					fs.PropSet = append(fs.PropSet, types.PropertySpec{Type: mv.src.Type, PathSet: []string{"vm"}})
+				}
+				return fs
+			},
+			mutate: func() {
+				res, err := methods.RelocateVM_Task(ctx, c, &types.RelocateVM_Task{This: vm.Self, Spec: spec})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = object.NewTask(c, res.Returnval).Wait(ctx); err != nil {
+					t.Fatal(err)
+				}
+			},
+			seen: func(updates []types.ObjectUpdate) bool {
+				change := func(obj types.ManagedObjectReference, path string, ok func(any) bool) bool {
+					return slices.ContainsFunc(updates, func(u types.ObjectUpdate) bool {
+						return u.Obj == obj && u.Kind == types.ObjectUpdateKindModify &&
+							slices.ContainsFunc(u.ChangeSet, func(c types.PropertyChange) bool { return c.Name == path && ok(c.Val) })
+					})
+				}
+				for _, mv := range moves {
+					if !change(mv.src, "vm", func(v any) bool { return !hasVM(v) }) || !change(mv.dst, "vm", hasVM) {
+						t.Logf("%s -> %s: vm list changes not seen", mv.src, mv.dst)
+						return false
+					}
+				}
+				return change(vm.Self, vmPath, func(any) bool { return true })
+			},
+			want: true,
+		}
 	}
 }
 

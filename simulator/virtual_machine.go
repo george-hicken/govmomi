@@ -3280,6 +3280,33 @@ func copyNonEmptyValue[T comparable](dst, src *T) {
 	*dst = *src
 }
 
+// vmList returns the field of obj (a host, pool, vApp or datastore) listing its VMs.
+func vmList(obj mo.Reference) *[]types.ManagedObjectReference {
+	switch o := obj.(type) {
+	case *HostSystem:
+		return &o.Vm
+	case *ResourcePool:
+		return &o.Vm
+	case *VirtualApp:
+		return &o.Vm
+	case *Datastore:
+		return &o.Vm
+	}
+	panic(fmt.Sprintf("%T has no vm list", obj))
+}
+
+// moveReference moves vm from the VM lists of src to that of dst, publishing each change.
+func (vm *VirtualMachine) moveReference(ctx *Context, src []types.ManagedObjectReference, dst types.ManagedObjectReference) {
+	for _, ref := range src {
+		if ref != dst {
+			obj := ctx.Map.Get(ref)
+			ctx.Map.RemoveReference(ctx, obj, vmList(obj), vm.Self)
+		}
+	}
+	obj := ctx.Map.Get(dst)
+	ctx.Map.AddReference(ctx, obj, vmList(obj), vm.Self)
+}
+
 func (vm *VirtualMachine) RelocateVMTask(ctx *Context, req *types.RelocateVM_Task) soap.HasFault {
 	task := CreateTask(vm, "relocateVm", func(t *Task) (types.AnyType, types.BaseMethodFault) {
 		var changes []types.PropertyChange
@@ -3292,8 +3319,7 @@ func (vm *VirtualMachine) RelocateVMTask(ctx *Context, req *types.RelocateVM_Tas
 		}
 
 		if ref := req.Spec.Datastore; ref != nil {
-			ds := ctx.Map.Get(*ref).(*Datastore)
-			ctx.Map.RemoveReference(ctx, ds, &ds.Vm, *ref)
+			vm.moveReference(ctx, vm.Datastore, *ref)
 
 			// TODO: migrate vm.Config.Files, vm.Summary.Config.VmPathName, vm.Layout and vm.LayoutEx
 
@@ -3301,15 +3327,15 @@ func (vm *VirtualMachine) RelocateVMTask(ctx *Context, req *types.RelocateVM_Tas
 		}
 
 		if ref := req.Spec.Pool; ref != nil {
-			pool := ctx.Map.Get(*ref).(*ResourcePool)
-			ctx.Map.RemoveReference(ctx, pool, &pool.Vm, *ref)
+			if vm.ResourcePool != nil {
+				vm.moveReference(ctx, []types.ManagedObjectReference{*vm.ResourcePool}, *ref)
+			}
 
 			changes = append(changes, types.PropertyChange{Name: "resourcePool", Val: ref})
 		}
 
 		if ref := req.Spec.Host; ref != nil {
-			host := ctx.Map.Get(*ref).(*HostSystem)
-			ctx.Map.RemoveReference(ctx, host, &host.Vm, *ref)
+			vm.moveReference(ctx, []types.ManagedObjectReference{*vm.Runtime.Host}, *ref)
 
 			changes = append(changes,
 				types.PropertyChange{Name: "runtime.host", Val: ref},
