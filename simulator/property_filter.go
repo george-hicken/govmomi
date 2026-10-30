@@ -70,14 +70,31 @@ func (f *PropertyFilter) collect(ctx *Context) (*types.RetrieveResult, types.Bas
 	return collect(ctx, req)
 }
 
-func (f *PropertyFilter) update(ctx *Context) {
+// update re-syncs the tracked refs after a traversal object changed and returns the refs that
+// left the filter. As vCenter does, the caller reports only the difference: a leave for each
+// returned ref, and an enter (via apply) for each object that joined; the rest stay as they are.
+func (f *PropertyFilter) update(ctx *Context) []types.ManagedObjectReference {
 	if !f.sync.CompareAndSwap(true, false) {
-		return
+		return nil
 	}
+	var left []types.ManagedObjectReference
 	ctx.WithLock(f, func() {
-		clear(f.refs)
-		_, _ = f.collect(ctx)
+		res, fault := f.collect(ctx)
+		if fault != nil {
+			return
+		}
+		current := make(map[types.ManagedObjectReference]struct{}, len(res.Objects))
+		for _, o := range res.Objects {
+			current[o.Obj] = struct{}{}
+		}
+		for ref := range f.refs {
+			if _, ok := current[ref]; !ok {
+				delete(f.refs, ref)
+				left = append(left, ref)
+			}
+		}
 	})
+	return left
 }
 
 // matches returns the PropertyChanges the filter reports for change: one for

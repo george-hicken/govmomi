@@ -966,8 +966,10 @@ func (pc *PropertyCollector) WaitForUpdatesEx(ctx *Context, r *types.WaitForUpda
 
 			for _, f := range pc.Filter {
 				filter := ctx.Session.Get(f).(*PropertyFilter)
-				filter.update(ctx)
 				fu := types.PropertyFilterUpdate{Filter: f}
+				for _, ref := range filter.update(ctx) {
+					fu.ObjectSet = append(fu.ObjectSet, types.ObjectUpdate{Obj: ref, Kind: types.ObjectUpdateKindLeave})
+				}
 
 				for _, update := range updates {
 					switch update.Kind {
