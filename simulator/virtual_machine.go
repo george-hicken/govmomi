@@ -2640,6 +2640,10 @@ func (c *powerVMTask) Run(task *Task) (types.AnyType, types.BaseMethodFault) {
 			return nil, new(types.InvalidState)
 		}
 
+		if fault := c.VirtualMachine.diskAccessFault(c.ctx, c.ctx.Map.Get(*c.VirtualMachine.Runtime.Host).(*HostSystem)); fault != nil {
+			return nil, fault
+		}
+
 		if fault := c.ctx.Map.VMRules.apply(c.ctx, c.VirtualMachine, VMRulePhasePowerOn); fault != nil {
 			return nil, fault
 		}
@@ -3279,6 +3283,13 @@ func copyNonEmptyValue[T comparable](dst, src *T) {
 func (vm *VirtualMachine) RelocateVMTask(ctx *Context, req *types.RelocateVM_Task) soap.HasFault {
 	task := CreateTask(vm, "relocateVm", func(t *Task) (types.AnyType, types.BaseMethodFault) {
 		var changes []types.PropertyChange
+
+		// A running VM moved to another host keeps running there, so that host must reach its disks.
+		if ref := req.Spec.Host; ref != nil && req.Spec.Datastore == nil && vm.Runtime.PowerState == types.VirtualMachinePowerStatePoweredOn {
+			if fault := vm.diskAccessFault(ctx, ctx.Map.Get(*ref).(*HostSystem)); fault != nil {
+				return nil, fault
+			}
+		}
 
 		if ref := req.Spec.Datastore; ref != nil {
 			ds := ctx.Map.Get(*ref).(*Datastore)
