@@ -1518,6 +1518,27 @@ var vmwOUI = net.HardwareAddr([]byte{0x0, 0xc, 0x29})
 // > The host generates generateMAC addresses that consists of the VMware OUI 00:0C:29 and the last three octets in hexadecimal
 // > format of the virtual machine UUID.  The virtual machine UUID is based on a hash calculated by using the UUID of the
 // > ESXi physical machine and the path to the configuration file (.vmx) of the virtual machine.
+// nicLabel returns the label vSphere gives a vNIC: an edit keeps the old vNIC's label, and a
+// new vNIC takes "Network adapter N" with the lowest N no other vNIC in devices holds.
+func nicLabel(devices object.VirtualDeviceList, oldDevice types.BaseVirtualDevice) string {
+	if old, ok := oldDevice.(types.BaseVirtualEthernetCard); ok {
+		if info := old.GetVirtualEthernetCard().DeviceInfo; info != nil && info.GetDescription().Label != "" {
+			return info.GetDescription().Label
+		}
+	}
+	used := map[string]bool{}
+	for _, nic := range devices.SelectByType((*types.VirtualEthernetCard)(nil)) {
+		if info := nic.GetVirtualDevice().DeviceInfo; info != nil {
+			used[info.GetDescription().Label] = true
+		}
+	}
+	for n := 1; ; n++ {
+		if label := fmt.Sprintf("Network adapter %d", n); !used[label] {
+			return label
+		}
+	}
+}
+
 func (vm *VirtualMachine) generateMAC(unit int32) string {
 	id := []byte(vm.Config.Uuid)
 
@@ -1672,6 +1693,11 @@ func (vm *VirtualMachine) configureDevice(
 	switch x := device.(type) {
 	case types.BaseVirtualEthernetCard:
 		controller = devices.PickController((*types.VirtualPCIController)(nil))
+		if d.UnitNumber == nil {
+			// vSphere places every vNIC in a PCI slot, so a vNIC always has a unit number.
+			devices.AssignController(device, controller)
+		}
+		label = nicLabel(devices, oldDevice)
 		var net types.ManagedObjectReference
 		var name string
 
@@ -1785,9 +1811,6 @@ func (vm *VirtualMachine) configureDevice(
 			c.MacAddress = old.GetVirtualEthernetCard().MacAddress
 		}
 		if c.MacAddress == "" {
-			if c.UnitNumber == nil {
-				devices.AssignController(device, controller)
-			}
 			c.MacAddress = vm.generateMAC(*c.UnitNumber - 7) // Note 7 == PCI offset
 		}
 
