@@ -311,7 +311,6 @@ func (svm *simVM) syncNetworkConfigToVMGuestProperties(ctx *Context, out []byte,
 		if live {
 			guestNics = topoNICs
 		} else {
-			nicIndex := int32(0)
 			for networkName, netSettings := range detail.NetworkSettings.Networks {
 				if netSettings.IPAddress == "" {
 					continue
@@ -321,7 +320,7 @@ func (svm *simVM) syncNetworkConfigToVMGuestProperties(ctx *Context, out []byte,
 					IpAddress:      []string{netSettings.IPAddress},
 					MacAddress:     netSettings.MacAddress,
 					Connected:      true,
-					DeviceConfigId: nicIndex,
+					DeviceConfigId: nicDeviceConfigID(svm.vm, netSettings.MacAddress),
 					IpConfig: &types.NetIpConfigInfo{
 						IpAddress: []types.NetIpConfigInfoIpAddress{{
 							IpAddress:    netSettings.IPAddress,
@@ -331,7 +330,6 @@ func (svm *simVM) syncNetworkConfigToVMGuestProperties(ctx *Context, out []byte,
 					},
 				}
 				guestNics = append(guestNics, nic)
-				nicIndex++
 			}
 
 			if len(guestNics) == 0 && primaryNet.IPAddress != "" {
@@ -340,7 +338,7 @@ func (svm *simVM) syncNetworkConfigToVMGuestProperties(ctx *Context, out []byte,
 					IpAddress:      []string{primaryNet.IPAddress},
 					MacAddress:     primaryNet.MacAddress,
 					Connected:      true,
-					DeviceConfigId: 0,
+					DeviceConfigId: nicDeviceConfigID(svm.vm, primaryNet.MacAddress),
 					IpConfig: &types.NetIpConfigInfo{
 						IpAddress: []types.NetIpConfigInfoIpAddress{{
 							IpAddress:    primaryNet.IPAddress,

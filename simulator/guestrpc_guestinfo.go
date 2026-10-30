@@ -58,6 +58,19 @@ func (s *guestRPCServer) setGuestInfo(ctx *Context, args string) string {
 	return "1 "
 }
 
+// nicDeviceConfigID returns the guest.net deviceConfigId for a guest NIC with mac: the device
+// key of vm's vNIC with that MAC, or -1 when no vNIC has it.
+func nicDeviceConfigID(vm *VirtualMachine, mac string) int32 {
+	for _, device := range vm.Config.Hardware.Device {
+		if card, ok := device.(types.BaseVirtualEthernetCard); ok {
+			if c := card.GetVirtualEthernetCard(); strings.EqualFold(c.MacAddress, mac) {
+				return c.Key
+			}
+		}
+	}
+	return -1
+}
+
 // applyGuestNicInfo sets vm's guest network identity from the guest's own
 // report, as hostd does from vmtoolsd's nicinfo. guest.net has one entry per
 // virtual NIC, in device order, filled from the guest NIC with the same MAC,
