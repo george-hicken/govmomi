@@ -503,17 +503,20 @@ func FindReference(refs []types.ManagedObjectReference, match ...types.ManagedOb
 
 // AppendReference appends the given refs to field.
 func (r *Registry) AppendReference(ctx *Context, obj mo.Reference, field *[]types.ManagedObjectReference, ref ...types.ManagedObjectReference) {
-	r.WithLock(ctx, obj, func() {
+	r.updateField(ctx, obj, field, func() bool {
 		*field = append(*field, ref...)
+		return len(ref) != 0
 	})
 }
 
 // AddReference appends ref to field if not already in the given field.
 func (r *Registry) AddReference(ctx *Context, obj mo.Reference, field *[]types.ManagedObjectReference, ref types.ManagedObjectReference) {
-	r.WithLock(ctx, obj, func() {
-		if FindReference(*field, ref) == nil {
-			*field = append(*field, ref)
+	r.updateField(ctx, obj, field, func() bool {
+		if FindReference(*field, ref) != nil {
+			return false
 		}
+		*field = append(*field, ref)
+		return true
 	})
 }
 
@@ -529,20 +532,87 @@ func RemoveReference(field *[]types.ManagedObjectReference, ref types.ManagedObj
 
 // RemoveReference removes ref from the given field.
 func (r *Registry) RemoveReference(ctx *Context, obj mo.Reference, field *[]types.ManagedObjectReference, ref types.ManagedObjectReference) {
-	r.WithLock(ctx, obj, func() {
+	r.updateField(ctx, obj, field, func() bool {
+		n := len(*field)
 		RemoveReference(field, ref)
+		return len(*field) != n
 	})
 }
 
 func (r *Registry) removeString(ctx *Context, obj mo.Reference, field *[]string, val string) {
+	r.updateField(ctx, obj, field, func() bool {
+		i := slices.Index(*field, val)
+		if i < 0 {
+			return false
+		}
+		*field = slices.Delete(*field, i, i+1)
+		return true
+	})
+}
+
+// updateField runs mutate on field, a slice field of obj, under obj's lock. When mutate reports
+// a change, the field's new value goes through Update, so property collectors and watchers see
+// it as vSphere would. A field that is not part of obj's managed object is mutated silently.
+func (r *Registry) updateField(ctx *Context, obj mo.Reference, field any, mutate func() bool) {
+	var changed bool
+	var val reflect.Value
 	r.WithLock(ctx, obj, func() {
-		for i, name := range *field {
-			if name == val {
-				*field = append((*field)[:i], (*field)[i+1:]...)
-				break
-			}
+		if changed = mutate(); changed {
+			v := reflect.ValueOf(field).Elem()
+			val = reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+			reflect.Copy(val, v)
 		}
 	})
+	if !changed {
+		return
+	}
+	// Callers may pass an embedded view of the registered object, such as the
+	// *mo.ComputeResource inside a ClusterComputeResource; update the object itself.
+	if o := r.Get(obj.Reference()); o != nil {
+		obj = o
+	}
+	name := propertyPath(getManagedObject(obj), reflect.ValueOf(field).Pointer())
+	if name == "" {
+		return
+	}
+	r.Update(ctx, obj, []types.PropertyChange{{Name: name, Val: val.Interface()}})
+}
+
+// propertyPath returns the property path of the field at address addr within the managed
+// object v (for example "vm" or "summary.vm"), or "" when v holds no such field.
+func propertyPath(v reflect.Value, addr uintptr) string {
+	t := v.Type()
+	for i := range t.NumField() {
+		f, fv := t.Field(i), v.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		name := propertyName(f)
+		if fv.Kind() == reflect.Slice && fv.Addr().Pointer() == addr {
+			return name
+		}
+		if fv.Kind() != reflect.Struct {
+			continue
+		}
+		if sub := propertyPath(fv, addr); sub != "" {
+			if f.Anonymous {
+				return sub
+			}
+			return name + "." + sub
+		}
+	}
+	return ""
+}
+
+// propertyName is a struct field's vSphere property name: the json tag in package mo, the
+// xml tag in package types.
+func propertyName(f reflect.StructField) string {
+	for _, key := range []string{"json", "xml"} {
+		if tag, _, _ := strings.Cut(f.Tag.Get(key), ","); tag != "" && tag != "-" {
+			return tag
+		}
+	}
+	return strings.ToLower(f.Name[:1]) + f.Name[1:]
 }
 
 func (r *Registry) content() types.ServiceContent {
