@@ -115,6 +115,12 @@ type Model struct {
 	// Name prefix: RP, vcsim flag: -pool
 	Pool int `json:"pool"`
 
+	// MoIDBase offsets the numeric suffix of generated MoIDs: the first reference Create allocates
+	// is MoIDBase+1 (for example "host-1000001" for 1000000). The default 0 is unchanged behaviour.
+	// Several models in one process can use disjoint bases so a reference sent to the wrong
+	// instance fails with ManagedObjectNotFound instead of resolving to a different object.
+	MoIDBase int64 `json:"-"`
+
 	// Datastore specifies the number of Datastore entities to create
 	// Each Datastore will have temporary local file storage and will be mounted
 	// on every HostSystem created by the ModelConfig
@@ -492,6 +498,7 @@ func (m *Model) Load(dir string) error {
 // Create populates the Model with the given ModelConfig
 func (m *Model) Create() error {
 	ctx := NewContext()
+	ctx.Map.counter = m.MoIDBase
 	m.Service = New(NewServiceInstance(ctx, m.ServiceContent, m.RootFolder))
 	if err := m.createRootTempDir(ctx.Map.OptionManager()); err != nil {
 		return err
