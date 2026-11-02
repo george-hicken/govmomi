@@ -132,7 +132,7 @@ import (
 // With RUN.vmci=true the guest can also read and write guestinfo while it runs.
 // vcsim serves GuestRPC on a Unix socket mounted at /run/vmware/rpc.sock, names
 // it in $VMX_RPC_SOCK, and mounts the govmomi toolbox binary at
-// /usr/bin/vmware-rpctool unless a RUN.volume already targets that path; see
+// /usr/bin/vmware-rpctool, from ToolboxEnv, unless a RUN.volume already targets that path; see
 // VmciToolboxBinaryPath to mount it as vmtoolsd as well. The guest may read
 // guestinfo.* keys and write those without "/". A write changes
 // config.extraConfig at once and is reported by PropertyCollector.
@@ -722,7 +722,7 @@ func (svm *simVM) start(ctx *Context) error {
 		env = append(env, toolbox.UnixSocketEnv+"="+toolbox.UnixSocketPath)
 
 		if !hasVolumeDest(svm.vm.Config.ExtraConfig, rpctoolPath) {
-			if bin, err := buildToolbox(); err != nil {
+			if bin, err := VmciToolboxBinary(); err != nil {
 				log.Printf("%s: %s not mounted: %s", svm.vm.Name, rpctoolPath, err)
 			} else {
 				volumes = append(volumes, bin+":"+rpctoolPath+":ro")

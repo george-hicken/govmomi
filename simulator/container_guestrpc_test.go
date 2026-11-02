@@ -10,7 +10,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -51,15 +53,37 @@ func buildVMCISystemdInitImage(t *testing.T) {
 	require.NoError(t, vmciSystemdInitErr, "docker build %s", vmciSystemdInitImage)
 }
 
-// toolboxBinary returns the toolbox binary RUN.vmci mounts, failing the test
-// if it cannot be built.
+// toolboxBinary returns the toolbox binary RUN.vmci mounts and sets ToolboxEnv
+// to it for t. It uses the caller's ToolboxEnv when set, and otherwise builds
+// the toolbox into t.TempDir from the package directory, which go test makes
+// the working directory.
 func toolboxBinary(t *testing.T) string {
 	t.Helper()
 
-	path, err := buildToolbox()
+	path := os.Getenv(ToolboxEnv)
+	if path == "" {
+		path = filepath.Join(t.TempDir(), "toolbox")
+		cmd := exec.Command("go", "build", "-o", path, "../toolbox/toolbox")
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux")
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "toolbox build\n%s", out)
+	}
+	t.Setenv(ToolboxEnv, path)
+
+	path, err := VmciToolboxBinary()
 	require.NoError(t, err)
 
 	return path
+}
+
+// hasVMCI reports whether extraConfig sets RUN.vmci=true.
+func hasVMCI(extraConfig []types.BaseOptionValue) bool {
+	for _, o := range extraConfig {
+		if v := o.GetOptionValue(); v.Key == "RUN.vmci" && v.Value == "true" {
+			return true
+		}
+	}
+	return false
 }
 
 // powerOnContainerVM creates a VM with extraConfig and powers it on.
@@ -70,6 +94,9 @@ func powerOnContainerVM(t *testing.T, env *vcSimEnv, name string, extraConfig ..
 		Name:        name,
 		Files:       &types.VirtualMachineFileInfo{VmPathName: "[LocalDS_0] " + name},
 		ExtraConfig: extraConfig,
+	}
+	if hasVMCI(extraConfig) {
+		toolboxBinary(t)
 	}
 	require.NoError(t, test.ApplyContainerRuntimeDefaults(&spec))
 
