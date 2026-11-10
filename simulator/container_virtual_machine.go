@@ -401,6 +401,12 @@ func (svm *simVM) prepareGuestOperation(auth types.BaseGuestAuthentication) type
 		}
 	}
 
+	// Guest operations are served by the tools in the guest, so vCenter
+	// refuses them while the tools are not running.
+	if svm.vm.Guest == nil || svm.vm.Guest.ToolsRunningStatus != string(types.VirtualMachineToolsRunningStatusGuestToolsRunning) {
+		return new(types.GuestOperationsUnavailable)
+	}
+
 	switch creds := auth.(type) {
 	case *types.NamePasswordAuthentication:
 		if creds.Username == "" || creds.Password == "" {
@@ -1168,7 +1174,7 @@ func (svm *simVM) exec(ctx *Context, auth types.BaseGuestAuthentication, args []
 
 func guestUpload(id string, file string, r *http.Request) error {
 	// TODO: decide behaviour for no container
-	err := copyToGuest(id, file, r.ContentLength, r.Body)
+	err := copyToGuest(id, file, r.ContentLength, guestFileAttributesFrom(r.URL.Query()), r.Body)
 	_ = r.Body.Close()
 	return err
 }

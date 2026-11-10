@@ -51,15 +51,17 @@ type GuestFileManager struct {
 	mo.GuestFileManager
 }
 
-func guestURL(ctx *Context, vm *VirtualMachine, path string) string {
+func guestURL(ctx *Context, vm *VirtualMachine, path string, attr guestFileAttributes) string {
+	query := url.Values{
+		"id":    []string{vm.svm.c.id},
+		"token": []string{ctx.Session.Key},
+	}
+	attr.addTo(query)
 	return (&url.URL{
-		Scheme: ctx.svc.Listen.Scheme,
-		Host:   "*", // See guest.FileManager.TransferURL
-		Path:   guestPrefix + strings.TrimPrefix(path, "/"),
-		RawQuery: url.Values{
-			"id":    []string{vm.svm.c.id},
-			"token": []string{ctx.Session.Key},
-		}.Encode(),
+		Scheme:   ctx.svc.Listen.Scheme,
+		Host:     "*", // See guest.FileManager.TransferURL
+		Path:     guestPrefix + strings.TrimPrefix(path, "/"),
+		RawQuery: query.Encode(),
 	}).String()
 }
 
@@ -74,7 +76,7 @@ func (m *GuestFileManager) InitiateFileTransferToGuest(ctx *Context, req *types.
 	}
 
 	body.Res = &types.InitiateFileTransferToGuestResponse{
-		Returnval: guestURL(ctx, vm, req.GuestFilePath),
+		Returnval: guestURL(ctx, vm, req.GuestFilePath, posixFileAttributes(req.FileAttributes)),
 	}
 
 	return body
@@ -94,7 +96,7 @@ func (m *GuestFileManager) InitiateFileTransferFromGuest(ctx *Context, req *type
 		Returnval: types.FileTransferInformation{
 			Attributes: nil, // TODO
 			Size:       0,   // TODO
-			Url:        guestURL(ctx, vm, req.GuestFilePath),
+			Url:        guestURL(ctx, vm, req.GuestFilePath, guestFileAttributes{}),
 		},
 	}
 

@@ -170,7 +170,7 @@ type tarEntry struct {
 // From https://docs.docker.com/engine/reference/commandline/cp/ :
 // > It is not possible to copy certain system files such as resources under /proc, /sys, /dev, tmpfs, and mounts created by the user in the container.
 // > However, you can still copy such files by manually running tar in docker exec.
-func copyToGuest(id string, dest string, length int64, reader io.Reader) error {
+func copyToGuest(id string, dest string, length int64, attr guestFileAttributes, reader io.Reader) error {
 	cmd := exec.Command("docker", "exec", "-i", id, "tar", "Cxf", path.Dir(dest), "-")
 	cmd.Stderr = os.Stderr
 	stdin, err := cmd.StdinPipe()
@@ -184,12 +184,7 @@ func copyToGuest(id string, dest string, length int64, reader io.Reader) error {
 	}
 
 	tw := tar.NewWriter(stdin)
-	_ = tw.WriteHeader(&tar.Header{
-		Name:    path.Base(dest),
-		Size:    length,
-		Mode:    0444,
-		ModTime: time.Now(),
-	})
+	_ = tw.WriteHeader(attr.tarHeader(path.Base(dest), length))
 
 	_, err = io.Copy(tw, reader)
 
