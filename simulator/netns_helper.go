@@ -36,7 +36,54 @@ type netnsRequest struct {
 // netnsResponse precedes the file descriptor, which travels as SCM_RIGHTS ancillary data.
 type netnsResponse struct {
 	Error string `json:"error,omitempty"`
+	// Errno and Timeout carry the failure's kind across the socket, so the host side returns the
+	// error a direct dial or listen would: an *net.OpError over the syscall errno, or a timeout.
+	Errno   int  `json:"errno,omitempty"`
+	Timeout bool `json:"timeout,omitempty"`
 }
+
+// setErr records err in resp: its text, and its errno or timeout when it has one.
+func (resp *netnsResponse) setErr(err error) {
+	if err == nil {
+		return
+	}
+	resp.Error = err.Error()
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		resp.Errno = int(errno)
+	}
+	var ne net.Error
+	resp.Timeout = errors.As(err, &ne) && ne.Timeout()
+}
+
+// err is the error resp describes, as a direct op would return it, or nil.
+func (resp netnsResponse) err(op, addr string) error {
+	if resp.Error == "" {
+		return nil
+	}
+	sysOp := map[string]string{"dial": "connect", "listen": "bind"}[op]
+	switch {
+	case resp.Errno != 0 && sysOp != "":
+		return &net.OpError{Op: op, Net: "tcp", Addr: netnsAddr(addr), Err: os.NewSyscallError(sysOp, syscall.Errno(resp.Errno))}
+	case resp.Timeout:
+		return &net.OpError{Op: op, Net: "tcp", Addr: netnsAddr(addr), Err: netnsTimeout(resp.Error)}
+	default:
+		return errors.New(resp.Error)
+	}
+}
+
+// netnsAddr is a net.Addr naming a request's address, for the rebuilt *net.OpError.
+type netnsAddr string
+
+func (a netnsAddr) Network() string { return "tcp" }
+func (a netnsAddr) String() string  { return string(a) }
+
+// netnsTimeout is a timeout reported by the helper; it satisfies net.Error.
+type netnsTimeout string
+
+func (t netnsTimeout) Error() string   { return string(t) }
+func (t netnsTimeout) Timeout() bool   { return true }
+func (t netnsTimeout) Temporary() bool { return true }
 
 // init makes any binary that imports this package a netns helper when the container runtime re-executes it as
 // one, before main or TestMain runs. Without the environment variable it does nothing.
@@ -99,9 +146,13 @@ func serveNetnsRequest(c *net.UnixConn) (shutdown bool) {
 	var resp netnsResponse
 	switch req.Op {
 	case "listen":
-		f, resp.Error = listenFile(req.Addr)
+		var err error
+		f, err = listenFile(req.Addr)
+		resp.setErr(err)
 	case "dial":
-		f, resp.Error = dialFile(req.Addr)
+		var err error
+		f, err = dialFile(req.Addr)
+		resp.setErr(err)
 	case "shutdown":
 		shutdown = true
 	default:
@@ -125,33 +176,25 @@ func serveNetnsRequest(c *net.UnixConn) (shutdown bool) {
 }
 
 // listenFile binds a TCP listener in the helper's namespace and returns a dup of its descriptor.
-func listenFile(addr string) (*os.File, string) {
+func listenFile(addr string) (*os.File, error) {
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
-		return nil, err.Error()
+		return nil, err
 	}
 	defer func() { _ = l.Close() }()
 
-	f, err := l.(*net.TCPListener).File()
-	if err != nil {
-		return nil, err.Error()
-	}
-	return f, ""
+	return l.(*net.TCPListener).File()
 }
 
 // dialFile connects to addr from the helper's namespace and returns a dup of the connection's descriptor.
-func dialFile(addr string) (*os.File, string) {
+func dialFile(addr string) (*os.File, error) {
 	conn, err := net.DialTimeout("tcp", addr, netnsDialTimeout)
 	if err != nil {
-		return nil, err.Error()
+		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
 
-	f, err := conn.(*net.TCPConn).File()
-	if err != nil {
-		return nil, err.Error()
-	}
-	return f, ""
+	return conn.(*net.TCPConn).File()
 }
 
 // netnsHelper is the host-side client of a helper running in a router's namespace.
@@ -220,8 +263,8 @@ func (h *netnsHelper) request(req netnsRequest) (*os.File, error) {
 	if err := json.Unmarshal(buf[:n], &resp); err != nil {
 		return nil, fmt.Errorf("netns helper %s: %w", req.Op, err)
 	}
-	if resp.Error != "" {
-		return nil, fmt.Errorf("netns helper %s %s: %s", req.Op, req.Addr, resp.Error)
+	if err := resp.err(req.Op, req.Addr); err != nil {
+		return nil, fmt.Errorf("netns helper %s %s: %w", req.Op, req.Addr, err)
 	}
 
 	msgs, err := syscall.ParseSocketControlMessage(oob[:oobn])
