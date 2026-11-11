@@ -15,7 +15,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -55,11 +54,11 @@ import (
 //     adapted from kind. Without it the container shares the host's cgroup
 //     namespace.
 //   - guestinfo.userdata: its machine-agent volumeMounts present the disk
-//     attached at each pcidevice's SCSI bus and unit as its content directory,
-//     bind-mounted at the mount point (replacing a RUN.nestedVolumes anonymous
-//     volume there), with the systemd .mount unit for it; see
-//     machineAgentConf. A change of the VM's disks applies at its next
-//     power-on.
+//     attached at each pcidevice's SCSI unit as its content directory,
+//     mounted at the mount point (over a RUN.nestedVolumes anonymous volume
+//     there), with the systemd .mount unit for it; see machineAgentConf. The
+//     container sees only that directory. It is presented after each start
+//     and on each attach or detach.
 //   - RUN.nestedVolumes (default ["/var"]): with RUN.nestedContainers, the
 //     container paths to mount as anonymous volumes, as a JSON array of
 //     absolute paths. An anonymous volume copies the image's content under it
@@ -220,12 +219,11 @@ type simVM struct {
 	// which must find the detect-virt shim it mounts.
 	vmwareVirt bool
 
-	// diskMounted is the disks the container was created with, as volumes; see diskMountPoints.
-	// diskLive is the set the running container presents, which presentDisks keeps current.
-	// diskStage is the datastore directories staged for it, none when the guest asks for no disks.
-	diskMounted []diskMount
-	diskLive    []diskMount
-	diskStage   []diskStage
+	// diskLive is the set the running container presents, which presentDisks keeps current;
+	// see diskMountPoints.
+	// diskUnits is the unit files presentDisks wrote, which outlive a stop.
+	diskLive  []diskMount
+	diskUnits []string
 }
 
 // createSimulationVM inspects the provided VirtualMachine and creates a simVM binding for it if
@@ -502,21 +500,6 @@ func (svm *simVM) start(ctx *Context) error {
 		return nil
 	}
 
-	if svm.c != nil && svm.c.id != "" && svm.diskStage == nil {
-		// Without staged datastores the mounts cannot change under the container, so disks changed
-		// since create need a new one.
-		mounts, err := svm.vm.diskMounts(ctx)
-		if err != nil {
-			return fmt.Errorf("%s: %w", svm.vm.Name, err)
-		}
-		if !slices.Equal(mounts, svm.diskMounted) {
-			if err := svm.remove(ctx); err != nil {
-				return err
-			}
-			svm.c = nil
-		}
-	}
-
 	if svm.c != nil && svm.c.id != "" {
 		// config.uuid may have been reconfigured while the VM was off.
 		if err := svm.writeMachineID(); err != nil {
@@ -727,22 +710,6 @@ func (svm *simVM) start(ctx *Context) error {
 	}
 	volumes = append(volumes, extraVolumes...)
 
-	mounts, err := svm.vm.diskMounts(ctx)
-	if err != nil {
-		return fmt.Errorf("%s: %w", svm.vm.Name, err)
-	}
-	diskVolumes, err := diskMountVolumes(mounts, func(name, content string) (string, error) {
-		return hostShim(name, content, 0644)
-	})
-	if err != nil {
-		return fmt.Errorf("%s: %w", svm.vm.Name, err)
-	}
-	volumes = append(volumes, diskVolumes...)
-	for _, m := range mounts {
-		// The disk replaces the anonymous volume the mount point would get.
-		nestedVolumes = slices.DeleteFunc(nestedVolumes, func(v string) bool { return v == m.dest })
-	}
-
 	if vmwareVirt {
 		mounts, err := virtMounts(svm.vm.Config.ExtraConfig)
 		if err != nil {
@@ -751,13 +718,7 @@ func (svm *simVM) start(ctx *Context) error {
 		volumes = append(volumes, mounts...)
 	}
 	svm.vmwareVirt = vmwareVirt
-	svm.diskMounted, svm.diskLive = mounts, mounts
-	if points, _ := diskMountPoints(svm.vm.Config.ExtraConfig); len(points) != 0 {
-		svm.diskStage = diskStages(ctx)
-		for _, s := range svm.diskStage {
-			volumes = append(volumes, s.volume())
-		}
-	}
+	svm.diskLive, svm.diskUnits = nil, nil
 
 	if mountMachineID {
 		mounts, err := svm.carryBIOSUUID(selectBIOSUUIDCarrier())
@@ -846,6 +807,11 @@ func (svm *simVM) start(ctx *Context) error {
 
 	svm.updateToolsStatus(ctx, false)
 
+	if err = svm.presentDisks(ctx); err != nil {
+		log.Printf("%s %s: %s", svm.vm.Name, "disks", err)
+		return err
+	}
+
 	if err = svm.addSubNICs(nics); err != nil {
 		log.Printf("%s %s: %s", svm.vm.Name, "sub-interfaces", err)
 		return err
@@ -931,8 +897,8 @@ func (svm *simVM) stop(ctx *Context) error {
 
 		return err
 	}
-	// Mounts made in the namespace are gone; those passed as volumes at create remain.
-	svm.diskLive = svm.diskMounted
+	// Mounts made in the namespace are gone.
+	svm.diskLive = nil
 
 	ctx.Update(svm.vm, toolsNotRunning)
 

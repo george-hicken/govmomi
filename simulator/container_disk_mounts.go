@@ -253,17 +253,3 @@ func contentDir(ctx *Context, disk *types.VirtualDisk) (string, error) {
 	dir := ds.resolve(ctx, rel)
 	return dir, os.MkdirAll(dir, 0o755)
 }
-
-// volumes returns the container volume arguments presenting ms: the disk
-// directory at its mount point and its unit file, written by write.
-func diskMountVolumes(ms []diskMount, write func(name, content string) (string, error)) ([]string, error) {
-	var vols []string
-	for _, m := range ms {
-		unit, err := write(systemdMountUnit(m.dest), m.mountUnit())
-		if err != nil {
-			return nil, err
-		}
-		vols = append(vols, m.source+":"+m.dest, unit+":"+m.unitPath()+":ro")
-	}
-	return vols, nil
-}

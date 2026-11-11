@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -91,22 +92,6 @@ func TestDiskMountPoints(t *testing.T) {
 	}
 }
 
-func TestDiskMountVolumes(t *testing.T) {
-	var units []string
-	vols, err := diskMountVolumes([]diskMount{{source: "/d/x.d", dest: "/var/lib/etcd"}}, func(name, content string) (string, error) {
-		units = append(units, name)
-		require.Contains(t, content, "What=/d/x.d\n")
-		require.Contains(t, content, "Where=/var/lib/etcd\n")
-		return "/tmp/" + name, nil
-	})
-	require.NoError(t, err)
-	require.Equal(t, []string{"var-lib-etcd.mount"}, units)
-	require.Equal(t, []string{
-		"/d/x.d:/var/lib/etcd",
-		"/tmp/var-lib-etcd.mount:/etc/systemd/system/var-lib-etcd.mount:ro",
-	}, vols)
-}
-
 // TestVMDiskMounts: an attached FCD at the named bus and unit is presented as
 // its content directory, other units are not, and detach removes it.
 func TestVMDiskMounts(t *testing.T) {
@@ -143,9 +128,9 @@ func TestVMDiskMounts(t *testing.T) {
 }
 
 // TestContainerVM_DiskMount checks that a disk attached at the named bus and
-// unit reaches the guest as its content directory with the guest's .mount
-// unit, in place of the anonymous volume, and that detach undoes both at the
-// next power-on.
+// unit before power-on reaches the guest as its content directory with the
+// guest's .mount unit, and that detach while stopped undoes both at the next
+// power-on.
 func TestContainerVM_DiskMount(t *testing.T) {
 	test.RequireContainerOptIn(t)
 	if !test.HasDocker() {
@@ -165,7 +150,7 @@ func TestContainerVM_DiskMount(t *testing.T) {
 	_, err = dockerExec(env.goCtx, cid, "sh", "-c", "echo x > /var/lib/etcd/probe")
 	require.NoError(t, err)
 	var dir string
-	env.simCtx.WithLock(svm, func() { dir = svm.svm.diskMounted[0].source })
+	env.simCtx.WithLock(svm, func() { dir = svm.svm.diskLive[0].source })
 	require.FileExists(t, filepath.Join(dir, "probe"))
 
 	powerOff(t, env, vm)
@@ -204,16 +189,7 @@ func diskContainerSetup(t *testing.T, name string) (env *vcSimEnv, vm *object.Vi
 	require.NoError(t, task.Wait(env.goCtx))
 
 	ds := env.simCtx.Map.Any("Datastore").(*Datastore)
-	res, err := methods.CreateDisk_Task(env.goCtx, env.client.Client, &types.CreateDisk_Task{
-		This: *env.client.ServiceContent.VStorageObjectManager,
-		Spec: types.VslmCreateSpec{Name: "etcd", CapacityInMB: 10, BackingSpec: &types.VslmCreateSpecDiskFileBackingSpec{
-			VslmCreateSpecBackingSpec: types.VslmCreateSpecBackingSpec{Datastore: ds.Self},
-		}},
-	})
-	require.NoError(t, err)
-	info, err := object.NewTask(env.client.Client, res.Returnval).WaitForResult(env.goCtx)
-	require.NoError(t, err)
-	id = info.Result.(types.VStorageObject).Config.Id
+	id = createFCDOn(t, env, ds, "etcd")
 	attach = func() {
 		unit := int32(1)
 		require.NoError(t, vm.AttachDisk(env.goCtx, id.Id, object.NewDatastore(env.client.Client, ds.Self), 0, &unit))
@@ -221,8 +197,24 @@ func diskContainerSetup(t *testing.T, name string) (env *vcSimEnv, vm *object.Vi
 	return env, vm, svm, id, attach
 }
 
+// createFCDOn creates a first class disk on ds.
+func createFCDOn(t *testing.T, env *vcSimEnv, ds *Datastore, name string) types.ID {
+	t.Helper()
+	res, err := methods.CreateDisk_Task(env.goCtx, env.client.Client, &types.CreateDisk_Task{
+		This: *env.client.ServiceContent.VStorageObjectManager,
+		Spec: types.VslmCreateSpec{Name: name, CapacityInMB: 10, BackingSpec: &types.VslmCreateSpecDiskFileBackingSpec{
+			VslmCreateSpecBackingSpec: types.VslmCreateSpecBackingSpec{Datastore: ds.Self},
+		}},
+	})
+	require.NoError(t, err)
+	info, err := object.NewTask(env.client.Client, res.Returnval).WaitForResult(env.goCtx)
+	require.NoError(t, err)
+	return info.Result.(types.VStorageObject).Config.Id
+}
+
 // TestContainerVM_DiskHotAttach: a disk attached or detached while the container runs reaches the
-// guest at once, with its unit; and after a stop it is presented again at the next start.
+// guest at once, with its unit; after a stop it is presented again at the next start; a disk on a
+// datastore made after the container is presented; and the guest sees nothing else of the datastore.
 func TestContainerVM_DiskHotAttach(t *testing.T) {
 	env, vm, svm, id, attach := diskContainerSetup(t, "disk-hot")
 	unitFile := "/etc/systemd/system/var-lib-etcd.mount"
@@ -262,8 +254,30 @@ func TestContainerVM_DiskHotAttach(t *testing.T) {
 	powerOn(t, env, vm)
 	present(containerID(t, env, svm))
 
+	cid = containerID(t, env, svm)
+	ds := env.simCtx.Map.Any("Datastore").(*Datastore)
+	require.NoError(t, os.WriteFile(filepath.Join(ds.Path(), "other-vm-secret"), nil, 0o644))
+	out, err := dockerExec(env.goCtx, cid, "sh", "-c", "find / -name other-vm-secret 2>/dev/null; ls -d /.vcsim 2>/dev/null; ls /var/lib/etcd")
+	require.NoError(t, err)
+	require.Equal(t, "probe", out, "the guest sees the disk's directory and no other datastore content")
+
 	require.NoError(t, vm.DetachDisk(env.goCtx, id.Id))
 	absent(containerID(t, env, svm))
+
+	// A datastore made after the container was created.
+	late := t.TempDir()
+	hs := env.simCtx.Map.Get(*svm.Runtime.Host).(*HostSystem)
+	_, err = methods.CreateLocalDatastore(env.goCtx, env.client.Client, &types.CreateLocalDatastore{
+		This: *hs.ConfigManager.DatastoreSystem, Name: "late-" + t.Name(), Path: late,
+	})
+	require.NoError(t, err)
+	lateDS := env.simCtx.Map.FindByName("late-"+t.Name(), hs.Datastore).(*Datastore)
+	lateID := createFCDOn(t, env, lateDS, "late")
+	unit := int32(1)
+	require.NoError(t, vm.AttachDisk(env.goCtx, lateID.Id, object.NewDatastore(env.client.Client, lateDS.Self), 0, &unit))
+	present(cid)
+	require.NoError(t, vm.DetachDisk(env.goCtx, lateID.Id))
+	absent(cid)
 	powerOff(t, env, vm)
 }
 
@@ -289,20 +303,16 @@ func TestDiskPlan(t *testing.T) {
 	require.Empty(t, remove)
 }
 
-func TestStaged(t *testing.T) {
-	stages := []diskStage{{"/ds/one", "/.vcsim/ds/0"}, {"/ds/two/", "/.vcsim/ds/1"}}
-	got, ok := staged(stages, "/ds/two/fcd/x.d")
-	require.True(t, ok)
-	require.Equal(t, "/.vcsim/ds/1/fcd/x.d", got)
-	_, ok = staged(stages, "/ds/onex/y")
-	require.False(t, ok, "a sibling with the same prefix is not under the datastore")
+func TestDiskTreeHelperUsage(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux only")
+	}
+	require.Error(t, diskTreeHelper([]string{"1"}))
 }
 
-func TestMountPoint(t *testing.T) {
-	points := map[scsiSlot]string{{3, 1}: "/var/lib/etcd"}
-	got, ok := mountPoint(points, 1)
-	require.True(t, ok, "bus 3 in the guest matches a controller at bus number 0")
-	require.Equal(t, "/var/lib/etcd", got)
-	_, ok = mountPoint(points, 2)
-	require.False(t, ok)
+func TestStaleUnits(t *testing.T) {
+	a, b := diskMount{source: "/d/a.d", dest: "/a"}, diskMount{source: "/d/b.d", dest: "/b"}
+	require.Equal(t, []string{b.unitPath()}, staleUnits([]string{a.unitPath(), b.unitPath()}, []diskMount{a}))
+	require.Empty(t, staleUnits([]string{a.unitPath()}, []diskMount{{source: "/d/a2.d", dest: "/a"}}), "same mount point, same unit")
+	require.Empty(t, staleUnits(nil, []diskMount{a}))
 }

@@ -10,42 +10,9 @@ import (
 	"path"
 	"slices"
 	"strconv"
-	"strings"
 
 	"github.com/vmware/govmomi/vim25/types"
 )
-
-// diskStageDir is where a container sees each datastore's host directory, so that
-// a disk attached while it runs can be bound from there: the source of a mount made
-// in the container's namespace must be visible in it.
-const diskStageDir = "/.vcsim/ds"
-
-// diskStage is a datastore host directory staged at guest in the container.
-type diskStage struct{ host, guest string }
-
-// diskStages returns the datastore directories of ctx staged for a VM whose
-// guest asks for disk mounts.
-func diskStages(ctx *Context) []diskStage {
-	var stages []diskStage
-	for i, e := range ctx.Map.All("Datastore") {
-		if ds, ok := e.(*Datastore); ok {
-			stages = append(stages, diskStage{ds.Path(), path.Join(diskStageDir, strconv.Itoa(i))})
-		}
-	}
-	return stages
-}
-
-func (s diskStage) volume() string { return s.host + ":" + s.guest }
-
-// staged returns where the container sees source, a directory under one of stages.
-func staged(stages []diskStage, source string) (string, bool) {
-	for _, s := range stages {
-		if rel, ok := strings.CutPrefix(source, strings.TrimSuffix(s.host, "/")+"/"); ok {
-			return path.Join(s.guest, rel), true
-		}
-	}
-	return "", false
-}
 
 // diskPlan returns the mounts to add and to remove to turn the presented set have into want.
 // A mount point whose source changed is removed and added.
@@ -63,6 +30,14 @@ func diskPlan(have, want []diskMount) (add, remove []diskMount) {
 	return add, remove
 }
 
+// staleUnits returns the unit files in written that no disk of want has. Unit files are written
+// to the container's filesystem, which a stop keeps, unlike its mounts.
+func staleUnits(written []string, want []diskMount) []string {
+	return slices.DeleteFunc(slices.Clone(written), func(u string) bool {
+		return slices.ContainsFunc(want, func(m diskMount) bool { return m.unitPath() == u })
+	})
+}
+
 // containerPID returns the PID that owns the container's namespaces.
 func (svm *simVM) containerPID() (int, error) {
 	out, err := podmanOutput("inspect", "--format", "{{.State.Pid}}", svm.c.id)
@@ -78,8 +53,8 @@ func (svm *simVM) containerPID() (int, error) {
 
 // presentDisks makes the container's mounts the VM's current disk set, in the running container's
 // mount namespace, so a disk attached or detached while it runs, or while it was stopped, reaches
-// the guest without a power cycle. It is the one place that presents the set after create, where
-// the set is passed as volumes instead.
+// the guest without a power cycle. It is the one place that presents disks: at power-on, after the
+// container's PID exists, and on each change. Only a disk's own directory enters the container.
 //
 // Mounts made this way last until the container stops; start presents the set again.
 func (svm *simVM) presentDisks(ctx *Context) error {
@@ -88,7 +63,8 @@ func (svm *simVM) presentDisks(ctx *Context) error {
 		return err
 	}
 	add, remove := diskPlan(svm.diskLive, want)
-	if len(add) == 0 && len(remove) == 0 {
+	stale := staleUnits(svm.diskUnits, want)
+	if len(add) == 0 && len(remove) == 0 && len(stale) == 0 {
 		return nil
 	}
 	pid, err := svm.containerPID()
@@ -104,25 +80,17 @@ func (svm *simVM) presentDisks(ctx *Context) error {
 		if err := run("", "umount", m.dest); err != nil {
 			return err
 		}
-		if slices.Contains(svm.diskMounted, m) {
-			// The create-time unit is a bind mount of a host file.
-			if err := run("", "umount", m.unitPath()); err != nil {
-				return err
-			}
-		}
-		if err := run("", "rm", "-f", m.unitPath()); err != nil {
+	}
+	for _, u := range stale {
+		if err := run("", "rm", "-f", u); err != nil {
 			return err
 		}
 	}
 	for _, m := range add {
-		src, ok := staged(svm.diskStage, m.source)
-		if !ok {
-			return fmt.Errorf("disk %s is under no staged datastore", m.source)
-		}
 		if err := run("", "mkdir", "-p", m.dest, path.Dir(m.unitPath())); err != nil {
 			return err
 		}
-		if err := run("", "mount", "--bind", src, m.dest); err != nil {
+		if err := mountTree(pid, m.source, m.dest); err != nil {
 			return err
 		}
 		if err := run(m.mountUnit(), "tee", m.unitPath()); err != nil {
@@ -130,6 +98,10 @@ func (svm *simVM) presentDisks(ctx *Context) error {
 		}
 	}
 	svm.diskLive = want
+	svm.diskUnits = nil
+	for _, m := range want {
+		svm.diskUnits = append(svm.diskUnits, m.unitPath())
+	}
 
 	// Units changed, so a running systemd must reload them; it then adopts the bind mounts.
 	if _, err := svm.c.exec(ctx, []string{"test", "-d", "/run/systemd/system"}); err == nil {
@@ -142,6 +114,6 @@ func (svm *simVM) presentDisks(ctx *Context) error {
 
 // livePresent reports whether a disk change must reach the container now.
 func (svm *simVM) livePresent() bool {
-	return svm != nil && svm.c != nil && svm.c.id != "" && svm.diskStage != nil &&
+	return svm != nil && svm.c != nil && svm.c.id != "" &&
 		svm.vm.Runtime.PowerState == types.VirtualMachinePowerStatePoweredOn
 }
