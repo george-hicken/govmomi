@@ -200,19 +200,22 @@ func diskMountPoints(text []byte) (map[scsiSlot]string, error) {
 		if f.Path != machineAgentConf {
 			continue
 		}
+		// The conf is a MachineConfig object; its volumeMounts are under spec.
 		var conf struct {
-			VolumeMounts []struct {
-				MountPoint string `yaml:"mountPoint"`
-				PCIDevice  *struct {
-					Bus    int32 `yaml:"bus"`
-					Target int32 `yaml:"target"`
-				} `yaml:"pcidevice"`
-			} `yaml:"volumeMounts"`
+			Spec struct {
+				VolumeMounts []struct {
+					MountPoint string `yaml:"mountPoint"`
+					PCIDevice  *struct {
+						Bus    int32 `yaml:"bus"`
+						Target int32 `yaml:"target"`
+					} `yaml:"pcidevice"`
+				} `yaml:"volumeMounts"`
+			} `yaml:"spec"`
 		}
 		if err := yaml.Unmarshal([]byte(f.Content), &conf); err != nil {
 			return nil, fmt.Errorf("%s: %w", machineAgentConf, err)
 		}
-		for _, m := range conf.VolumeMounts {
+		for _, m := range conf.Spec.VolumeMounts {
 			if m.PCIDevice == nil {
 				continue
 			}

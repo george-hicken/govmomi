@@ -41,7 +41,7 @@ func TestSystemdMountUnit(t *testing.T) {
 // userdataFor returns cloud-config user-data whose machine-agent conf holds
 // one volumeMount, in the named encoding.
 func userdataFor(t *testing.T, encoding, mountPoint string, bus, target int) []types.BaseOptionValue {
-	conf := fmt.Sprintf("volumeMounts:\n- mountPoint: %s\n  pcidevice:\n    bus: %d\n    target: %d\n", mountPoint, bus, target)
+	conf := fmt.Sprintf("apiVersion: cluster.kubernetes.vmware.com/v1alpha1\nkind: MachineConfig\nspec:\n  volumeMounts:\n  - mountPoint: %s\n    pcidevice:\n      bus: %d\n      target: %d\n", mountPoint, bus, target)
 	cc, err := yaml.Marshal(map[string]any{"write_files": []map[string]any{
 		{"path": "/etc/other", "content": "volumeMounts:\n- mountPoint: /elsewhere\n  pcidevice: {bus: 0, target: 9}\n"},
 		{"path": machineAgentConf, "content": conf},
@@ -349,7 +349,7 @@ func TestVMDiskMountsCloudinitPrep(t *testing.T) {
 			&types.OptionValue{Key: userdataEncodingKey, Value: "gzip+base64"})
 
 		cc, err := yaml.Marshal(map[string]any{"write_files": []map[string]any{
-			{"path": machineAgentConf, "content": "volumeMounts:\n- mountPoint: /var/lib/etcd\n  pcidevice: {bus: 3, target: 1}\n"},
+			{"path": machineAgentConf, "content": "apiVersion: cluster.kubernetes.vmware.com/v1alpha1\nkind: MachineConfig\nspec:\n  volumeMounts:\n  - mountPoint: /var/lib/etcd\n    pcidevice: {bus: 3, target: 1}\n"},
 		}})
 		require.NoError(t, err)
 		obj := object.NewVirtualMachine(e.c, vm.Self)
