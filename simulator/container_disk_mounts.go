@@ -5,26 +5,34 @@
 package simulator
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/vim25/types"
 )
 
-// diskMountKeyPrefix starts the ExtraConfig keys that name where a container
-// VM's disk appears in the guest: RUN.diskMount.<bus>:<unit> = <mount point>.
-// The guest cannot mount a block device rootless, so a disk attached at that
-// controller bus and unit is presented as its content directory, bind-mounted
-// at the mount point, with the systemd .mount unit the guest's tooling expects
-// for it. The mount is made when the container is created, so a change of the
-// VM's disks takes effect at its next power-on.
-const diskMountKeyPrefix = "RUN.diskMount."
+// machineAgentConf is the cloud-config write_files path of the machine-agent
+// configuration, the guest's own statement of where each disk is mounted. Only
+// this file is read: it is the one product source of volumeMounts, and any
+// other file's volumeMounts would not be an instruction to the guest.
+const machineAgentConf = "/run/machine-agent/conf"
+
+// The guestinfo keys carrying the cloud-config user-data and its encoding.
+const (
+	userdataKey         = "guestinfo.userdata"
+	userdataEncodingKey = "guestinfo.userdata.encoding"
+)
 
 // diskMount is one disk presented to the guest.
 type diskMount struct {
@@ -76,27 +84,91 @@ func (m diskMount) unitPath() string {
 	return "/etc/systemd/system/" + systemdMountUnit(m.dest)
 }
 
-// diskMountPoints parses the diskMountKeyPrefix keys of extraConfig into the
-// mount point of each "<bus>:<unit>".
-func diskMountPoints(extraConfig []types.BaseOptionValue) (map[string]string, error) {
-	points := map[string]string{}
+// scsiSlot is a disk's place on a SCSI controller: the controller's bus number
+// and the disk's unit number. machine-agent's volumeMounts name it as
+// pcidevice{bus, target}.
+type scsiSlot struct{ bus, unit int32 }
+
+// extraConfigValue returns the string value of key in extraConfig.
+func extraConfigValue(extraConfig []types.BaseOptionValue, key string) string {
 	for _, opt := range extraConfig {
-		v := opt.GetOptionValue()
-		slot, ok := strings.CutPrefix(v.Key, diskMountKeyPrefix)
-		if !ok {
+		if v := opt.GetOptionValue(); v.Key == key {
+			return fmt.Sprint(v.Value)
+		}
+	}
+	return ""
+}
+
+// decodeUserdata returns the user-data text, decoded as encoding names:
+// "base64", "gzip+base64" (also "gzip, base64"), or plain when empty.
+func decodeUserdata(data, encoding string) ([]byte, error) {
+	switch strings.ReplaceAll(strings.ToLower(strings.TrimSpace(encoding)), " ", "") {
+	case "":
+		return []byte(data), nil
+	case "base64":
+		return base64.StdEncoding.DecodeString(data)
+	case "gzip+base64", "gzip,base64":
+		raw, err := base64.StdEncoding.DecodeString(data)
+		if err != nil {
+			return nil, err
+		}
+		zr, err := gzip.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		defer zr.Close()
+		return io.ReadAll(zr)
+	}
+	return nil, fmt.Errorf("unsupported encoding %q", encoding)
+}
+
+// diskMountPoints returns the mount point of each SCSI slot that the VM's
+// guest user-data gives machine-agent in its volumeMounts. A VM without
+// user-data, or whose user-data has no machine-agent configuration, has none.
+func diskMountPoints(extraConfig []types.BaseOptionValue) (map[scsiSlot]string, error) {
+	data := extraConfigValue(extraConfig, userdataKey)
+	if data == "" {
+		return nil, nil
+	}
+	text, err := decodeUserdata(data, extraConfigValue(extraConfig, userdataEncodingKey))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", userdataKey, err)
+	}
+	var cloudConfig struct {
+		WriteFiles []struct {
+			Path    string `yaml:"path"`
+			Content string `yaml:"content"`
+		} `yaml:"write_files"`
+	}
+	if err := yaml.Unmarshal(text, &cloudConfig); err != nil {
+		return nil, fmt.Errorf("%s: %w", userdataKey, err)
+	}
+
+	points := map[scsiSlot]string{}
+	for _, f := range cloudConfig.WriteFiles {
+		if f.Path != machineAgentConf {
 			continue
 		}
-		bus, unit, ok := strings.Cut(slot, ":")
-		if _, e1 := strconv.Atoi(bus); !ok || e1 != nil {
-			return nil, fmt.Errorf("%s: want <bus>:<unit>", v.Key)
+		var conf struct {
+			VolumeMounts []struct {
+				MountPoint string `yaml:"mountPoint"`
+				PCIDevice  *struct {
+					Bus    int32 `yaml:"bus"`
+					Target int32 `yaml:"target"`
+				} `yaml:"pcidevice"`
+			} `yaml:"volumeMounts"`
 		}
-		if _, err := strconv.Atoi(unit); err != nil {
-			return nil, fmt.Errorf("%s: want <bus>:<unit>", v.Key)
+		if err := yaml.Unmarshal([]byte(f.Content), &conf); err != nil {
+			return nil, fmt.Errorf("%s: %w", machineAgentConf, err)
 		}
-		if dest := fmt.Sprint(v.Value); path.IsAbs(dest) && path.Clean(dest) != "/" {
-			points[slot] = path.Clean(dest)
-		} else {
-			return nil, fmt.Errorf("%s: %q is not an absolute mount point", v.Key, dest)
+		for _, m := range conf.VolumeMounts {
+			if m.PCIDevice == nil {
+				continue
+			}
+			if !path.IsAbs(m.MountPoint) || path.Clean(m.MountPoint) == "/" {
+				return nil, fmt.Errorf("%s: %q is not an absolute mount point", machineAgentConf, m.MountPoint)
+			}
+			points[scsiSlot{m.PCIDevice.Bus, m.PCIDevice.Target}] = path.Clean(m.MountPoint)
 		}
 	}
 	return points, nil
@@ -114,18 +186,18 @@ func (vm *VirtualMachine) diskMounts(ctx *Context) ([]diskMount, error) {
 	var mounts []diskMount
 	for _, d := range devices.SelectByType((*types.VirtualDisk)(nil)) {
 		disk := d.(*types.VirtualDisk)
-		ctrl, ok := devices.FindByKey(disk.ControllerKey).(types.BaseVirtualController)
+		ctrl, ok := devices.FindByKey(disk.ControllerKey).(types.BaseVirtualSCSIController)
 		if !ok || disk.UnitNumber == nil {
 			continue
 		}
-		slot := fmt.Sprintf("%d:%d", ctrl.GetVirtualController().BusNumber, *disk.UnitNumber)
+		slot := scsiSlot{ctrl.GetVirtualSCSIController().BusNumber, *disk.UnitNumber}
 		dest, ok := points[slot]
 		if !ok {
 			continue
 		}
 		dir, err := contentDir(ctx, disk)
 		if err != nil {
-			return nil, fmt.Errorf("disk %s: %w", slot, err)
+			return nil, fmt.Errorf("disk %d:%d: %w", slot.bus, slot.unit, err)
 		}
 		mounts = append(mounts, diskMount{source: dir, dest: dest})
 	}

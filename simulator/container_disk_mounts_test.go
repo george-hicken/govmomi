@@ -5,6 +5,10 @@
 package simulator
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/base64"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/test"
@@ -32,19 +37,57 @@ func TestSystemdMountUnit(t *testing.T) {
 	require.Equal(t, "-.mount", systemdMountUnit("/"))
 }
 
-func TestDiskMountPoints(t *testing.T) {
-	opt := func(k, v string) types.BaseOptionValue { return &types.OptionValue{Key: k, Value: v} }
-
-	got, err := diskMountPoints([]types.BaseOptionValue{opt("RUN.diskMount.0:1", "/var/lib/etcd/"), opt("RUN.container", "x")})
+// userdataFor returns cloud-config user-data whose machine-agent conf holds
+// one volumeMount, in the named encoding.
+func userdataFor(t *testing.T, encoding, mountPoint string, bus, target int) []types.BaseOptionValue {
+	conf := fmt.Sprintf("volumeMounts:\n- mountPoint: %s\n  pcidevice:\n    bus: %d\n    target: %d\n", mountPoint, bus, target)
+	cc, err := yaml.Marshal(map[string]any{"write_files": []map[string]any{
+		{"path": "/etc/other", "content": "volumeMounts:\n- mountPoint: /elsewhere\n  pcidevice: {bus: 0, target: 9}\n"},
+		{"path": machineAgentConf, "content": conf},
+	}})
 	require.NoError(t, err)
-	require.Equal(t, map[string]string{"0:1": "/var/lib/etcd"}, got)
+	data := string(cc)
+	switch encoding {
+	case "base64":
+		data = base64.StdEncoding.EncodeToString(cc)
+	case "gzip+base64":
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		_, err := zw.Write(cc)
+		require.NoError(t, err)
+		require.NoError(t, zw.Close())
+		data = base64.StdEncoding.EncodeToString(buf.Bytes())
+	}
+	return []types.BaseOptionValue{
+		&types.OptionValue{Key: userdataKey, Value: data},
+		&types.OptionValue{Key: userdataEncodingKey, Value: encoding},
+	}
+}
 
-	for _, bad := range []types.BaseOptionValue{
-		opt("RUN.diskMount.1", "/a"), opt("RUN.diskMount.x:1", "/a"), opt("RUN.diskMount.0:y", "/a"),
-		opt("RUN.diskMount.0:1", "rel"), opt("RUN.diskMount.0:1", "/"),
+func TestDiskMountPoints(t *testing.T) {
+	for _, enc := range []string{"", "base64", "gzip+base64"} {
+		got, err := diskMountPoints(userdataFor(t, enc, "/var/lib/etcd/", 3, 1))
+		require.NoError(t, err, enc)
+		require.Equal(t, map[scsiSlot]string{{3, 1}: "/var/lib/etcd"}, got, enc)
+	}
+
+	none, err := diskMountPoints(nil)
+	require.NoError(t, err)
+	require.Empty(t, none)
+	none, err = diskMountPoints([]types.BaseOptionValue{&types.OptionValue{Key: userdataKey, Value: "runcmd: [true]\n"}})
+	require.NoError(t, err)
+	require.Empty(t, none, "user-data without machine-agent conf")
+
+	for name, opts := range map[string][]types.BaseOptionValue{
+		"relative": userdataFor(t, "", "rel", 3, 1),
+		"root":     userdataFor(t, "", "/", 3, 1),
+		"bad encoding": {&types.OptionValue{Key: userdataKey, Value: "x"},
+			&types.OptionValue{Key: userdataEncodingKey, Value: "rot13"}},
+		"bad gzip": {&types.OptionValue{Key: userdataKey, Value: "eA=="},
+			&types.OptionValue{Key: userdataEncodingKey, Value: "gzip+base64"}},
 	} {
-		_, err := diskMountPoints([]types.BaseOptionValue{bad})
-		require.Error(t, err, bad)
+		_, err := diskMountPoints(opts)
+		require.Error(t, err, name)
 	}
 }
 
@@ -71,7 +114,7 @@ func TestVMDiskMounts(t *testing.T) {
 		vm := e.vm(0)
 		ctx := registryContext(e.model.Map())
 		vm.Config.ExtraConfig = append(vm.Config.ExtraConfig,
-			&types.OptionValue{Key: diskMountKeyPrefix + "0:1", Value: "/var/lib/etcd"})
+			userdataFor(t, "gzip+base64", "/var/lib/etcd", 0, 1)...)
 
 		none, err := vm.diskMounts(ctx)
 		require.NoError(t, err)
@@ -110,10 +153,11 @@ func TestContainerVM_DiskMount(t *testing.T) {
 	}
 
 	env := newVCSIMEnv(t)
-	vm, svm := createContainerVM(t, env, "disk-mount", "",
+	extra := append([]types.BaseOptionValue{
 		&types.OptionValue{Key: "RUN.nestedContainers", Value: "true"},
 		&types.OptionValue{Key: "RUN.nestedVolumes", Value: `["/var/lib/etcd"]`},
-		&types.OptionValue{Key: diskMountKeyPrefix + "0:1", Value: "/var/lib/etcd"})
+	}, userdataFor(t, "gzip+base64", "/var/lib/etcd", 0, 1)...)
+	vm, svm := createContainerVM(t, env, "disk-mount", "", extra...)
 
 	ctrl, err := object.VirtualDeviceList(nil).CreateSCSIController("pvscsi")
 	require.NoError(t, err)

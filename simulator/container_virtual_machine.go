@@ -54,11 +54,12 @@ import (
 //     each path of RUN.nestedVolumes, /lib/modules read-only and /dev/fuse,
 //     adapted from kind. Without it the container shares the host's cgroup
 //     namespace.
-//   - RUN.diskMount.<bus>:<unit> = <mount point>: present the disk attached at
-//     that SCSI bus and unit as its content directory, bind-mounted at the
-//     mount point (replacing a RUN.nestedVolumes anonymous volume there), with
-//     the systemd .mount unit for it; see diskMountKeyPrefix. A change of the
-//     VM's disks applies at its next power-on.
+//   - guestinfo.userdata: its machine-agent volumeMounts present the disk
+//     attached at each pcidevice's SCSI bus and unit as its content directory,
+//     bind-mounted at the mount point (replacing a RUN.nestedVolumes anonymous
+//     volume there), with the systemd .mount unit for it; see
+//     machineAgentConf. A change of the VM's disks applies at its next
+//     power-on.
 //   - RUN.nestedVolumes (default ["/var"]): with RUN.nestedContainers, the
 //     container paths to mount as anonymous volumes, as a JSON array of
 //     absolute paths. An anonymous volume copies the image's content under it
@@ -219,7 +220,7 @@ type simVM struct {
 	// which must find the detect-virt shim it mounts.
 	vmwareVirt bool
 
-	// diskMounted is the disks the container was created with; see diskMountKeyPrefix.
+	// diskMounted is the disks the container was created with; see diskMountPoints.
 	diskMounted []diskMount
 }
 
