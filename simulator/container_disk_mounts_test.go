@@ -299,10 +299,10 @@ func TestStaged(t *testing.T) {
 }
 
 func TestMountPoint(t *testing.T) {
-	points := map[scsiSlot]string{{0, 1}: "/var/lib/etcd"}
-	got, ok := mountPoint(points, 0, 1)
-	require.True(t, ok)
+	points := map[scsiSlot]string{{3, 1}: "/var/lib/etcd"}
+	got, ok := mountPoint(points, 1)
+	require.True(t, ok, "bus 3 in the guest matches a controller at bus number 0")
 	require.Equal(t, "/var/lib/etcd", got)
-	_, ok = mountPoint(points, 0, 2)
+	_, ok = mountPoint(points, 2)
 	require.False(t, ok)
 }

@@ -89,20 +89,13 @@ func (m diskMount) unitPath() string {
 // pcidevice{bus, target}.
 type scsiSlot struct{ bus, unit int32 }
 
-// busMatches reports whether the guest's pcidevice bus names the controller
-// with the given BusNumber.
-//
-// PENDING: the guest's bus is a PCI bus that vm-operator derives from the
-// controller (inferred: slotInfo.pciSlotNumber 160 gives 3), not its
-// BusNumber. Until that mapping is established this compares them directly,
-// so the one place to change is here.
-func busMatches(guestBus, ctrlBus int32) bool { return guestBus == ctrlBus }
-
-// mountPoint returns the mount point points names for the disk at ctrl's bus
-// and unit.
-func mountPoint(points map[scsiSlot]string, ctrlBus, unit int32) (string, bool) {
+// mountPoint returns the mount point points names for the disk at unit, ignoring the guest's bus.
+// This mirrors machine-agent (spec 9524 O-9524-15), which ignores pcidevice.Bus and resolves
+// /dev/disk/by-path/pci-<PVSCSI address>-scsi-0:0:<target>:0 from the target alone; the kubernetes-service
+// mutator's bus 3 against vm-operator's controllerBusNumber 0 is a cross-component misalignment it masks.
+func mountPoint(points map[scsiSlot]string, unit int32) (string, bool) {
 	for slot, dest := range points {
-		if slot.unit == unit && busMatches(slot.bus, ctrlBus) {
+		if slot.unit == unit {
 			return dest, true
 		}
 	}
@@ -203,26 +196,38 @@ func (vm *VirtualMachine) diskMounts(ctx *Context) ([]diskMount, error) {
 	}
 
 	devices := object.VirtualDeviceList(vm.Config.Hardware.Device)
+	ctrlKey := pvscsiController(devices)
 	var mounts []diskMount
 	for _, d := range devices.SelectByType((*types.VirtualDisk)(nil)) {
 		disk := d.(*types.VirtualDisk)
-		ctrl, ok := devices.FindByKey(disk.ControllerKey).(types.BaseVirtualSCSIController)
-		if !ok || disk.UnitNumber == nil {
+		if disk.ControllerKey != ctrlKey || disk.UnitNumber == nil {
 			continue
 		}
-		bus := ctrl.GetVirtualSCSIController().BusNumber
-		dest, ok := mountPoint(points, bus, *disk.UnitNumber)
+		dest, ok := mountPoint(points, *disk.UnitNumber)
 		if !ok {
 			continue
 		}
 		dir, err := contentDir(ctx, disk)
 		if err != nil {
-			return nil, fmt.Errorf("disk %d:%d: %w", bus, *disk.UnitNumber, err)
+			return nil, fmt.Errorf("disk unit %d: %w", *disk.UnitNumber, err)
 		}
 		mounts = append(mounts, diskMount{source: dir, dest: dest})
 	}
 	sort.Slice(mounts, func(i, j int) bool { return mounts[i].dest < mounts[j].dest })
 	return mounts, nil
+}
+
+// pvscsiController returns the key of the PVSCSI controller machine-agent resolves disks on, or 0.
+// With several, the lowest bus number is taken (inference: the sim presents one PVSCSI address).
+func pvscsiController(devices object.VirtualDeviceList) int32 {
+	var key, bus int32 = 0, -1
+	for _, d := range devices.SelectByType((*types.ParaVirtualSCSIController)(nil)) {
+		c := d.(*types.ParaVirtualSCSIController)
+		if bus < 0 || c.BusNumber < bus {
+			key, bus = c.Key, c.BusNumber
+		}
+	}
+	return key
 }
 
 // contentDir returns, creating it, the directory that holds disk's content:
