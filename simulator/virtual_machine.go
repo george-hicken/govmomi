@@ -45,9 +45,7 @@ type VirtualMachine struct {
 	uid uuid.UUID
 	imc *types.CustomizationSpec
 
-	// appliedUserdata is the user-data, by CloudinitPrep or guestinfo, last delivered to the guest.
-	appliedUserdata string
-	// diskNoted records the disk units whose absence from the guest user-data was logged.
+	// diskNoted records the devices whose disks were logged as not presented to the guest.
 	diskNoted map[int32]bool
 }
 
@@ -1839,6 +1837,8 @@ func (vm *VirtualMachine) configureDevice(
 				}
 			}
 		}
+	case *types.ParaVirtualSCSIController:
+		placePVSCSI(devices, x)
 	case *types.VirtualDisk:
 		if oldDevice == nil {
 			// NOTE: either of capacityInBytes and capacityInKB may not be specified
@@ -3546,9 +3546,6 @@ func (vm *VirtualMachine) customize(ctx *Context) types.BaseMethodFault {
 		changes = append(changes, types.PropertyChange{Name: "summary.guest.ipAddress", Val: address})
 	}
 
-	if prep, ok := vm.imcIdentity(); ok {
-		vm.appliedUserdata = cloudinitUserdata(prep)
-	}
 	vm.imc = nil
 	changes = append(changes, types.PropertyChange{
 		Name: "guest.customizationInfo",

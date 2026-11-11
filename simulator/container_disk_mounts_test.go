@@ -5,19 +5,13 @@
 package simulator
 
 import (
-	"bytes"
-	"compress/gzip"
-	"encoding/base64"
-	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v3"
 
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/test"
@@ -25,149 +19,138 @@ import (
 	"github.com/vmware/govmomi/vim25/types"
 )
 
-func TestSystemdMountUnit(t *testing.T) {
-	for _, p := range []string{"/var/lib/etcd", "/mnt/a-b", "/data//x/", "/with space", "/.hidden/x", "/a_b:c.d"} {
-		got := systemdMountUnit(p)
-		if bin, err := exec.LookPath("systemd-escape"); err == nil {
-			want, err := exec.Command(bin, "--path", "--suffix=mount", p).Output()
-			require.NoError(t, err)
-			require.Equal(t, strings.TrimSpace(string(want)), got, p)
-		}
-	}
-	require.Equal(t, "var-lib-etcd.mount", systemdMountUnit("/var/lib/etcd"))
-	require.Equal(t, "-.mount", systemdMountUnit("/"))
-}
-
-// userdataFor returns cloud-config user-data whose machine-agent conf holds
-// one volumeMount, in the named encoding.
-func userdataFor(t *testing.T, encoding, mountPoint string, bus, target int) []types.BaseOptionValue {
-	conf := fmt.Sprintf("apiVersion: cluster.kubernetes.vmware.com/v1alpha1\nkind: MachineConfig\nspec:\n  volumeMounts:\n  - mountPoint: %s\n    pcidevice:\n      bus: %d\n      target: %d\n", mountPoint, bus, target)
-	cc, err := yaml.Marshal(map[string]any{"write_files": []map[string]any{
-		{"path": "/etc/other", "content": "volumeMounts:\n- mountPoint: /elsewhere\n  pcidevice: {bus: 0, target: 9}\n"},
-		{"path": machineAgentConf, "content": conf},
-	}})
-	require.NoError(t, err)
-	data := string(cc)
-	switch encoding {
-	case "base64":
-		data = base64.StdEncoding.EncodeToString(cc)
-	case "gzip+base64":
-		var buf bytes.Buffer
-		zw := gzip.NewWriter(&buf)
-		_, err := zw.Write(cc)
-		require.NoError(t, err)
-		require.NoError(t, zw.Close())
-		data = base64.StdEncoding.EncodeToString(buf.Bytes())
-	}
-	return []types.BaseOptionValue{
-		&types.OptionValue{Key: userdataKey, Value: data},
-		&types.OptionValue{Key: userdataEncodingKey, Value: encoding},
-	}
-}
-
-func mustGuestinfo(t *testing.T, opts []types.BaseOptionValue) []byte {
-	t.Helper()
-	text, err := guestinfoUserdata(opts)
-	require.NoError(t, err)
-	return text
-}
-
-// The placeholder a rolled Supervisor VM carries in guestinfo is no user-data.
-func TestGuestinfoUserdataPlaceholder(t *testing.T) {
-	text, err := guestinfoUserdata([]types.BaseOptionValue{
-		&types.OptionValue{Key: userdataKey, Value: "---"},
-		&types.OptionValue{Key: userdataEncodingKey, Value: "gzip+base64"},
-	})
-	require.NoError(t, err)
-	require.Empty(t, text)
-}
-
-func TestDiskMountPoints(t *testing.T) {
-	for _, enc := range []string{"", "base64", "gzip+base64"} {
-		got, err := diskMountPoints(mustGuestinfo(t, userdataFor(t, enc, "/var/lib/etcd/", 3, 1)))
-		require.NoError(t, err, enc)
-		require.Equal(t, map[scsiSlot]string{{3, 1}: "/var/lib/etcd"}, got, enc)
-	}
-
-	none, err := diskMountPoints(nil)
-	require.NoError(t, err)
-	require.Empty(t, none)
-	none, err = diskMountPoints([]byte("runcmd: [true]\n"))
-	require.NoError(t, err)
-	require.Empty(t, none, "user-data without machine-agent conf")
-
-	for name, opts := range map[string][]types.BaseOptionValue{
-		"relative": userdataFor(t, "", "rel", 3, 1),
-		"root":     userdataFor(t, "", "/", 3, 1),
-		"bad encoding": {&types.OptionValue{Key: userdataKey, Value: "x"},
-			&types.OptionValue{Key: userdataEncodingKey, Value: "rot13"}},
-		"bad gzip": {&types.OptionValue{Key: userdataKey, Value: "eA=="},
-			&types.OptionValue{Key: userdataEncodingKey, Value: "gzip+base64"}},
+func TestGuestPCIAddress(t *testing.T) {
+	for slot, want := range map[int32]string{
+		16:           "0000:00:10.0", // root bus
+		160:          "0000:03:00.0", // pciBridge4, the first PVSCSI
+		192:          "0000:0b:00.0", // pciBridge5
+		224:          "0000:13:00.0", // pciBridge6
+		256:          "0000:1b:00.0", // pciBridge7
+		1<<10 | 160:  "0000:04:00.0", // pciBridge4 function 1
+		160 + 3:      "0000:03:03.0",
+		2<<10 | 6<<5: "0000:0d:00.0", // pciBridge5 function 2
 	} {
-		text, err := guestinfoUserdata(opts)
-		if err == nil {
-			_, err = diskMountPoints(text)
+		got, err := guestPCIAddress(slot)
+		require.NoError(t, err, slot)
+		require.Equal(t, want, got, slot)
+	}
+	_, err := guestPCIAddress(1 << 5)
+	require.Error(t, err, "no guest bus is known behind pciBridge0")
+}
+
+func TestDiskByPath(t *testing.T) {
+	require.Equal(t, "/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:1:0", diskByPath("0000:03:00.0", 1))
+	require.Equal(t, "/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:f:0", diskByPath("0000:03:00.0", 15), "unit in hex")
+}
+
+// TestPlacePVSCSI: a PVSCSI controller added without a slot gets the first free ESX default; a
+// slot the spec sets is kept.
+func TestPlacePVSCSI(t *testing.T) {
+	testFCD(t, func(e *fcdEnv) {
+		vm := e.vm(0)
+		ctx := registryContext(e.model.Map())
+		add := func(slot types.BaseVirtualDeviceBusSlotInfo) {
+			t.Helper()
+			ctrl, err := object.VirtualDeviceList(nil).CreateSCSIController("pvscsi")
+			require.NoError(t, err)
+			ctrl.GetVirtualDevice().SlotInfo = slot
+			ctx.WithLock(vm, func() {
+				require.Nil(t, vm.configureDevices(ctx, &types.VirtualMachineConfigSpec{DeviceChange: []types.BaseVirtualDeviceConfigSpec{
+					&types.VirtualDeviceConfigSpec{Operation: types.VirtualDeviceConfigSpecOperationAdd, Device: ctrl},
+				}}))
+			})
 		}
-		require.Error(t, err, name)
+		slots := func() []int32 {
+			var s []int32
+			for _, d := range object.VirtualDeviceList(vm.Config.Hardware.Device).SelectByType((*types.ParaVirtualSCSIController)(nil)) {
+				s = append(s, d.GetVirtualDevice().SlotInfo.(*types.VirtualDevicePciBusSlotInfo).PciSlotNumber)
+			}
+			return s
+		}
+		base := slots()
+		require.Equal(t, pvscsiDefaultSlots[:len(base)], base, "the model's PVSCSI controllers are placed as ESX places them")
+		add(&types.VirtualDevicePciBusSlotInfo{PciSlotNumber: 1184})
+		add(nil)
+		require.Equal(t, append(base, 1184, pvscsiDefaultSlots[len(base)]), slots())
+	})
+}
+
+func TestWritePCIDevices(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, writePCIDevices(dir, []string{"0000:03:00.0", "0000:04:00.0"}))
+	require.NoError(t, writePCIDevices(dir, []string{"0000:03:00.0"}))
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	for name, want := range map[string]string{"vendor": "0x15ad\n", "device": "0x07c0\n"} {
+		b, err := os.ReadFile(filepath.Join(dir, "0000:03:00.0", name))
+		require.NoError(t, err)
+		require.Equal(t, want, string(b))
 	}
 }
 
-// TestVMDiskMounts: an attached FCD at the named bus and unit is presented as
-// its content directory, other units are not, and detach removes it.
+// TestVMDiskMounts: each disk on the PVSCSI controller is presented at its by-path name, whatever
+// the guest's user-data says, and a detach removes it.
 func TestVMDiskMounts(t *testing.T) {
 	testFCD(t, func(e *fcdEnv) {
 		vm := e.vm(0)
 		ctx := registryContext(e.model.Map())
-		vm.Config.ExtraConfig = append(vm.Config.ExtraConfig,
-			userdataFor(t, "gzip+base64", "/var/lib/etcd", 0, 1)...)
 
-		none, err := vm.diskMounts(ctx)
+		pvscsi, base, err := vm.diskMounts(ctx)
 		require.NoError(t, err)
-		require.Empty(t, none)
+		require.Equal(t, []string{"0000:03:00.0"}, pvscsi)
+		require.Equal(t, []string{"/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:0:0"}, dests(base), "the VM's own disk")
 
 		id := e.createFCD("etcd")
 		other := e.createFCD("other")
 		unit := int32(1)
 		require.NoError(t, e.attach(vm, id, 0, &unit))
-		unit = 2
+		unit = 10
 		require.NoError(t, e.attach(vm, other, 0, &unit))
 
-		got, err := vm.diskMounts(ctx)
+		dir := func(id types.ID) string {
+			return strings.TrimSuffix(e.ds.resolve(ctx, strings.SplitN(e.fcdPath(id), "] ", 2)[1]), ".vmdk") + ".d"
+		}
+		_, got, err := vm.diskMounts(ctx)
 		require.NoError(t, err)
-		want := strings.TrimSuffix(e.ds.resolve(ctx, strings.SplitN(e.fcdPath(id), "] ", 2)[1]), ".vmdk") + ".d"
-		require.Equal(t, []diskMount{{source: want, dest: "/var/lib/etcd"}}, got)
-		require.DirExists(t, filepath.Clean(want))
+		require.Equal(t, append(base,
+			diskMount{source: dir(id), dest: "/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:1:0"},
+			diskMount{source: dir(other), dest: "/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:a:0"},
+		), got)
+		require.DirExists(t, dir(id))
 
 		require.NoError(t, e.detach(vm, id))
-		got, err = vm.diskMounts(ctx)
+		_, got, err = vm.diskMounts(ctx)
 		require.NoError(t, err)
-		require.Empty(t, got)
-		_, err = os.Stat(want)
-		require.NoError(t, err, "detach keeps the FCD's content")
+		require.Equal(t, append(dests(base), "/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:a:0"), dests(got))
+		require.DirExists(t, dir(id), "detach keeps the FCD's content")
 	})
 }
 
-// TestContainerVM_DiskMount checks that a disk attached at the named bus and
-// unit before power-on reaches the guest as its content directory with the
-// guest's .mount unit, and that detach while stopped undoes both at the next
-// power-on.
-func TestContainerVM_DiskMount(t *testing.T) {
-	test.RequireContainerOptIn(t)
-	if !test.HasDocker() {
-		t.Skip("requires docker or podman (aliased as docker) on linux")
+func dests(mounts []diskMount) []string {
+	var d []string
+	for _, m := range mounts {
+		d = append(d, m.dest)
 	}
+	return d
+}
 
+const testDiskPath = "/dev/disk/by-path/pci-0000:03:00.0-scsi-0:0:1:0"
+
+// TestContainerVM_DiskMount checks that a disk attached at unit 1 before power-on reaches the
+// guest at its by-path name, with the PVSCSI controller in the guest's sysfs, and that detach
+// while stopped removes it at the next power-on.
+func TestContainerVM_DiskMount(t *testing.T) {
 	env, vm, svm, id, attach := diskContainerSetup(t, "disk-mount")
 	attach()
 
 	powerOn(t, env, vm)
 	cid := containerID(t, env, svm)
-	unitFile := "/etc/systemd/system/var-lib-etcd.mount"
-	out, err := dockerExec(env.goCtx, cid, "cat", unitFile)
+	out, err := dockerExec(env.goCtx, cid, "sh", "-c", "ls "+guestPCIDevicesDir+"; cat "+guestPCIDevicesDir+"/0000:03:00.0/vendor "+guestPCIDevicesDir+"/0000:03:00.0/device")
 	require.NoError(t, err)
-	require.Contains(t, out, "Where=/var/lib/etcd")
+	require.Equal(t, "0000:03:00.0\n0x15ad\n0x07c0", out, "the guest's PCI devices are the VM's")
 
-	_, err = dockerExec(env.goCtx, cid, "sh", "-c", "echo x > /var/lib/etcd/probe")
+	_, err = dockerExec(env.goCtx, cid, "sh", "-c", "echo x > "+testDiskPath+"/probe")
 	require.NoError(t, err)
 	var dir string
 	env.simCtx.WithLock(svm, func() { dir = svm.svm.diskLive[0].source })
@@ -176,16 +159,13 @@ func TestContainerVM_DiskMount(t *testing.T) {
 	powerOff(t, env, vm)
 	require.NoError(t, vm.DetachDisk(env.goCtx, id.Id))
 	powerOn(t, env, vm)
-	cid = containerID(t, env, svm)
-	_, err = dockerExec(env.goCtx, cid, "test", "!", "-e", unitFile)
-	require.NoError(t, err, "detach removes the unit at the next power-on")
-	_, err = dockerExec(env.goCtx, cid, "test", "!", "-e", "/var/lib/etcd/probe")
-	require.NoError(t, err)
+	_, err = dockerExec(env.goCtx, containerID(t, env, svm), "test", "!", "-e", testDiskPath)
+	require.NoError(t, err, "detach removes the disk at the next power-on")
 	powerOff(t, env, vm)
 }
 
-// diskContainerSetup creates a container VM whose guest asks for /var/lib/etcd at bus 0, unit 1,
-// with a controller and an FCD ready; attach attaches the FCD at that slot.
+// diskContainerSetup creates a container VM with a PVSCSI controller and an FCD ready; attach
+// attaches the FCD at unit 1.
 func diskContainerSetup(t *testing.T, name string) (env *vcSimEnv, vm *object.VirtualMachine, svm *VirtualMachine, id types.ID, attach func()) {
 	t.Helper()
 	test.RequireContainerOptIn(t)
@@ -194,11 +174,7 @@ func diskContainerSetup(t *testing.T, name string) (env *vcSimEnv, vm *object.Vi
 	}
 
 	env = newVCSIMEnv(t)
-	extra := append([]types.BaseOptionValue{
-		&types.OptionValue{Key: "RUN.nestedContainers", Value: "true"},
-		&types.OptionValue{Key: "RUN.nestedVolumes", Value: `["/var/lib/etcd"]`},
-	}, userdataFor(t, "gzip+base64", "/var/lib/etcd", 0, 1)...)
-	vm, svm = createContainerVM(t, env, name, "", extra...)
+	vm, svm = createContainerVM(t, env, name, "")
 
 	ctrl, err := object.VirtualDeviceList(nil).CreateSCSIController("pvscsi")
 	require.NoError(t, err)
@@ -233,28 +209,24 @@ func createFCDOn(t *testing.T, env *vcSimEnv, ds *Datastore, name string) types.
 }
 
 // TestContainerVM_DiskHotAttach: a disk attached or detached while the container runs reaches the
-// guest at once, with its unit; after a stop it is presented again at the next start; a disk on a
+// guest at once at its by-path name; after a stop it is presented again at the next start; a disk on a
 // datastore made after the container is presented; and the guest sees nothing else of the datastore.
 func TestContainerVM_DiskHotAttach(t *testing.T) {
 	env, vm, svm, id, attach := diskContainerSetup(t, "disk-hot")
-	unitFile := "/etc/systemd/system/var-lib-etcd.mount"
 
 	powerOn(t, env, vm)
 	cid := containerID(t, env, svm)
-	_, err := dockerExec(env.goCtx, cid, "test", "!", "-e", unitFile)
+	_, err := dockerExec(env.goCtx, cid, "test", "!", "-e", testDiskPath)
 	require.NoError(t, err, "no disk yet")
 
 	present := func(cid string) {
 		t.Helper()
-		out, err := dockerExec(env.goCtx, cid, "cat", unitFile)
-		require.NoError(t, err)
-		require.Contains(t, out, "Where=/var/lib/etcd")
-		_, err = dockerExec(env.goCtx, cid, "sh", "-c", "echo x > /var/lib/etcd/probe")
+		_, err := dockerExec(env.goCtx, cid, "sh", "-c", "echo x > "+testDiskPath+"/probe")
 		require.NoError(t, err)
 	}
 	absent := func(cid string) {
 		t.Helper()
-		_, err := dockerExec(env.goCtx, cid, "test", "!", "-e", unitFile)
+		_, err := dockerExec(env.goCtx, cid, "test", "!", "-e", testDiskPath)
 		require.NoError(t, err)
 		_, err = dockerExec(env.goCtx, cid, "test", "!", "-e", "/var/lib/etcd/probe")
 		require.NoError(t, err)
@@ -277,7 +249,7 @@ func TestContainerVM_DiskHotAttach(t *testing.T) {
 	cid = containerID(t, env, svm)
 	ds := env.simCtx.Map.Any("Datastore").(*Datastore)
 	require.NoError(t, os.WriteFile(filepath.Join(ds.Path(), "other-vm-secret"), nil, 0o644))
-	out, err := dockerExec(env.goCtx, cid, "sh", "-c", "find / -name other-vm-secret 2>/dev/null; ls -d /.vcsim 2>/dev/null; ls /var/lib/etcd")
+	out, err := dockerExec(env.goCtx, cid, "sh", "-c", "find / -name other-vm-secret 2>/dev/null; ls -d /.vcsim 2>/dev/null; ls "+testDiskPath)
 	require.NoError(t, err)
 	require.Equal(t, "probe", out, "the guest sees the disk's directory and no other datastore content")
 
@@ -328,74 +300,4 @@ func TestDiskTreeHelperUsage(t *testing.T) {
 		t.Skip("linux only")
 	}
 	require.Error(t, diskTreeHelper([]string{"1"}))
-}
-
-func TestStaleUnits(t *testing.T) {
-	a, b := diskMount{source: "/d/a.d", dest: "/a"}, diskMount{source: "/d/b.d", dest: "/b"}
-	require.Equal(t, []string{b.unitPath()}, staleUnits([]string{a.unitPath(), b.unitPath()}, []diskMount{a}))
-	require.Empty(t, staleUnits([]string{a.unitPath()}, []diskMount{{source: "/d/a2.d", dest: "/a"}}), "same mount point, same unit")
-	require.Empty(t, staleUnits(nil, []diskMount{a}))
-}
-
-// TestVMDiskMountsCloudinitPrep drives the production path: guestinfo.userdata is the placeholder
-// "---", the user-data arrives by CustomizeVM_Task as CloudinitPrep, and the mount point is derived
-// from it while pending and after power-on applied it.
-func TestVMDiskMountsCloudinitPrep(t *testing.T) {
-	testFCD(t, func(e *fcdEnv) {
-		vm := e.vm(0)
-		ctx := registryContext(e.model.Map())
-		vm.Config.ExtraConfig = append(vm.Config.ExtraConfig,
-			&types.OptionValue{Key: userdataKey, Value: "---"},
-			&types.OptionValue{Key: userdataEncodingKey, Value: "gzip+base64"})
-
-		cc, err := yaml.Marshal(map[string]any{"write_files": []map[string]any{
-			{"path": machineAgentConf, "content": "apiVersion: cluster.kubernetes.vmware.com/v1alpha1\nkind: MachineConfig\nspec:\n  volumeMounts:\n  - mountPoint: /var/lib/etcd\n    pcidevice: {bus: 3, target: 1}\n"},
-		}})
-		require.NoError(t, err)
-		obj := object.NewVirtualMachine(e.c, vm.Self)
-		require.NoError(t, e.wait(obj.Customize(e.ctx, types.CustomizationSpec{
-			Identity: &types.CustomizationCloudinitPrep{Metadata: "instance-id: a", Userdata: string(cc)},
-		})))
-
-		unit := int32(1)
-		require.NoError(t, e.attach(vm, e.createFCD("etcd"), 0, &unit))
-
-		check := func(when string) {
-			t.Helper()
-			got, err := vm.diskMounts(ctx)
-			require.NoError(t, err, when)
-			require.Len(t, got, 1, when)
-			require.Equal(t, "/var/lib/etcd", got[0].dest, when)
-		}
-		check("pending")
-		require.NoError(t, e.wait(obj.PowerOn(e.ctx)))
-		require.Nil(t, vm.imc, "power-on applied the customization")
-		check("applied")
-	})
-}
-
-// TestVMDiskMountsGuestinfoCleared checks that a disk hot added after guestinfo.userdata was read
-// and then replaced by the "---" placeholder still gets the mount point the guest booted with.
-func TestVMDiskMountsGuestinfoCleared(t *testing.T) {
-	testFCD(t, func(e *fcdEnv) {
-		vm := e.vm(0)
-		ctx := registryContext(e.model.Map())
-		vm.Config.ExtraConfig = append(vm.Config.ExtraConfig,
-			userdataFor(t, "gzip+base64", "/var/lib/etcd", 0, 1)...)
-		_, err := vm.diskMounts(ctx)
-		require.NoError(t, err)
-
-		for _, o := range vm.Config.ExtraConfig {
-			if v := o.GetOptionValue(); v.Key == userdataKey {
-				v.Value = "---"
-			}
-		}
-		unit := int32(1)
-		require.NoError(t, e.attach(vm, e.createFCD("etcd"), 0, &unit))
-
-		got, err := vm.diskMounts(ctx)
-		require.NoError(t, err)
-		require.Len(t, got, 1)
-		require.Equal(t, "/var/lib/etcd", got[0].dest)
-	})
 }

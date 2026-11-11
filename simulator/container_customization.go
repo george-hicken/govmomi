@@ -50,7 +50,7 @@ func cloudinitPrepPackage(prep *types.CustomizationCloudinitPrep, instanceID str
 		{&tar.Header{Name: imcMetadataFile, Mode: 0600}, []byte(strings.TrimSpace(prep.Metadata))},
 	}
 
-	if userdata := cloudinitUserdata(prep); userdata != "" {
+	if userdata := strings.TrimSpace(prep.Userdata); userdata != "" {
 		cfg.WriteString("USERDATA = " + imcUserdataFile + "\n")
 		files = append(files, tarEntry{&tar.Header{Name: imcUserdataFile, Mode: 0600}, []byte(userdata)})
 	}

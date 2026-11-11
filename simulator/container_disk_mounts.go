@@ -5,284 +5,167 @@
 package simulator
 
 import (
-	"bytes"
-	"compress/gzip"
-	"encoding/base64"
 	"fmt"
-	"io"
 	"log"
 	"os"
-	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
-
-	"gopkg.in/yaml.v3"
 
 	"github.com/vmware/govmomi/object"
 	"github.com/vmware/govmomi/vim25/types"
 )
 
-// machineAgentConf is the cloud-config write_files path of the machine-agent
-// configuration, the guest's own statement of where each disk is mounted. Only
-// this file is read: it is the one product source of volumeMounts, and any
-// other file's volumeMounts would not be an instruction to the guest.
-const machineAgentConf = "/run/machine-agent/conf"
-
-// The guestinfo keys carrying the cloud-config user-data and its encoding.
+// The guest paths a container VM's PVSCSI hardware appears at. The guest finds a disk as
+// machine-agent does: the first sysfs PCI device with the PVSCSI vendor and device IDs, then
+// /dev/disk/by-path/pci-<address>-scsi-0:0:<unit>:0. Rootless podman cannot make block devices,
+// so the by-path name is the disk's content directory.
 const (
-	userdataKey         = "guestinfo.userdata"
-	userdataEncodingKey = "guestinfo.userdata.encoding"
+	guestPCIDevicesDir = "/sys/bus/pci/devices"
+	guestDiskByPathDir = "/dev/disk/by-path"
+	pciVendorVMware    = "0x15ad"
+	pciDevicePVSCSI    = "0x07c0"
 )
 
-// diskMount is one disk presented to the guest.
+// diskMount is one host directory presented at a guest path.
 type diskMount struct {
 	source string // host directory
-	dest   string // guest mount point
+	dest   string // guest path
 }
 
-// systemdMountUnit returns the name of the .mount unit for mount point p, as
-// systemd-escape --path --suffix=mount does.
-func systemdMountUnit(p string) string {
-	p = strings.Trim(path.Clean(p), "/")
-	if p == "" {
-		return "-.mount"
+// pvscsiDefaultSlots are the PCI slot numbers ESX gives PVSCSI controllers 0-3 that the spec
+// leaves unplaced (inference: ESX defaults for scsi0-3; scsi0 at 160 is the documented one).
+var pvscsiDefaultSlots = []int32{160, 224, 256, 288}
+
+// placePVSCSI gives c a PCI slot, as ESX does, when the spec sets none: the first default slot
+// no other controller of devices holds.
+func placePVSCSI(devices object.VirtualDeviceList, c *types.ParaVirtualSCSIController) {
+	if c.SlotInfo != nil {
+		return
 	}
-	var b strings.Builder
-	for i := 0; i < len(p); i++ {
-		c := p[i]
-		switch {
-		case c == '/':
-			b.WriteByte('-')
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == ':', c == '_',
-			c == '.' && i > 0:
-			b.WriteByte(c)
-		default:
-			fmt.Fprintf(&b, `\x%02x`, c)
+	var used []int32
+	for _, d := range devices.SelectByType((*types.ParaVirtualSCSIController)(nil)) {
+		if s, ok := d.GetVirtualDevice().SlotInfo.(*types.VirtualDevicePciBusSlotInfo); ok && d.GetVirtualDevice().Key != c.Key {
+			used = append(used, s.PciSlotNumber)
 		}
 	}
-	return b.String() + ".mount"
-}
-
-// mountUnit renders the unit machine-agent would write for m, a bind mount.
-func (m diskMount) mountUnit() string {
-	return fmt.Sprintf(`[Unit]
-Description=Mount %[2]s
-
-[Mount]
-What=%[1]s
-Where=%[2]s
-Type=none
-Options=bind
-
-[Install]
-WantedBy=local-fs.target
-`, m.source, m.dest)
-}
-
-// unitPath is where the guest looks for m's unit.
-func (m diskMount) unitPath() string {
-	return "/etc/systemd/system/" + systemdMountUnit(m.dest)
-}
-
-// scsiSlot is a disk's place on a SCSI controller: the controller's bus number
-// and the disk's unit number. machine-agent's volumeMounts name it as
-// pcidevice{bus, target}.
-type scsiSlot struct{ bus, unit int32 }
-
-// mountPoint returns the mount point points names for the disk at unit, ignoring the guest's bus.
-// This mirrors machine-agent (spec 9524 O-9524-15), which ignores pcidevice.Bus and resolves
-// /dev/disk/by-path/pci-<PVSCSI address>-scsi-0:0:<target>:0 from the target alone; the kubernetes-service
-// mutator's bus 3 against vm-operator's controllerBusNumber 0 is a cross-component misalignment it masks.
-func mountPoint(points map[scsiSlot]string, unit int32) (string, bool) {
-	for slot, dest := range points {
-		if slot.unit == unit {
-			return dest, true
+	for _, slot := range pvscsiDefaultSlots {
+		if !slices.Contains(used, slot) {
+			c.SlotInfo = &types.VirtualDevicePciBusSlotInfo{PciSlotNumber: slot}
+			return
 		}
 	}
-	return "", false
 }
 
-// extraConfigValue returns the string value of key in extraConfig.
-func extraConfigValue(extraConfig []types.BaseOptionValue, key string) string {
-	for _, opt := range extraConfig {
-		if v := opt.GetOptionValue(); v.Key == key {
-			return fmt.Sprint(v.Value)
-		}
+// guestPCIAddress returns the guest's PCI address (domain:bus:device.function) of a device in
+// slot, by Broadcom KB 2047927: bits 0-4 are the device, bits 5-9 select the bridge (0 for the
+// root bus, else pciBridge<n-1>), bits 10-12 the function.
+func guestPCIAddress(slot int32) (string, error) {
+	dev, sel, fn := slot&0x1f, (slot>>5)&0x1f, (slot>>10)&0x7
+	if sel == 0 {
+		return fmt.Sprintf("0000:00:%02x.%x", dev, fn), nil
 	}
-	return ""
-}
-
-// decodeUserdata returns the user-data text, decoded as encoding names:
-// "base64", "gzip+base64" (also "gzip, base64"), or plain when empty.
-func decodeUserdata(data, encoding string) ([]byte, error) {
-	switch strings.ReplaceAll(strings.ToLower(strings.TrimSpace(encoding)), " ", "") {
-	case "":
-		return []byte(data), nil
-	case "base64":
-		return base64.StdEncoding.DecodeString(data)
-	case "gzip+base64", "gzip,base64":
-		raw, err := base64.StdEncoding.DecodeString(data)
-		if err != nil {
-			return nil, err
-		}
-		zr, err := gzip.NewReader(bytes.NewReader(raw))
-		if err != nil {
-			return nil, err
-		}
-		defer zr.Close()
-		return io.ReadAll(zr)
-	}
-	return nil, fmt.Errorf("unsupported encoding %q", encoding)
-}
-
-// guestinfoUserdata returns the decoded user-data of ExtraConfig guestinfo.userdata, or nil when it is
-// empty or the placeholder "---" a rolled Supervisor VM carries while the real user-data arrives by
-// CloudinitPrep customization.
-func guestinfoUserdata(extraConfig []types.BaseOptionValue) ([]byte, error) {
-	data := extraConfigValue(extraConfig, userdataKey)
-	if strings.Trim(strings.TrimSpace(data), "-") == "" {
-		return nil, nil
-	}
-	text, err := decodeUserdata(data, extraConfigValue(extraConfig, userdataEncodingKey))
+	bus, err := bridgeSecondaryBus(sel-1, fn)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", userdataKey, err)
+		return "", fmt.Errorf("slot %d: %w", slot, err)
 	}
-	return text, nil
+	return fmt.Sprintf("0000:%02x:%02x.0", bus, dev), nil
 }
 
-// guestUserdata returns the cloud-config user-data this VM's guest receives: that of the pending
-// CloudinitPrep customization, else guestinfo.userdata, else the last of either delivered. The
-// guestinfo key is not durable: once the guest has read it, it may be replaced by the "---"
-// placeholder, while a disk hot added later still needs the mount point the guest booted with.
-func (vm *VirtualMachine) guestUserdata() ([]byte, error) {
-	if prep, ok := vm.imcIdentity(); ok {
-		if text := cloudinitUserdata(prep); text != "" {
-			return []byte(text), nil
-		}
+// bridgeSecondaryBus returns the guest bus number behind function fn of pciBridge<bridge>. The KB
+// does not give it; it is the guest firmware's enumeration, so this is the one place to correct
+// against a real VM. pciBridge4-7 are PCIe root ports of 8 functions each, numbered from bus 3:
+// pciBridge4 function 0 (slot 160) is bus 3, pciBridge5 function 0 (slot 192) bus 0x0b, as an
+// ESX VM with the default bridges enumerates them.
+func bridgeSecondaryBus(bridge, fn int32) (int32, error) {
+	if bridge < 4 || bridge > 7 {
+		return 0, fmt.Errorf("no guest bus is known behind pciBridge%d", bridge)
 	}
-	text, err := guestinfoUserdata(vm.Config.ExtraConfig)
-	if err != nil || len(text) != 0 {
-		if len(text) != 0 {
-			vm.appliedUserdata = string(text)
-		}
-		return text, err
-	}
-	if vm.appliedUserdata != "" {
-		return []byte(vm.appliedUserdata), nil
-	}
-	return nil, nil
+	return 3 + 8*(bridge-4) + fn, nil
 }
 
-// imcIdentity returns the pending customization's CloudinitPrep, if that is what is pending.
-func (vm *VirtualMachine) imcIdentity() (*types.CustomizationCloudinitPrep, bool) {
-	if vm.imc == nil {
-		return nil, false
-	}
-	prep, ok := vm.imc.Identity.(*types.CustomizationCloudinitPrep)
-	return prep, ok && prep != nil
+// diskByPath returns the guest path of the disk at unit on the PVSCSI controller at addr, as
+// machine-agent formats it.
+func diskByPath(addr string, unit int32) string {
+	return fmt.Sprintf("%s/pci-%s-scsi-0:0:%x:0", guestDiskByPathDir, addr, unit)
 }
 
-// cloudinitUserdata returns the user-data vpxd puts in the package: trimmed, empty when absent.
-func cloudinitUserdata(prep *types.CustomizationCloudinitPrep) string {
-	return strings.TrimSpace(prep.Userdata)
-}
-
-// diskMountPoints returns the mount point of each SCSI slot that the guest user-data gives
-// machine-agent in its volumeMounts. No user-data, or none with a machine-agent configuration, gives none.
-func diskMountPoints(text []byte) (map[scsiSlot]string, error) {
-	if len(text) == 0 {
-		return nil, nil
-	}
-	var cloudConfig struct {
-		WriteFiles []struct {
-			Path    string `yaml:"path"`
-			Content string `yaml:"content"`
-		} `yaml:"write_files"`
-	}
-	if err := yaml.Unmarshal(text, &cloudConfig); err != nil {
-		return nil, fmt.Errorf("user-data: %w", err)
-	}
-
-	points := map[scsiSlot]string{}
-	for _, f := range cloudConfig.WriteFiles {
-		if f.Path != machineAgentConf {
+// guestPVSCSI returns the guest PCI address of each PVSCSI controller of devices, by key. A
+// controller with no slot or an unmapped one is logged once and left out.
+func (vm *VirtualMachine) guestPVSCSI(devices object.VirtualDeviceList) map[int32]string {
+	addrs := map[int32]string{}
+	for _, d := range devices.SelectByType((*types.ParaVirtualSCSIController)(nil)) {
+		c := d.GetVirtualDevice()
+		slot, ok := c.SlotInfo.(*types.VirtualDevicePciBusSlotInfo)
+		if !ok {
+			vm.noteDiskOnce(c.Key, "PVSCSI controller %d has no PCI slot, its disks are not presented", c.Key)
 			continue
 		}
-		// The conf is a MachineConfig object; its volumeMounts are under spec.
-		var conf struct {
-			Spec struct {
-				VolumeMounts []struct {
-					MountPoint string `yaml:"mountPoint"`
-					PCIDevice  *struct {
-						Bus    int32 `yaml:"bus"`
-						Target int32 `yaml:"target"`
-					} `yaml:"pcidevice"`
-				} `yaml:"volumeMounts"`
-			} `yaml:"spec"`
+		addr, err := guestPCIAddress(slot.PciSlotNumber)
+		if err != nil {
+			vm.noteDiskOnce(c.Key, "PVSCSI controller %d: %s, its disks are not presented", c.Key, err)
+			continue
 		}
-		if err := yaml.Unmarshal([]byte(f.Content), &conf); err != nil {
-			return nil, fmt.Errorf("%s: %w", machineAgentConf, err)
-		}
-		for _, m := range conf.Spec.VolumeMounts {
-			if m.PCIDevice == nil {
-				continue
-			}
-			if !path.IsAbs(m.MountPoint) || path.Clean(m.MountPoint) == "/" {
-				return nil, fmt.Errorf("%s: %q is not an absolute mount point", machineAgentConf, m.MountPoint)
-			}
-			points[scsiSlot{m.PCIDevice.Bus, m.PCIDevice.Target}] = path.Clean(m.MountPoint)
-		}
+		addrs[c.Key] = addr
 	}
-	return points, nil
+	return addrs
 }
 
-// diskMounts returns the disks of vm that diskMountPoints names, sorted by
-// mount point, creating each content directory as needed.
-func (vm *VirtualMachine) diskMounts(ctx *Context) ([]diskMount, error) {
-	text, err := vm.guestUserdata()
-	if err != nil {
-		return nil, err
-	}
-	points, err := diskMountPoints(text)
-	if err != nil {
-		return nil, err
-	}
-
+// diskMounts returns the guest's PVSCSI controller addresses and its disks on them, each at its
+// by-path name and sorted by it, creating each content directory as needed.
+func (vm *VirtualMachine) diskMounts(ctx *Context) (pvscsi []string, mounts []diskMount, err error) {
 	devices := object.VirtualDeviceList(vm.Config.Hardware.Device)
-	ctrlKey := pvscsiController(devices)
-	var mounts []diskMount
+	addrs := vm.guestPVSCSI(devices)
 	for _, d := range devices.SelectByType((*types.VirtualDisk)(nil)) {
 		disk := d.(*types.VirtualDisk)
-		if disk.ControllerKey != ctrlKey || disk.UnitNumber == nil {
-			continue
-		}
-		dest, ok := mountPoint(points, *disk.UnitNumber)
-		if !ok {
-			vm.noteDiskOnce(*disk.UnitNumber, "disk unit %d has no volumeMount in the guest user-data (%d mount points), not presented", *disk.UnitNumber, len(points))
+		addr, ok := addrs[disk.ControllerKey]
+		if !ok || disk.UnitNumber == nil {
+			vm.noteDiskOnce(disk.Key, "disk %d is not on a presented PVSCSI controller, not presented", disk.Key)
 			continue
 		}
 		dir, err := contentDir(ctx, disk)
 		if err != nil {
-			return nil, fmt.Errorf("disk unit %d: %w", *disk.UnitNumber, err)
+			return nil, nil, fmt.Errorf("disk unit %d: %w", *disk.UnitNumber, err)
 		}
-		mounts = append(mounts, diskMount{source: dir, dest: dest})
+		mounts = append(mounts, diskMount{source: dir, dest: diskByPath(addr, *disk.UnitNumber)})
 	}
+	for _, addr := range addrs {
+		pvscsi = append(pvscsi, addr)
+	}
+	sort.Strings(pvscsi)
 	sort.Slice(mounts, func(i, j int) bool { return mounts[i].dest < mounts[j].dest })
-	return mounts, nil
+	return pvscsi, mounts, nil
 }
 
-// pvscsiController returns the key of the PVSCSI controller machine-agent resolves disks on, or 0.
-// With several, the lowest bus number is taken (inference: the sim presents one PVSCSI address).
-func pvscsiController(devices object.VirtualDeviceList) int32 {
-	var key, bus int32 = 0, -1
-	for _, d := range devices.SelectByType((*types.ParaVirtualSCSIController)(nil)) {
-		c := d.(*types.ParaVirtualSCSIController)
-		if bus < 0 || c.BusNumber < bus {
-			key, bus = c.Key, c.BusNumber
+// writePCIDevices makes dir hold exactly a sysfs entry, vendor and device, for each address.
+func writePCIDevices(dir string, addrs []string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if !slices.Contains(addrs, e.Name()) {
+			if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+				return err
+			}
 		}
 	}
-	return key
+	for _, addr := range addrs {
+		entry := filepath.Join(dir, addr)
+		if _, err := os.Stat(entry); err == nil {
+			continue // an entry's content is fixed, and its read-only files cannot be rewritten
+		}
+		if err := os.Mkdir(entry, 0o755); err != nil {
+			return err
+		}
+		for name, id := range map[string]string{"vendor": pciVendorVMware, "device": pciDevicePVSCSI} {
+			if err := os.WriteFile(filepath.Join(entry, name), []byte(id+"\n"), 0o444); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // contentDir returns, creating it, the directory that holds disk's content:
@@ -309,14 +192,14 @@ func contentDir(ctx *Context, disk *types.VirtualDisk) (string, error) {
 	return dir, os.MkdirAll(dir, 0o755)
 }
 
-// noteDiskOnce logs, once per unit, why a disk is not presented, so a run log shows it.
-func (vm *VirtualMachine) noteDiskOnce(unit int32, format string, args ...any) {
-	if vm.diskNoted[unit] {
+// noteDiskOnce logs, once per device key, why a device's disks are not presented, so a run log shows it.
+func (vm *VirtualMachine) noteDiskOnce(key int32, format string, args ...any) {
+	if vm.diskNoted[key] {
 		return
 	}
 	if vm.diskNoted == nil {
 		vm.diskNoted = map[int32]bool{}
 	}
-	vm.diskNoted[unit] = true
+	vm.diskNoted[key] = true
 	log.Printf("%s disks: %s", vm.Name, fmt.Sprintf(format, args...))
 }

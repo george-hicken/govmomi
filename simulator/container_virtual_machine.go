@@ -219,11 +219,11 @@ type simVM struct {
 	// which must find the detect-virt shim it mounts.
 	vmwareVirt bool
 
-	// diskLive is the set the running container presents, which presentDisks keeps current;
-	// see diskMountPoints.
-	// diskUnits is the unit files presentDisks wrote, which outlive a stop.
-	diskLive  []diskMount
-	diskUnits []string
+	// diskLive is the set the running container presents, which presentDisks keeps current.
+	// pciDir is the host directory presented as the guest's PCI devices; it lives as long as
+	// the container.
+	diskLive []diskMount
+	pciDir   string
 }
 
 // createSimulationVM inspects the provided VirtualMachine and creates a simVM binding for it if
@@ -718,7 +718,7 @@ func (svm *simVM) start(ctx *Context) error {
 		volumes = append(volumes, mounts...)
 	}
 	svm.vmwareVirt = vmwareVirt
-	svm.diskLive, svm.diskUnits = nil, nil
+	svm.diskLive = nil
 
 	if mountMachineID {
 		mounts, err := svm.carryBIOSUUID(selectBIOSUUIDCarrier())
@@ -956,6 +956,7 @@ func (svm *simVM) remove(ctx *Context) error {
 	defer svm.removeGuestRPC()
 	defer svm.removeMachineID()
 	defer svm.removeSysctl()
+	defer svm.removePCIDir()
 
 	err := svm.c.remove(ctx)
 	if err != nil {
