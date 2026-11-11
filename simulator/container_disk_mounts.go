@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -135,17 +136,54 @@ func decodeUserdata(data, encoding string) ([]byte, error) {
 	return nil, fmt.Errorf("unsupported encoding %q", encoding)
 }
 
-// diskMountPoints returns the mount point of each SCSI slot that the VM's
-// guest user-data gives machine-agent in its volumeMounts. A VM without
-// user-data, or whose user-data has no machine-agent configuration, has none.
-func diskMountPoints(extraConfig []types.BaseOptionValue) (map[scsiSlot]string, error) {
+// guestinfoUserdata returns the decoded user-data of ExtraConfig guestinfo.userdata, or nil when it is
+// empty or the placeholder "---" a rolled Supervisor VM carries while the real user-data arrives by
+// CloudinitPrep customization.
+func guestinfoUserdata(extraConfig []types.BaseOptionValue) ([]byte, error) {
 	data := extraConfigValue(extraConfig, userdataKey)
-	if data == "" {
+	if strings.Trim(strings.TrimSpace(data), "-") == "" {
 		return nil, nil
 	}
 	text, err := decodeUserdata(data, extraConfigValue(extraConfig, userdataEncodingKey))
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", userdataKey, err)
+	}
+	return text, nil
+}
+
+// guestUserdata returns the cloud-config user-data this VM's guest receives: that of the pending
+// CloudinitPrep customization, else of the last one applied, else guestinfo.userdata.
+func (vm *VirtualMachine) guestUserdata() ([]byte, error) {
+	if prep, ok := vm.imcIdentity(); ok {
+		if text := cloudinitUserdata(prep); text != "" {
+			return []byte(text), nil
+		}
+	}
+	if vm.appliedUserdata != "" {
+		return []byte(vm.appliedUserdata), nil
+	}
+	return guestinfoUserdata(vm.Config.ExtraConfig)
+}
+
+// imcIdentity returns the pending customization's CloudinitPrep, if that is what is pending.
+func (vm *VirtualMachine) imcIdentity() (*types.CustomizationCloudinitPrep, bool) {
+	if vm.imc == nil {
+		return nil, false
+	}
+	prep, ok := vm.imc.Identity.(*types.CustomizationCloudinitPrep)
+	return prep, ok && prep != nil
+}
+
+// cloudinitUserdata returns the user-data vpxd puts in the package: trimmed, empty when absent.
+func cloudinitUserdata(prep *types.CustomizationCloudinitPrep) string {
+	return strings.TrimSpace(prep.Userdata)
+}
+
+// diskMountPoints returns the mount point of each SCSI slot that the guest user-data gives
+// machine-agent in its volumeMounts. No user-data, or none with a machine-agent configuration, gives none.
+func diskMountPoints(text []byte) (map[scsiSlot]string, error) {
+	if len(text) == 0 {
+		return nil, nil
 	}
 	var cloudConfig struct {
 		WriteFiles []struct {
@@ -154,7 +192,7 @@ func diskMountPoints(extraConfig []types.BaseOptionValue) (map[scsiSlot]string, 
 		} `yaml:"write_files"`
 	}
 	if err := yaml.Unmarshal(text, &cloudConfig); err != nil {
-		return nil, fmt.Errorf("%s: %w", userdataKey, err)
+		return nil, fmt.Errorf("user-data: %w", err)
 	}
 
 	points := map[scsiSlot]string{}
@@ -190,8 +228,12 @@ func diskMountPoints(extraConfig []types.BaseOptionValue) (map[scsiSlot]string, 
 // diskMounts returns the disks of vm that diskMountPoints names, sorted by
 // mount point, creating each content directory as needed.
 func (vm *VirtualMachine) diskMounts(ctx *Context) ([]diskMount, error) {
-	points, err := diskMountPoints(vm.Config.ExtraConfig)
-	if err != nil || len(points) == 0 {
+	text, err := vm.guestUserdata()
+	if err != nil {
+		return nil, err
+	}
+	points, err := diskMountPoints(text)
+	if err != nil {
 		return nil, err
 	}
 
@@ -205,6 +247,7 @@ func (vm *VirtualMachine) diskMounts(ctx *Context) ([]diskMount, error) {
 		}
 		dest, ok := mountPoint(points, *disk.UnitNumber)
 		if !ok {
+			vm.noteDiskOnce(*disk.UnitNumber, "disk unit %d has no volumeMount in the guest user-data (%d mount points), not presented", *disk.UnitNumber, len(points))
 			continue
 		}
 		dir, err := contentDir(ctx, disk)
@@ -252,4 +295,16 @@ func contentDir(ctx *Context, disk *types.VirtualDisk) (string, error) {
 	rel := strings.TrimSuffix(p.Path, filepath.Ext(p.Path)) + ".d"
 	dir := ds.resolve(ctx, rel)
 	return dir, os.MkdirAll(dir, 0o755)
+}
+
+// noteDiskOnce logs, once per unit, why a disk is not presented, so a run log shows it.
+func (vm *VirtualMachine) noteDiskOnce(unit int32, format string, args ...any) {
+	if vm.diskNoted[unit] {
+		return
+	}
+	if vm.diskNoted == nil {
+		vm.diskNoted = map[int32]bool{}
+	}
+	vm.diskNoted[unit] = true
+	log.Printf("%s disks: %s", vm.Name, fmt.Sprintf(format, args...))
 }

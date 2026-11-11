@@ -44,6 +44,11 @@ type VirtualMachine struct {
 	svm *simVM
 	uid uuid.UUID
 	imc *types.CustomizationSpec
+
+	// appliedUserdata is the CloudinitPrep user-data last delivered to the guest.
+	appliedUserdata string
+	// diskNoted records the disk units whose absence from the guest user-data was logged.
+	diskNoted map[int32]bool
 }
 
 func asVirtualMachineMO(obj mo.Reference) (*mo.VirtualMachine, bool) {
@@ -2617,6 +2622,7 @@ func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMach
 
 	if vm.svm.livePresent() {
 		if err := vm.svm.presentDisks(ctx); err != nil {
+			log.Printf("%s disks: %s", vm.Name, err)
 			return newInvalidStateFault("%s: %s", vm.Name, err)
 		}
 	}
@@ -3540,6 +3546,9 @@ func (vm *VirtualMachine) customize(ctx *Context) types.BaseMethodFault {
 		changes = append(changes, types.PropertyChange{Name: "summary.guest.ipAddress", Val: address})
 	}
 
+	if prep, ok := vm.imcIdentity(); ok {
+		vm.appliedUserdata = cloudinitUserdata(prep)
+	}
 	vm.imc = nil
 	changes = append(changes, types.PropertyChange{
 		Name: "guest.customizationInfo",

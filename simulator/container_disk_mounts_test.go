@@ -65,9 +65,26 @@ func userdataFor(t *testing.T, encoding, mountPoint string, bus, target int) []t
 	}
 }
 
+func mustGuestinfo(t *testing.T, opts []types.BaseOptionValue) []byte {
+	t.Helper()
+	text, err := guestinfoUserdata(opts)
+	require.NoError(t, err)
+	return text
+}
+
+// The placeholder a rolled Supervisor VM carries in guestinfo is no user-data.
+func TestGuestinfoUserdataPlaceholder(t *testing.T) {
+	text, err := guestinfoUserdata([]types.BaseOptionValue{
+		&types.OptionValue{Key: userdataKey, Value: "---"},
+		&types.OptionValue{Key: userdataEncodingKey, Value: "gzip+base64"},
+	})
+	require.NoError(t, err)
+	require.Empty(t, text)
+}
+
 func TestDiskMountPoints(t *testing.T) {
 	for _, enc := range []string{"", "base64", "gzip+base64"} {
-		got, err := diskMountPoints(userdataFor(t, enc, "/var/lib/etcd/", 3, 1))
+		got, err := diskMountPoints(mustGuestinfo(t, userdataFor(t, enc, "/var/lib/etcd/", 3, 1)))
 		require.NoError(t, err, enc)
 		require.Equal(t, map[scsiSlot]string{{3, 1}: "/var/lib/etcd"}, got, enc)
 	}
@@ -75,7 +92,7 @@ func TestDiskMountPoints(t *testing.T) {
 	none, err := diskMountPoints(nil)
 	require.NoError(t, err)
 	require.Empty(t, none)
-	none, err = diskMountPoints([]types.BaseOptionValue{&types.OptionValue{Key: userdataKey, Value: "runcmd: [true]\n"}})
+	none, err = diskMountPoints([]byte("runcmd: [true]\n"))
 	require.NoError(t, err)
 	require.Empty(t, none, "user-data without machine-agent conf")
 
@@ -87,7 +104,10 @@ func TestDiskMountPoints(t *testing.T) {
 		"bad gzip": {&types.OptionValue{Key: userdataKey, Value: "eA=="},
 			&types.OptionValue{Key: userdataEncodingKey, Value: "gzip+base64"}},
 	} {
-		_, err := diskMountPoints(opts)
+		text, err := guestinfoUserdata(opts)
+		if err == nil {
+			_, err = diskMountPoints(text)
+		}
 		require.Error(t, err, name)
 	}
 }
@@ -315,4 +335,41 @@ func TestStaleUnits(t *testing.T) {
 	require.Equal(t, []string{b.unitPath()}, staleUnits([]string{a.unitPath(), b.unitPath()}, []diskMount{a}))
 	require.Empty(t, staleUnits([]string{a.unitPath()}, []diskMount{{source: "/d/a2.d", dest: "/a"}}), "same mount point, same unit")
 	require.Empty(t, staleUnits(nil, []diskMount{a}))
+}
+
+// TestVMDiskMountsCloudinitPrep drives the production path: guestinfo.userdata is the placeholder
+// "---", the user-data arrives by CustomizeVM_Task as CloudinitPrep, and the mount point is derived
+// from it while pending and after power-on applied it.
+func TestVMDiskMountsCloudinitPrep(t *testing.T) {
+	testFCD(t, func(e *fcdEnv) {
+		vm := e.vm(0)
+		ctx := registryContext(e.model.Map())
+		vm.Config.ExtraConfig = append(vm.Config.ExtraConfig,
+			&types.OptionValue{Key: userdataKey, Value: "---"},
+			&types.OptionValue{Key: userdataEncodingKey, Value: "gzip+base64"})
+
+		cc, err := yaml.Marshal(map[string]any{"write_files": []map[string]any{
+			{"path": machineAgentConf, "content": "volumeMounts:\n- mountPoint: /var/lib/etcd\n  pcidevice: {bus: 3, target: 1}\n"},
+		}})
+		require.NoError(t, err)
+		obj := object.NewVirtualMachine(e.c, vm.Self)
+		require.NoError(t, e.wait(obj.Customize(e.ctx, types.CustomizationSpec{
+			Identity: &types.CustomizationCloudinitPrep{Metadata: "instance-id: a", Userdata: string(cc)},
+		})))
+
+		unit := int32(1)
+		require.NoError(t, e.attach(vm, e.createFCD("etcd"), 0, &unit))
+
+		check := func(when string) {
+			t.Helper()
+			got, err := vm.diskMounts(ctx)
+			require.NoError(t, err, when)
+			require.Len(t, got, 1, when)
+			require.Equal(t, "/var/lib/etcd", got[0].dest, when)
+		}
+		check("pending")
+		require.NoError(t, e.wait(obj.PowerOn(e.ctx)))
+		require.Nil(t, vm.imc, "power-on applied the customization")
+		check("applied")
+	})
 }
