@@ -533,7 +533,13 @@ func removeLabelled(filter string) error {
 
 // nsenter runs args in the network namespace of pid, as rootless podman's owner namespace requires.
 func nsenter(pid int, stdin string, args ...string) (string, error) {
-	cmdArgs := append([]string{"unshare", "nsenter", "-t", strconv.Itoa(pid), "-n"}, args...)
+	return nsenterIn(pid, "-n", stdin, args...)
+}
+
+// nsenterIn runs args in the namespace of pid that nsFlag (nsenter's -n, -m, ...) selects, inside
+// podman's user namespace: a plain nsenter by the rootless owner is refused (EPERM).
+func nsenterIn(pid int, nsFlag, stdin string, args ...string) (string, error) {
+	cmdArgs := append([]string{"unshare", "nsenter", "-t", strconv.Itoa(pid), nsFlag, "--"}, args...)
 	cmd := exec.Command("podman", cmdArgs...)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)

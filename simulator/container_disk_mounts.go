@@ -89,6 +89,26 @@ func (m diskMount) unitPath() string {
 // pcidevice{bus, target}.
 type scsiSlot struct{ bus, unit int32 }
 
+// busMatches reports whether the guest's pcidevice bus names the controller
+// with the given BusNumber.
+//
+// PENDING: the guest's bus is a PCI bus that vm-operator derives from the
+// controller (inferred: slotInfo.pciSlotNumber 160 gives 3), not its
+// BusNumber. Until that mapping is established this compares them directly,
+// so the one place to change is here.
+func busMatches(guestBus, ctrlBus int32) bool { return guestBus == ctrlBus }
+
+// mountPoint returns the mount point points names for the disk at ctrl's bus
+// and unit.
+func mountPoint(points map[scsiSlot]string, ctrlBus, unit int32) (string, bool) {
+	for slot, dest := range points {
+		if slot.unit == unit && busMatches(slot.bus, ctrlBus) {
+			return dest, true
+		}
+	}
+	return "", false
+}
+
 // extraConfigValue returns the string value of key in extraConfig.
 func extraConfigValue(extraConfig []types.BaseOptionValue, key string) string {
 	for _, opt := range extraConfig {
@@ -190,14 +210,14 @@ func (vm *VirtualMachine) diskMounts(ctx *Context) ([]diskMount, error) {
 		if !ok || disk.UnitNumber == nil {
 			continue
 		}
-		slot := scsiSlot{ctrl.GetVirtualSCSIController().BusNumber, *disk.UnitNumber}
-		dest, ok := points[slot]
+		bus := ctrl.GetVirtualSCSIController().BusNumber
+		dest, ok := mountPoint(points, bus, *disk.UnitNumber)
 		if !ok {
 			continue
 		}
 		dir, err := contentDir(ctx, disk)
 		if err != nil {
-			return nil, fmt.Errorf("disk %d:%d: %w", slot.bus, slot.unit, err)
+			return nil, fmt.Errorf("disk %d:%d: %w", bus, *disk.UnitNumber, err)
 		}
 		mounts = append(mounts, diskMount{source: dir, dest: dest})
 	}

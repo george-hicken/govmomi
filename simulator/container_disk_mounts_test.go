@@ -152,34 +152,8 @@ func TestContainerVM_DiskMount(t *testing.T) {
 		t.Skip("requires docker or podman (aliased as docker) on linux")
 	}
 
-	env := newVCSIMEnv(t)
-	extra := append([]types.BaseOptionValue{
-		&types.OptionValue{Key: "RUN.nestedContainers", Value: "true"},
-		&types.OptionValue{Key: "RUN.nestedVolumes", Value: `["/var/lib/etcd"]`},
-	}, userdataFor(t, "gzip+base64", "/var/lib/etcd", 0, 1)...)
-	vm, svm := createContainerVM(t, env, "disk-mount", "", extra...)
-
-	ctrl, err := object.VirtualDeviceList(nil).CreateSCSIController("pvscsi")
-	require.NoError(t, err)
-	task, err := vm.Reconfigure(env.goCtx, types.VirtualMachineConfigSpec{DeviceChange: []types.BaseVirtualDeviceConfigSpec{
-		&types.VirtualDeviceConfigSpec{Operation: types.VirtualDeviceConfigSpecOperationAdd, Device: ctrl},
-	}})
-	require.NoError(t, err)
-	require.NoError(t, task.Wait(env.goCtx))
-
-	ds := env.simCtx.Map.Any("Datastore").(*Datastore)
-	res, err := methods.CreateDisk_Task(env.goCtx, env.client.Client, &types.CreateDisk_Task{
-		This: *env.client.ServiceContent.VStorageObjectManager,
-		Spec: types.VslmCreateSpec{Name: "etcd", CapacityInMB: 10, BackingSpec: &types.VslmCreateSpecDiskFileBackingSpec{
-			VslmCreateSpecBackingSpec: types.VslmCreateSpecBackingSpec{Datastore: ds.Self},
-		}},
-	})
-	require.NoError(t, err)
-	info, err := object.NewTask(env.client.Client, res.Returnval).WaitForResult(env.goCtx)
-	require.NoError(t, err)
-	id := info.Result.(types.VStorageObject).Config.Id
-	unit := int32(1)
-	require.NoError(t, vm.AttachDisk(env.goCtx, id.Id, object.NewDatastore(env.client.Client, ds.Self), 0, &unit))
+	env, vm, svm, id, attach := diskContainerSetup(t, "disk-mount")
+	attach()
 
 	powerOn(t, env, vm)
 	cid := containerID(t, env, svm)
@@ -203,4 +177,132 @@ func TestContainerVM_DiskMount(t *testing.T) {
 	_, err = dockerExec(env.goCtx, cid, "test", "!", "-e", "/var/lib/etcd/probe")
 	require.NoError(t, err)
 	powerOff(t, env, vm)
+}
+
+// diskContainerSetup creates a container VM whose guest asks for /var/lib/etcd at bus 0, unit 1,
+// with a controller and an FCD ready; attach attaches the FCD at that slot.
+func diskContainerSetup(t *testing.T, name string) (env *vcSimEnv, vm *object.VirtualMachine, svm *VirtualMachine, id types.ID, attach func()) {
+	t.Helper()
+	test.RequireContainerOptIn(t)
+	if !test.HasDocker() {
+		t.Skip("requires docker or podman (aliased as docker) on linux")
+	}
+
+	env = newVCSIMEnv(t)
+	extra := append([]types.BaseOptionValue{
+		&types.OptionValue{Key: "RUN.nestedContainers", Value: "true"},
+		&types.OptionValue{Key: "RUN.nestedVolumes", Value: `["/var/lib/etcd"]`},
+	}, userdataFor(t, "gzip+base64", "/var/lib/etcd", 0, 1)...)
+	vm, svm = createContainerVM(t, env, name, "", extra...)
+
+	ctrl, err := object.VirtualDeviceList(nil).CreateSCSIController("pvscsi")
+	require.NoError(t, err)
+	task, err := vm.Reconfigure(env.goCtx, types.VirtualMachineConfigSpec{DeviceChange: []types.BaseVirtualDeviceConfigSpec{
+		&types.VirtualDeviceConfigSpec{Operation: types.VirtualDeviceConfigSpecOperationAdd, Device: ctrl},
+	}})
+	require.NoError(t, err)
+	require.NoError(t, task.Wait(env.goCtx))
+
+	ds := env.simCtx.Map.Any("Datastore").(*Datastore)
+	res, err := methods.CreateDisk_Task(env.goCtx, env.client.Client, &types.CreateDisk_Task{
+		This: *env.client.ServiceContent.VStorageObjectManager,
+		Spec: types.VslmCreateSpec{Name: "etcd", CapacityInMB: 10, BackingSpec: &types.VslmCreateSpecDiskFileBackingSpec{
+			VslmCreateSpecBackingSpec: types.VslmCreateSpecBackingSpec{Datastore: ds.Self},
+		}},
+	})
+	require.NoError(t, err)
+	info, err := object.NewTask(env.client.Client, res.Returnval).WaitForResult(env.goCtx)
+	require.NoError(t, err)
+	id = info.Result.(types.VStorageObject).Config.Id
+	attach = func() {
+		unit := int32(1)
+		require.NoError(t, vm.AttachDisk(env.goCtx, id.Id, object.NewDatastore(env.client.Client, ds.Self), 0, &unit))
+	}
+	return env, vm, svm, id, attach
+}
+
+// TestContainerVM_DiskHotAttach: a disk attached or detached while the container runs reaches the
+// guest at once, with its unit; and after a stop it is presented again at the next start.
+func TestContainerVM_DiskHotAttach(t *testing.T) {
+	env, vm, svm, id, attach := diskContainerSetup(t, "disk-hot")
+	unitFile := "/etc/systemd/system/var-lib-etcd.mount"
+
+	powerOn(t, env, vm)
+	cid := containerID(t, env, svm)
+	_, err := dockerExec(env.goCtx, cid, "test", "!", "-e", unitFile)
+	require.NoError(t, err, "no disk yet")
+
+	present := func(cid string) {
+		t.Helper()
+		out, err := dockerExec(env.goCtx, cid, "cat", unitFile)
+		require.NoError(t, err)
+		require.Contains(t, out, "Where=/var/lib/etcd")
+		_, err = dockerExec(env.goCtx, cid, "sh", "-c", "echo x > /var/lib/etcd/probe")
+		require.NoError(t, err)
+	}
+	absent := func(cid string) {
+		t.Helper()
+		_, err := dockerExec(env.goCtx, cid, "test", "!", "-e", unitFile)
+		require.NoError(t, err)
+		_, err = dockerExec(env.goCtx, cid, "test", "!", "-e", "/var/lib/etcd/probe")
+		require.NoError(t, err)
+	}
+
+	attach()
+	present(cid)
+	var dir string
+	env.simCtx.WithLock(svm, func() { dir = svm.svm.diskLive[0].source })
+	require.FileExists(t, filepath.Join(dir, "probe"))
+
+	require.NoError(t, vm.DetachDisk(env.goCtx, id.Id))
+	absent(cid)
+
+	attach()
+	powerOff(t, env, vm)
+	powerOn(t, env, vm)
+	present(containerID(t, env, svm))
+
+	require.NoError(t, vm.DetachDisk(env.goCtx, id.Id))
+	absent(containerID(t, env, svm))
+	powerOff(t, env, vm)
+}
+
+func TestDiskPlan(t *testing.T) {
+	a := diskMount{source: "/d/a.d", dest: "/a"}
+	b := diskMount{source: "/d/b.d", dest: "/b"}
+	a2 := diskMount{source: "/d/a2.d", dest: "/a"}
+
+	add, remove := diskPlan(nil, []diskMount{a})
+	require.Equal(t, []diskMount{a}, add)
+	require.Empty(t, remove)
+
+	add, remove = diskPlan([]diskMount{a, b}, []diskMount{b})
+	require.Empty(t, add)
+	require.Equal(t, []diskMount{a}, remove)
+
+	add, remove = diskPlan([]diskMount{a}, []diskMount{a2})
+	require.Equal(t, []diskMount{a2}, add)
+	require.Equal(t, []diskMount{a}, remove, "a changed source is a remove and an add")
+
+	add, remove = diskPlan([]diskMount{a, b}, []diskMount{a, b})
+	require.Empty(t, add)
+	require.Empty(t, remove)
+}
+
+func TestStaged(t *testing.T) {
+	stages := []diskStage{{"/ds/one", "/.vcsim/ds/0"}, {"/ds/two/", "/.vcsim/ds/1"}}
+	got, ok := staged(stages, "/ds/two/fcd/x.d")
+	require.True(t, ok)
+	require.Equal(t, "/.vcsim/ds/1/fcd/x.d", got)
+	_, ok = staged(stages, "/ds/onex/y")
+	require.False(t, ok, "a sibling with the same prefix is not under the datastore")
+}
+
+func TestMountPoint(t *testing.T) {
+	points := map[scsiSlot]string{{0, 1}: "/var/lib/etcd"}
+	got, ok := mountPoint(points, 0, 1)
+	require.True(t, ok)
+	require.Equal(t, "/var/lib/etcd", got)
+	_, ok = mountPoint(points, 0, 2)
+	require.False(t, ok)
 }

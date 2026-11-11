@@ -2615,6 +2615,12 @@ func (vm *VirtualMachine) configureDevices(ctx *Context, spec *types.VirtualMach
 		return err
 	}
 
+	if vm.svm.livePresent() {
+		if err := vm.svm.presentDisks(ctx); err != nil {
+			return newInvalidStateFault("%s: %s", vm.Name, err)
+		}
+	}
+
 	// Do this after device config, as some may apply to the devices themselves (e.g. ethernet -> guest.net)
 	err = vm.applyExtraConfig(ctx, spec)
 	if err != nil {
