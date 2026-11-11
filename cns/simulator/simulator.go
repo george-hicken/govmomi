@@ -70,15 +70,40 @@ func (m *CnsVolumeManager) findDisk(vctx *simulator.Context, createSpec cnstypes
 	return nil, &vim25types.InvalidArgument{InvalidProperty: "VolumeId"}
 }
 
+// placementDatastore picks the datastore a new volume is placed on. Real CNS considers the given
+// Datastores, or, when there are none, places the volume itself on a datastore that the ActiveClusters
+// (or Hosts) can reach and the storage policy allows; vsphere-csi sends ActiveClusters alone when a
+// zone's clusters share no datastore. The simulator takes the first candidate and ignores the policy.
+func placementDatastore(vctx *simulator.Context, spec cnstypes.CnsVolumeCreateSpec) (vim25types.ManagedObjectReference, vim25types.BaseMethodFault) {
+	if len(spec.Datastores) != 0 {
+		return spec.Datastores[0], nil
+	}
+	hosts := spec.Hosts
+	for _, ref := range spec.ActiveClusters {
+		c, ok := vctx.Map.Get(ref).(*simulator.ClusterComputeResource)
+		if !ok {
+			continue
+		}
+		if len(c.Datastore) != 0 {
+			return c.Datastore[0], nil
+		}
+		hosts = append(hosts, c.Host...)
+	}
+	for _, ref := range hosts {
+		if h, ok := vctx.Map.Get(ref).(*simulator.HostSystem); ok && len(h.Datastore) != 0 {
+			return h.Datastore[0], nil
+		}
+	}
+	return vim25types.ManagedObjectReference{}, &vim25types.InvalidArgument{InvalidProperty: "createSpecs.datastores"}
+}
+
 func (m *CnsVolumeManager) createDisk(vctx *simulator.Context, createSpec cnstypes.CnsVolumeCreateSpec) (*vim25types.VStorageObject, vim25types.BaseMethodFault) {
 	vsom := vctx.Map.VStorageObjectManager()
 
-	if len(createSpec.Datastores) == 0 {
-		return nil, &vim25types.InvalidArgument{InvalidProperty: "createSpecs.datastores"}
+	datastoreRef, fault := placementDatastore(vctx, createSpec)
+	if fault != nil {
+		return nil, fault
 	}
-
-	// "Datastores to be considered for volume placement" - we'll just use the 1st for now
-	datastoreRef := createSpec.Datastores[0]
 
 	val := vsom.CreateDiskTask(vctx, &vim25types.CreateDisk_Task{
 		This: vsom.Self,
