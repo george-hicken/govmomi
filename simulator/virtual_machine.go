@@ -45,7 +45,7 @@ type VirtualMachine struct {
 	uid uuid.UUID
 	imc *types.CustomizationSpec
 
-	// appliedUserdata is the CloudinitPrep user-data last delivered to the guest.
+	// appliedUserdata is the user-data, by CloudinitPrep or guestinfo, last delivered to the guest.
 	appliedUserdata string
 	// diskNoted records the disk units whose absence from the guest user-data was logged.
 	diskNoted map[int32]bool

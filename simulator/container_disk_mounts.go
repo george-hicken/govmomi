@@ -152,17 +152,26 @@ func guestinfoUserdata(extraConfig []types.BaseOptionValue) ([]byte, error) {
 }
 
 // guestUserdata returns the cloud-config user-data this VM's guest receives: that of the pending
-// CloudinitPrep customization, else of the last one applied, else guestinfo.userdata.
+// CloudinitPrep customization, else guestinfo.userdata, else the last of either delivered. The
+// guestinfo key is not durable: once the guest has read it, it may be replaced by the "---"
+// placeholder, while a disk hot added later still needs the mount point the guest booted with.
 func (vm *VirtualMachine) guestUserdata() ([]byte, error) {
 	if prep, ok := vm.imcIdentity(); ok {
 		if text := cloudinitUserdata(prep); text != "" {
 			return []byte(text), nil
 		}
 	}
+	text, err := guestinfoUserdata(vm.Config.ExtraConfig)
+	if err != nil || len(text) != 0 {
+		if len(text) != 0 {
+			vm.appliedUserdata = string(text)
+		}
+		return text, err
+	}
 	if vm.appliedUserdata != "" {
 		return []byte(vm.appliedUserdata), nil
 	}
-	return guestinfoUserdata(vm.Config.ExtraConfig)
+	return nil, nil
 }
 
 // imcIdentity returns the pending customization's CloudinitPrep, if that is what is pending.

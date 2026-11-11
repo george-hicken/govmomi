@@ -373,3 +373,29 @@ func TestVMDiskMountsCloudinitPrep(t *testing.T) {
 		check("applied")
 	})
 }
+
+// TestVMDiskMountsGuestinfoCleared checks that a disk hot added after guestinfo.userdata was read
+// and then replaced by the "---" placeholder still gets the mount point the guest booted with.
+func TestVMDiskMountsGuestinfoCleared(t *testing.T) {
+	testFCD(t, func(e *fcdEnv) {
+		vm := e.vm(0)
+		ctx := registryContext(e.model.Map())
+		vm.Config.ExtraConfig = append(vm.Config.ExtraConfig,
+			userdataFor(t, "gzip+base64", "/var/lib/etcd", 0, 1)...)
+		_, err := vm.diskMounts(ctx)
+		require.NoError(t, err)
+
+		for _, o := range vm.Config.ExtraConfig {
+			if v := o.GetOptionValue(); v.Key == userdataKey {
+				v.Value = "---"
+			}
+		}
+		unit := int32(1)
+		require.NoError(t, e.attach(vm, e.createFCD("etcd"), 0, &unit))
+
+		got, err := vm.diskMounts(ctx)
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		require.Equal(t, "/var/lib/etcd", got[0].dest)
+	})
+}
