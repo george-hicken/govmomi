@@ -15,6 +15,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -53,6 +54,11 @@ import (
 //     each path of RUN.nestedVolumes, /lib/modules read-only and /dev/fuse,
 //     adapted from kind. Without it the container shares the host's cgroup
 //     namespace.
+//   - RUN.diskMount.<bus>:<unit> = <mount point>: present the disk attached at
+//     that SCSI bus and unit as its content directory, bind-mounted at the
+//     mount point (replacing a RUN.nestedVolumes anonymous volume there), with
+//     the systemd .mount unit for it; see diskMountKeyPrefix. A change of the
+//     VM's disks applies at its next power-on.
 //   - RUN.nestedVolumes (default ["/var"]): with RUN.nestedContainers, the
 //     container paths to mount as anonymous volumes, as a JSON array of
 //     absolute paths. An anonymous volume copies the image's content under it
@@ -212,6 +218,9 @@ type simVM struct {
 	// vmwareVirt is RUN.virt=vmware, kept for later starts of the container,
 	// which must find the detect-virt shim it mounts.
 	vmwareVirt bool
+
+	// diskMounted is the disks the container was created with; see diskMountKeyPrefix.
+	diskMounted []diskMount
 }
 
 // createSimulationVM inspects the provided VirtualMachine and creates a simVM binding for it if
@@ -489,6 +498,20 @@ func (svm *simVM) start(ctx *Context) error {
 	}
 
 	if svm.c != nil && svm.c.id != "" {
+		// Mounts are fixed at create, so disks changed since then need a new container.
+		mounts, err := svm.vm.diskMounts(ctx)
+		if err != nil {
+			return fmt.Errorf("%s: %w", svm.vm.Name, err)
+		}
+		if !slices.Equal(mounts, svm.diskMounted) {
+			if err := svm.remove(ctx); err != nil {
+				return err
+			}
+			svm.c = nil
+		}
+	}
+
+	if svm.c != nil && svm.c.id != "" {
 		// config.uuid may have been reconfigured while the VM was off.
 		if err := svm.writeMachineID(); err != nil {
 			return err
@@ -694,6 +717,22 @@ func (svm *simVM) start(ctx *Context) error {
 	}
 	volumes = append(volumes, extraVolumes...)
 
+	mounts, err := svm.vm.diskMounts(ctx)
+	if err != nil {
+		return fmt.Errorf("%s: %w", svm.vm.Name, err)
+	}
+	diskVolumes, err := diskMountVolumes(mounts, func(name, content string) (string, error) {
+		return hostShim(name, content, 0644)
+	})
+	if err != nil {
+		return fmt.Errorf("%s: %w", svm.vm.Name, err)
+	}
+	volumes = append(volumes, diskVolumes...)
+	for _, m := range mounts {
+		// The disk replaces the anonymous volume the mount point would get.
+		nestedVolumes = slices.DeleteFunc(nestedVolumes, func(v string) bool { return v == m.dest })
+	}
+
 	if vmwareVirt {
 		mounts, err := virtMounts(svm.vm.Config.ExtraConfig)
 		if err != nil {
@@ -702,6 +741,7 @@ func (svm *simVM) start(ctx *Context) error {
 		volumes = append(volumes, mounts...)
 	}
 	svm.vmwareVirt = vmwareVirt
+	svm.diskMounted = mounts
 
 	if mountMachineID {
 		mounts, err := svm.carryBIOSUUID(selectBIOSUUIDCarrier())

@@ -1,0 +1,172 @@
+// © Broadcom. All Rights Reserved.
+// The term "Broadcom" refers to Broadcom Inc. and/or its subsidiaries.
+// SPDX-License-Identifier: Apache-2.0
+
+package simulator
+
+import (
+	"fmt"
+	"os"
+	"path"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/vmware/govmomi/object"
+	"github.com/vmware/govmomi/vim25/types"
+)
+
+// diskMountKeyPrefix starts the ExtraConfig keys that name where a container
+// VM's disk appears in the guest: RUN.diskMount.<bus>:<unit> = <mount point>.
+// The guest cannot mount a block device rootless, so a disk attached at that
+// controller bus and unit is presented as its content directory, bind-mounted
+// at the mount point, with the systemd .mount unit the guest's tooling expects
+// for it. The mount is made when the container is created, so a change of the
+// VM's disks takes effect at its next power-on.
+const diskMountKeyPrefix = "RUN.diskMount."
+
+// diskMount is one disk presented to the guest.
+type diskMount struct {
+	source string // host directory
+	dest   string // guest mount point
+}
+
+// systemdMountUnit returns the name of the .mount unit for mount point p, as
+// systemd-escape --path --suffix=mount does.
+func systemdMountUnit(p string) string {
+	p = strings.Trim(path.Clean(p), "/")
+	if p == "" {
+		return "-.mount"
+	}
+	var b strings.Builder
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		switch {
+		case c == '/':
+			b.WriteByte('-')
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == ':', c == '_',
+			c == '.' && i > 0:
+			b.WriteByte(c)
+		default:
+			fmt.Fprintf(&b, `\x%02x`, c)
+		}
+	}
+	return b.String() + ".mount"
+}
+
+// mountUnit renders the unit machine-agent would write for m, a bind mount.
+func (m diskMount) mountUnit() string {
+	return fmt.Sprintf(`[Unit]
+Description=Mount %[2]s
+
+[Mount]
+What=%[1]s
+Where=%[2]s
+Type=none
+Options=bind
+
+[Install]
+WantedBy=local-fs.target
+`, m.source, m.dest)
+}
+
+// unitPath is where the guest looks for m's unit.
+func (m diskMount) unitPath() string {
+	return "/etc/systemd/system/" + systemdMountUnit(m.dest)
+}
+
+// diskMountPoints parses the diskMountKeyPrefix keys of extraConfig into the
+// mount point of each "<bus>:<unit>".
+func diskMountPoints(extraConfig []types.BaseOptionValue) (map[string]string, error) {
+	points := map[string]string{}
+	for _, opt := range extraConfig {
+		v := opt.GetOptionValue()
+		slot, ok := strings.CutPrefix(v.Key, diskMountKeyPrefix)
+		if !ok {
+			continue
+		}
+		bus, unit, ok := strings.Cut(slot, ":")
+		if _, e1 := strconv.Atoi(bus); !ok || e1 != nil {
+			return nil, fmt.Errorf("%s: want <bus>:<unit>", v.Key)
+		}
+		if _, err := strconv.Atoi(unit); err != nil {
+			return nil, fmt.Errorf("%s: want <bus>:<unit>", v.Key)
+		}
+		if dest := fmt.Sprint(v.Value); path.IsAbs(dest) && path.Clean(dest) != "/" {
+			points[slot] = path.Clean(dest)
+		} else {
+			return nil, fmt.Errorf("%s: %q is not an absolute mount point", v.Key, dest)
+		}
+	}
+	return points, nil
+}
+
+// diskMounts returns the disks of vm that diskMountPoints names, sorted by
+// mount point, creating each content directory as needed.
+func (vm *VirtualMachine) diskMounts(ctx *Context) ([]diskMount, error) {
+	points, err := diskMountPoints(vm.Config.ExtraConfig)
+	if err != nil || len(points) == 0 {
+		return nil, err
+	}
+
+	devices := object.VirtualDeviceList(vm.Config.Hardware.Device)
+	var mounts []diskMount
+	for _, d := range devices.SelectByType((*types.VirtualDisk)(nil)) {
+		disk := d.(*types.VirtualDisk)
+		ctrl, ok := devices.FindByKey(disk.ControllerKey).(types.BaseVirtualController)
+		if !ok || disk.UnitNumber == nil {
+			continue
+		}
+		slot := fmt.Sprintf("%d:%d", ctrl.GetVirtualController().BusNumber, *disk.UnitNumber)
+		dest, ok := points[slot]
+		if !ok {
+			continue
+		}
+		dir, err := contentDir(ctx, disk)
+		if err != nil {
+			return nil, fmt.Errorf("disk %s: %w", slot, err)
+		}
+		mounts = append(mounts, diskMount{source: dir, dest: dest})
+	}
+	sort.Slice(mounts, func(i, j int) bool { return mounts[i].dest < mounts[j].dest })
+	return mounts, nil
+}
+
+// contentDir returns, creating it, the directory that holds disk's content:
+// the backing file's path with its extension replaced by ".d".
+func contentDir(ctx *Context, disk *types.VirtualDisk) (string, error) {
+	backing, ok := disk.Backing.(types.BaseVirtualDeviceFileBackingInfo)
+	if !ok {
+		return "", fmt.Errorf("backing has no file")
+	}
+	info := backing.GetVirtualDeviceFileBackingInfo()
+	if info.Datastore == nil {
+		return "", fmt.Errorf("backing has no datastore")
+	}
+	ds, ok := ctx.Map.Get(*info.Datastore).(*Datastore)
+	if !ok {
+		return "", fmt.Errorf("datastore %s not found", info.Datastore)
+	}
+	var p object.DatastorePath
+	if !p.FromString(info.FileName) {
+		return "", fmt.Errorf("bad backing file %q", info.FileName)
+	}
+	rel := strings.TrimSuffix(p.Path, filepath.Ext(p.Path)) + ".d"
+	dir := ds.resolve(ctx, rel)
+	return dir, os.MkdirAll(dir, 0o755)
+}
+
+// volumes returns the container volume arguments presenting ms: the disk
+// directory at its mount point and its unit file, written by write.
+func diskMountVolumes(ms []diskMount, write func(name, content string) (string, error)) ([]string, error) {
+	var vols []string
+	for _, m := range ms {
+		unit, err := write(systemdMountUnit(m.dest), m.mountUnit())
+		if err != nil {
+			return nil, err
+		}
+		vols = append(vols, m.source+":"+m.dest, unit+":"+m.unitPath()+":ro")
+	}
+	return vols, nil
+}
