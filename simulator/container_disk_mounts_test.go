@@ -129,17 +129,45 @@ func TestWritePCIDevices(t *testing.T) {
 		got, err := os.Readlink(filepath.Join(links, addr))
 		require.NoError(t, err)
 		require.Equal(t, want, got, addr)
-		for name, id := range map[string]string{"vendor": "0x15ad\n", "device": "0x07c0\n"} {
-			b, err := os.ReadFile(filepath.Join(links, addr, name))
-			require.NoError(t, err)
-			require.Equal(t, id, string(b))
-		}
 	}
+	requirePCIDevices(t, sys, []string{"0000:03:00.0", "0000:04:00.0", "0000:00:10.0"})
 
 	require.NoError(t, writePCIDevices(sys, []string{"0000:03:00.0"}))
+	requirePCIDevices(t, sys, []string{"0000:03:00.0"})
 	require.Equal(t, []string{"0000:03:00.0"}, dirNames(t, links))
 	require.Equal(t, []string{"0000:00:15.0"}, dirNames(t, root), "the gone devices' bridges are removed with them")
 	require.Equal(t, []string{"0000:03:00.0"}, dirNames(t, filepath.Join(root, "0000:00:15.0")))
+}
+
+// TestWritePCIDevicesRewrite: every device stays readable through its link after each write of a
+// sequence, as presentDisks writes the tree again on every disk change while the guest runs.
+func TestWritePCIDevicesRewrite(t *testing.T) {
+	sys := t.TempDir()
+	for _, addrs := range [][]string{
+		{"0000:03:00.0"},
+		{"0000:03:00.0"},
+		{"0000:03:00.0", "0000:04:00.0"},
+		{"0000:04:00.0"},
+		{"0000:03:00.0", "0000:04:00.0", "0000:00:10.0"},
+	} {
+		require.NoError(t, writePCIDevices(sys, addrs))
+		requirePCIDevices(t, sys, addrs)
+	}
+}
+
+// requirePCIDevices requires that the bus's device list under sys is addrs, each readable as a
+// PVSCSI controller through its link.
+func requirePCIDevices(t *testing.T, sys string, addrs []string) {
+	t.Helper()
+	links := sysPath(sys, guestPCIDevicesDir)
+	require.ElementsMatch(t, addrs, dirNames(t, links))
+	for _, addr := range addrs {
+		for name, id := range map[string]string{"vendor": "0x15ad\n", "device": "0x07c0\n"} {
+			b, err := os.ReadFile(filepath.Join(links, addr, name))
+			require.NoError(t, err, "%v: %s/%s", addrs, addr, name)
+			require.Equal(t, id, string(b))
+		}
+	}
 }
 
 // machineAgentGetPCIDevice is machine-agent's GetPCIDevice (pkg/os/disk_linux.go) with the sysfs
@@ -262,10 +290,8 @@ func TestContainerVM_DiskMount(t *testing.T) {
 
 	powerOn(t, env, vm)
 	cid := containerID(t, env, svm)
-	out, err := dockerExec(env.goCtx, cid, "sh", "-c", "ls "+guestPCIDevicesDir+"; cat "+guestPCIDevicesDir+"/0000:03:00.0/vendor "+guestPCIDevicesDir+"/0000:03:00.0/device")
-	require.NoError(t, err)
-	require.Equal(t, "0000:03:00.0\n0x15ad\n0x07c0", out, "the guest's PCI devices are the VM's")
-	out, err = dockerExec(env.goCtx, cid, "readlink", guestPCIDevicesDir+"/0000:03:00.0")
+	requireGuestPVSCSI(t, env, cid)
+	out, err := dockerExec(env.goCtx, cid, "readlink", guestPCIDevicesDir+"/0000:03:00.0")
 	require.NoError(t, err)
 	require.Equal(t, "../../../devices/pci0000:00/0000:00:15.0/0000:03:00.0", out, "an entry is a symlink into the device's directory, as in sysfs")
 
@@ -281,6 +307,16 @@ func TestContainerVM_DiskMount(t *testing.T) {
 	_, err = dockerExec(env.goCtx, containerID(t, env, svm), "test", "!", "-e", testDiskPath)
 	require.NoError(t, err, "detach removes the disk at the next power-on")
 	powerOff(t, env, vm)
+}
+
+// requireGuestPVSCSI requires that the guest's PCI devices are the VM's one PVSCSI controller,
+// with vendor and device read through the guest's symlink.
+func requireGuestPVSCSI(t *testing.T, env *vcSimEnv, cid string) {
+	t.Helper()
+	dev := guestPCIDevicesDir + "/0000:03:00.0"
+	out, err := dockerExec(env.goCtx, cid, "sh", "-c", "ls "+guestPCIDevicesDir+"; cat "+dev+"/vendor "+dev+"/device")
+	require.NoError(t, err)
+	require.Equal(t, "0000:03:00.0\n0x15ad\n0x07c0", out, "the guest's PCI devices are the VM's")
 }
 
 // diskContainerSetup creates a container VM with a PVSCSI controller and an FCD ready; attach
@@ -353,6 +389,7 @@ func TestContainerVM_DiskHotAttach(t *testing.T) {
 
 	attach()
 	present(cid)
+	requireGuestPVSCSI(t, env, cid)
 	var dir string
 	env.simCtx.WithLock(svm, func() { dir = svm.svm.diskLive[0].source })
 	require.FileExists(t, filepath.Join(dir, "probe"))

@@ -232,7 +232,7 @@ func writePCIDevice(dir string) error {
 }
 
 // pruneTree removes from root every entry that is not one of the slash-separated paths keep, nor
-// an ancestor of one.
+// an ancestor or descendant of one: a kept path's content is its own.
 func pruneTree(root string, keep []string) error {
 	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -242,9 +242,13 @@ func pruneTree(root string, keep []string) error {
 		if err != nil || rel == "." {
 			return err
 		}
-		if slices.ContainsFunc(keep, func(k string) bool {
-			return k == rel || strings.HasPrefix(k, rel+string(filepath.Separator))
-		}) {
+		if slices.Contains(keep, rel) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if slices.ContainsFunc(keep, func(k string) bool { return strings.HasPrefix(k, rel+string(filepath.Separator)) }) {
 			return nil
 		}
 		if err := os.RemoveAll(p); err != nil {
