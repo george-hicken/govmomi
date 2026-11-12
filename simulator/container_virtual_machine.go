@@ -220,10 +220,10 @@ type simVM struct {
 	vmwareVirt bool
 
 	// diskLive is the set the running container presents, which presentDisks keeps current.
-	// pciDir is the host directory presented as the guest's PCI devices; it lives as long as
-	// the container.
+	// sysDir is the host tree presented as the guest's PCI sysfs (see writePCIDevices); it lives
+	// as long as the container.
 	diskLive []diskMount
-	pciDir   string
+	sysDir   string
 }
 
 // createSimulationVM inspects the provided VirtualMachine and creates a simVM binding for it if
@@ -956,7 +956,7 @@ func (svm *simVM) remove(ctx *Context) error {
 	defer svm.removeGuestRPC()
 	defer svm.removeMachineID()
 	defer svm.removeSysctl()
-	defer svm.removePCIDir()
+	defer svm.removeSysDir()
 
 	err := svm.c.remove(ctx)
 	if err != nil {

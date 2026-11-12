@@ -6,6 +6,7 @@ package simulator
 
 import (
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -21,12 +22,26 @@ import (
 // machine-agent does: the first sysfs PCI device with the PVSCSI vendor and device IDs, then
 // /dev/disk/by-path/pci-<address>-scsi-0:0:<unit>:0. Rootless podman cannot make block devices,
 // so the by-path name is the disk's content directory.
+//
+// machine-agent walks guestPCIDevicesDir and skips directories, so each entry there is a symlink to
+// its device's directory under guestPCIRootDir, as sysfs makes it. The link is relative, so both
+// directories are mounted in the guest at the paths the link reaches.
 const (
 	guestPCIDevicesDir = "/sys/bus/pci/devices"
+	guestPCIRootDir    = "/sys/devices/pci0000:00"
 	guestDiskByPathDir = "/dev/disk/by-path"
 	pciVendorVMware    = "0x15ad"
 	pciDevicePVSCSI    = "0x07c0"
 )
+
+// guestPCIRelLink is the path from guestPCIDevicesDir to guestPCIRootDir, which sysfs writes into
+// each entry's symlink.
+const guestPCIRelLink = "../../../devices/pci0000:00"
+
+// sysPath returns the path under sysRoot, the host tree of the guest's /sys, of guest.
+func sysPath(sysRoot, guest string) string {
+	return filepath.Join(sysRoot, strings.TrimPrefix(guest, "/sys/"))
+}
 
 // diskMount is one host directory presented at a guest path.
 type diskMount struct {
@@ -138,34 +153,108 @@ func (vm *VirtualMachine) diskMounts(ctx *Context) (pvscsi []string, mounts []di
 	return pvscsi, mounts, nil
 }
 
-// writePCIDevices makes dir hold exactly a sysfs entry, vendor and device, for each address.
-func writePCIDevices(dir string, addrs []string) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
+// guestPCIParent returns the guest address of the root port the device at addr sits behind, or ""
+// for a device on the root bus. It is the inverse of bridgeSecondaryBus.
+func guestPCIParent(addr string) (string, error) {
+	var bus, dev, fn int32
+	if _, err := fmt.Sscanf(addr, "0000:%x:%x.%x", &bus, &dev, &fn); err != nil {
+		return "", fmt.Errorf("PCI address %q: %w", addr, err)
+	}
+	if bus == 0 {
+		return "", nil
+	}
+	for bridge := int32(4); bridge <= 7; bridge++ {
+		for f := int32(0); f < 8; f++ {
+			if sec, _ := bridgeSecondaryBus(bridge, f); sec == bus {
+				// pciBridge<n> is at 0000:00:<0x11+n>, ESX's default slot for it (inference, as above).
+				return fmt.Sprintf("0000:00:%02x.%x", 0x11+bridge, f), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no guest bridge leads to bus %d", bus)
+}
+
+// writePCIDevices lays the guest's PCI devices out under sysRoot, the host tree of the guest's
+// /sys, as the kernel does. guestPCIDevicesDir holds a symlink per address to the device's
+// directory under guestPCIRootDir, and the device directory holds vendor and device. The bridge
+// directories between them are bare: the VM's bridges are not modelled. A device that is gone is
+// removed from both places, and an entry's content is fixed once written.
+func writePCIDevices(sysRoot string, addrs []string) error {
+	links, root := sysPath(sysRoot, guestPCIDevicesDir), sysPath(sysRoot, guestPCIRootDir)
+	if err := os.MkdirAll(links, 0o755); err != nil {
 		return err
 	}
-	for _, e := range entries {
-		if !slices.Contains(addrs, e.Name()) {
-			if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
-				return err
-			}
-		}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return err
 	}
-	for _, addr := range addrs {
-		entry := filepath.Join(dir, addr)
-		if _, err := os.Stat(entry); err == nil {
-			continue // an entry's content is fixed, and its read-only files cannot be rewritten
-		}
-		if err := os.Mkdir(entry, 0o755); err != nil {
+	devDirs := make([]string, len(addrs))
+	for i, addr := range addrs {
+		parent, err := guestPCIParent(addr)
+		if err != nil {
 			return err
 		}
-		for name, id := range map[string]string{"vendor": pciVendorVMware, "device": pciDevicePVSCSI} {
-			if err := os.WriteFile(filepath.Join(entry, name), []byte(id+"\n"), 0o444); err != nil {
-				return err
-			}
+		devDirs[i] = filepath.Join(parent, addr)
+	}
+	if err := pruneTree(links, addrs); err != nil {
+		return err
+	}
+	if err := pruneTree(root, devDirs); err != nil {
+		return err
+	}
+	for i, addr := range addrs {
+		link := filepath.Join(links, addr)
+		if _, err := os.Lstat(link); err == nil {
+			continue // an entry's content is fixed, and its read-only files cannot be rewritten
+		}
+		dev := filepath.Join(root, devDirs[i])
+		if err := writePCIDevice(dev); err != nil {
+			return err
+		}
+		// The device directory is complete before its link, so no reader sees a dangling entry.
+		if err := os.Symlink(filepath.Join(guestPCIRelLink, devDirs[i]), link); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// writePCIDevice makes dir a PCI device directory of a PVSCSI controller.
+func writePCIDevice(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	for name, id := range map[string]string{"vendor": pciVendorVMware, "device": pciDevicePVSCSI} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(id+"\n"), 0o444); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// pruneTree removes from root every entry that is not one of the slash-separated paths keep, nor
+// an ancestor of one.
+func pruneTree(root string, keep []string) error {
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil || rel == "." {
+			return err
+		}
+		if slices.ContainsFunc(keep, func(k string) bool {
+			return k == rel || strings.HasPrefix(k, rel+string(filepath.Separator))
+		}) {
+			return nil
+		}
+		if err := os.RemoveAll(p); err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return filepath.SkipDir
+		}
+		return nil // SkipDir on a file would skip its siblings
+	})
 }
 
 // contentDir returns, creating it, the directory that holds disk's content:

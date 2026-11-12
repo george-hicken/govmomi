@@ -55,17 +55,20 @@ func (svm *simVM) presentDisks(ctx *Context) error {
 	if err != nil {
 		return err
 	}
-	if len(pvscsi) != 0 && svm.pciDir == "" {
-		if svm.pciDir, err = os.MkdirTemp("", "vcsim-pci-"); err != nil {
+	if len(pvscsi) != 0 && svm.sysDir == "" {
+		if svm.sysDir, err = os.MkdirTemp("", "vcsim-sys-"); err != nil {
 			return err
 		}
 	}
-	if svm.pciDir != "" {
-		// The mount is of the directory, so later entries reach the guest through it.
-		if err := writePCIDevices(svm.pciDir, pvscsi); err != nil {
+	if svm.sysDir != "" {
+		// The mounts are of directories, so later entries reach the guest through them.
+		if err := writePCIDevices(svm.sysDir, pvscsi); err != nil {
 			return err
 		}
-		want = append(want, diskMount{source: svm.pciDir, dest: guestPCIDevicesDir})
+		want = append(want,
+			diskMount{source: sysPath(svm.sysDir, guestPCIDevicesDir), dest: guestPCIDevicesDir},
+			diskMount{source: sysPath(svm.sysDir, guestPCIRootDir), dest: guestPCIRootDir},
+		)
 	}
 	add, remove := diskPlan(svm.diskLive, want)
 	if len(add) == 0 && len(remove) == 0 {
@@ -80,7 +83,7 @@ func (svm *simVM) presentDisks(ctx *Context) error {
 		return err
 	}
 
-	// Only by-path names are ever removed: pciDir, once mounted, stays for the container's life.
+	// Only by-path names are ever removed: sysDir's mounts, once made, stay for the container's life.
 	for _, m := range remove {
 		if err := run("umount", m.dest); err != nil {
 			return err
@@ -101,11 +104,11 @@ func (svm *simVM) presentDisks(ctx *Context) error {
 	return nil
 }
 
-// removePCIDir removes the host directory of the guest's PCI devices.
-func (svm *simVM) removePCIDir() {
-	if svm.pciDir != "" {
-		_ = os.RemoveAll(svm.pciDir)
-		svm.pciDir = ""
+// removeSysDir removes the host tree of the guest's PCI devices.
+func (svm *simVM) removeSysDir() {
+	if svm.sysDir != "" {
+		_ = os.RemoveAll(svm.sysDir)
+		svm.sysDir = ""
 	}
 }
 

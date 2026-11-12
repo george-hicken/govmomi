@@ -75,18 +75,134 @@ func TestPlacePVSCSI(t *testing.T) {
 	})
 }
 
-func TestWritePCIDevices(t *testing.T) {
-	dir := t.TempDir()
-	require.NoError(t, writePCIDevices(dir, []string{"0000:03:00.0", "0000:04:00.0"}))
-	require.NoError(t, writePCIDevices(dir, []string{"0000:03:00.0"}))
+// TestGuestPCIParent: a device's parent is the root port whose secondary bus it is on, and the
+// root bus has none.
+func TestGuestPCIParent(t *testing.T) {
+	for addr, want := range map[string]string{
+		"0000:00:10.0": "",
+		"0000:03:00.0": "0000:00:15.0",
+		"0000:04:00.0": "0000:00:15.1",
+		"0000:0b:00.0": "0000:00:16.0",
+		"0000:0d:00.0": "0000:00:16.2",
+		"0000:1b:00.0": "0000:00:18.0",
+	} {
+		got, err := guestPCIParent(addr)
+		require.NoError(t, err, addr)
+		require.Equal(t, want, got, addr)
+	}
+	_, err := guestPCIParent("0000:01:00.0")
+	require.Error(t, err, "no guest bridge leads to bus 1")
+	require.Equal(t, "../../../devices/pci0000:00", guestPCIRelLink)
+	rel, err := filepath.Rel(guestPCIDevicesDir, guestPCIRootDir)
+	require.NoError(t, err)
+	require.Equal(t, rel, guestPCIRelLink)
+}
+
+// dirNames returns the names of the entries of dir, sorted.
+func dirNames(t *testing.T, dir string) []string {
+	t.Helper()
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
-	require.Len(t, entries, 1)
-	for name, want := range map[string]string{"vendor": "0x15ad\n", "device": "0x07c0\n"} {
-		b, err := os.ReadFile(filepath.Join(dir, "0000:03:00.0", name))
-		require.NoError(t, err)
-		require.Equal(t, want, string(b))
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
 	}
+	return names
+}
+
+// TestWritePCIDevices: each device is a symlink in the bus's device list to its directory under
+// the root bridge, as sysfs lays it out, with vendor and device readable through the link; a device
+// that goes is removed from both places, along with a bridge it leaves empty.
+func TestWritePCIDevices(t *testing.T) {
+	sys := t.TempDir()
+	links := filepath.Join(sys, "bus", "pci", "devices")
+	root := filepath.Join(sys, "devices", "pci0000:00")
+	require.NoError(t, writePCIDevices(sys, []string{"0000:03:00.0", "0000:04:00.0", "0000:00:10.0"}))
+	for addr, want := range map[string]string{
+		"0000:03:00.0": "../../../devices/pci0000:00/0000:00:15.0/0000:03:00.0",
+		"0000:04:00.0": "../../../devices/pci0000:00/0000:00:15.1/0000:04:00.0",
+		"0000:00:10.0": "../../../devices/pci0000:00/0000:00:10.0",
+	} {
+		info, err := os.Lstat(filepath.Join(links, addr))
+		require.NoError(t, err, addr)
+		require.NotZero(t, info.Mode()&os.ModeSymlink, addr, "an entry is a symlink, as sysfs's is")
+		got, err := os.Readlink(filepath.Join(links, addr))
+		require.NoError(t, err)
+		require.Equal(t, want, got, addr)
+		for name, id := range map[string]string{"vendor": "0x15ad\n", "device": "0x07c0\n"} {
+			b, err := os.ReadFile(filepath.Join(links, addr, name))
+			require.NoError(t, err)
+			require.Equal(t, id, string(b))
+		}
+	}
+
+	require.NoError(t, writePCIDevices(sys, []string{"0000:03:00.0"}))
+	require.Equal(t, []string{"0000:03:00.0"}, dirNames(t, links))
+	require.Equal(t, []string{"0000:00:15.0"}, dirNames(t, root), "the gone devices' bridges are removed with them")
+	require.Equal(t, []string{"0000:03:00.0"}, dirNames(t, filepath.Join(root, "0000:00:15.0")))
+}
+
+// machineAgentGetPCIDevice is machine-agent's GetPCIDevice (pkg/os/disk_linux.go) with the sysfs
+// root as a parameter, so the walk the guest's disk lookup runs can run over a written tree. Its
+// walk uses Lstat, so an entry that is a directory is skipped as not a device.
+func machineAgentGetPCIDevice(sysRoot, vendorID, deviceID string) (string, error) {
+	pciDevice := ""
+	err := filepath.Walk(filepath.Join(sysRoot, "bus", "pci", "devices"), func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		vendor, device, err := machineAgentDeviceVendor(sysRoot, info.Name())
+		if err != nil {
+			return filepath.SkipDir
+		}
+		if vendorID == vendor && deviceID == device {
+			pciDevice = info.Name()
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return pciDevice, err
+}
+
+// machineAgentDeviceVendor is machine-agent's getDeviceVendor with the sysfs root as a parameter.
+func machineAgentDeviceVendor(sysRoot, addr string) (vendorID, deviceID string, err error) {
+	dir := filepath.Join(sysRoot, "bus", "pci", "devices", addr)
+	data, err := os.ReadFile(filepath.Join(dir, "vendor"))
+	if err != nil {
+		return "", "", err
+	}
+	vendorID = strings.Trim(string(data), "\n")
+	data, err = os.ReadFile(filepath.Join(dir, "device"))
+	if err != nil {
+		return "", "", err
+	}
+	return vendorID, strings.Trim(string(data), "\n"), nil
+}
+
+// TestWritePCIDevicesMachineAgentWalk: machine-agent's walk finds the PVSCSI controller at its
+// address in the tree writePCIDevices writes.
+func TestWritePCIDevicesMachineAgentWalk(t *testing.T) {
+	sys := t.TempDir()
+	require.NoError(t, writePCIDevices(sys, []string{"0000:03:00.0"}))
+	addr, err := machineAgentGetPCIDevice(sys, pciVendorVMware, pciDevicePVSCSI)
+	require.NoError(t, err)
+	require.Equal(t, "0000:03:00.0", addr)
+}
+
+// TestWritePCIDevicesDirectoryLayoutFails is the control for the walk: the directory layout this
+// replaces, with the same IDs, is not found, since the walk skips a directory as not a device.
+func TestWritePCIDevicesDirectoryLayoutFails(t *testing.T) {
+	sys := t.TempDir()
+	dev := filepath.Join(sys, "bus", "pci", "devices", "0000:03:00.0")
+	require.NoError(t, os.MkdirAll(dev, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dev, "vendor"), []byte(pciVendorVMware+"\n"), 0o444))
+	require.NoError(t, os.WriteFile(filepath.Join(dev, "device"), []byte(pciDevicePVSCSI+"\n"), 0o444))
+	addr, err := machineAgentGetPCIDevice(sys, pciVendorVMware, pciDevicePVSCSI)
+	require.NoError(t, err)
+	require.Empty(t, addr, "a directory entry is skipped, so the walk finds no device")
 }
 
 // TestVMDiskMounts: each disk on the PVSCSI controller is presented at its by-path name, whatever
@@ -149,6 +265,9 @@ func TestContainerVM_DiskMount(t *testing.T) {
 	out, err := dockerExec(env.goCtx, cid, "sh", "-c", "ls "+guestPCIDevicesDir+"; cat "+guestPCIDevicesDir+"/0000:03:00.0/vendor "+guestPCIDevicesDir+"/0000:03:00.0/device")
 	require.NoError(t, err)
 	require.Equal(t, "0000:03:00.0\n0x15ad\n0x07c0", out, "the guest's PCI devices are the VM's")
+	out, err = dockerExec(env.goCtx, cid, "readlink", guestPCIDevicesDir+"/0000:03:00.0")
+	require.NoError(t, err)
+	require.Equal(t, "../../../devices/pci0000:00/0000:00:15.0/0000:03:00.0", out, "an entry is a symlink into the device's directory, as in sysfs")
 
 	_, err = dockerExec(env.goCtx, cid, "sh", "-c", "echo x > "+testDiskPath+"/probe")
 	require.NoError(t, err)
