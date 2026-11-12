@@ -433,9 +433,10 @@ type createOptions struct {
 	// overlay as its entrypoint, so args are the command it execs; see
 	// sysctlCreateArgs. The caller mounts the overlay's directory.
 	Sysctl bool
-	// GuestIdentityFiles gives the container its own /etc/hostname, /etc/hosts
-	// and /etc/resolv.conf, and sets its hostname; see guestIdentityCreateArgs.
-	GuestIdentityFiles bool
+	// GuestIdentity is the set of /etc/hostname, /etc/hosts and /etc/resolv.conf
+	// the container owns instead of the runtime's bind mounts; see
+	// guestIdentityCreateArgs and seedGuestIdentity.
+	GuestIdentity guestIdentitySet
 	// VMwareVirt hides the runtime's container marker from the guest's PID 1
 	// environment; see virtCreateArgs.
 	VMwareVirt bool
@@ -549,6 +550,10 @@ func create(ctx *Context, name string, id string, image string, args []string, o
 	}
 
 	c.id = strings.TrimSpace(string(out))
+
+	if err := seedGuestIdentity(c.id, name, opts.GuestIdentity); err != nil {
+		return nil, err
+	}
 
 	return &c, nil
 }

@@ -80,15 +80,18 @@ import (
 //     JSON array, the image present locally, and no "host" network, or power-on
 //     fails. An empty list unmasks /proc/sys and emulates nothing. EmulatedSysctls
 //     reports the seeds and the values read back, as SysctlEmulatedNotApplied.
-//   - RUN.guestIdentityFiles (default absent): "owned". The container owns
-//     /etc/hostname, /etc/hosts and /etc/resolv.conf from its image instead of
-//     the runtime's bind mounts, so the guest can replace them, and its hostname
-//     is set from the VM name, sanitised to a hostname. CAP_SYS_ADMIN is added,
-//     which sethostname needs in the container's UTS namespace, and it widens
-//     the container's privileges beyond that namespace. The container gets no
-//     DNS server (--dns none). Needs podman as the docker CLI, RUN.container
-//     and no "host" network, or power-on fails. Without the key the container
-//     is created as before.
+//   - RUN.guestIdentityFiles (default absent): "owned", or a comma-separated
+//     list of "hosts" (/etc/hosts), "hostname" (/etc/hostname) and "resolv"
+//     (/etc/resolv.conf), such as "hosts,hostname". The container owns each
+//     listed file instead of the runtime's bind mount, so the guest can replace
+//     it. An owned hostname also sets the container's hostname from the VM name,
+//     sanitised to a hostname; it adds CAP_SYS_ADMIN, which sethostname needs in
+//     the container's UTS namespace, and that widens the container's privileges
+//     beyond that namespace. Owned resolv gives the container no DNS server
+//     (--dns none). An owned hosts or hostname file the image lacks is seeded
+//     with the loopback names and the hostname. Needs podman as the docker CLI,
+//     RUN.container and no "host" network, or power-on fails. Any other value
+//     fails power-on. Without the key the container is created as before.
 //   - RUN.virt (default "vmware"): what virtualization the guest detects.
 //     "vmware" makes it a VMware VM to the guest's own probes, as cloud-init
 //     and ds-identify run them: /usr/bin/systemd-detect-virt reports "vmware"
@@ -551,7 +554,7 @@ func (svm *simVM) start(ctx *Context) error {
 	nestedContainers := false
 	nestedVolumes := []string{"/var"}
 	vmci := false
-	guestIdentity := false
+	var guestIdentity guestIdentitySet
 	vmwareVirt := true
 
 	// The keys are documented on ContainerBackingOptionKey.
@@ -634,10 +637,11 @@ func (svm *simVM) start(ctx *Context) error {
 		}
 
 		if val.Key == "RUN.guestIdentityFiles" {
-			if err := parseGuestIdentity(value); err != nil {
+			set, err := parseGuestIdentity(value)
+			if err != nil {
 				return fmt.Errorf("%s: %w", svm.vm.Name, err)
 			}
-			guestIdentity = true
+			guestIdentity = set
 			continue
 		}
 
@@ -684,7 +688,7 @@ func (svm *simVM) start(ctx *Context) error {
 	// when VMX_GUESTINFO=true.
 	env = append(env, "VMX_GUESTINFO=true")
 
-	if guestIdentity {
+	if guestIdentity.enabled() {
 		if err := guestIdentityPreflight(networks); err != nil {
 			return fmt.Errorf("%s: %w", svm.vm.Name, err)
 		}
@@ -692,8 +696,8 @@ func (svm *simVM) start(ctx *Context) error {
 
 	if sysctl != nil {
 		// Without a privileged or nested container, the overlay drops the CAP_SYS_ADMIN it needs.
-		// RUN.guestIdentityFiles keeps it, which sethostname needs.
-		dropSysAdmin := !privileged && !nestedContainers && !guestIdentity
+		// An owned hostname keeps it, since sethostname needs it.
+		dropSysAdmin := !privileged && !nestedContainers && !guestIdentity.hostname
 		argv, err := svm.prepareSysctl(*sysctl, networks, args, jsonArgs, dropSysAdmin)
 		if err != nil {
 			return fmt.Errorf("%s: %w", svm.vm.Name, err)
@@ -762,20 +766,20 @@ func (svm *simVM) start(ctx *Context) error {
 	}
 
 	svm.c, err = create(ctx, svm.vm.Name, svm.vm.uid.String(), args[0], args[1:], createOptions{
-		Networks:           networks,
-		NICs:               nics,
-		CapAdd:             capAdd(ctx),
-		Volumes:            volumes,
-		Ports:              ports,
-		Env:                env,
-		Privileged:         privileged,
-		NestedContainers:   nestedContainers,
-		NestedVolumes:      nestedVolumes,
-		Sysctl:             sysctl != nil,
-		GuestIdentityFiles: guestIdentity,
-		VMwareVirt:         vmwareVirt,
-		QuoteImageAndArgs:  jsonArgs,
-		RecreateIfExists:   true,
+		Networks:          networks,
+		NICs:              nics,
+		CapAdd:            capAdd(ctx),
+		Volumes:           volumes,
+		Ports:             ports,
+		Env:               env,
+		Privileged:        privileged,
+		NestedContainers:  nestedContainers,
+		NestedVolumes:     nestedVolumes,
+		Sysctl:            sysctl != nil,
+		GuestIdentity:     guestIdentity,
+		VMwareVirt:        vmwareVirt,
+		QuoteImageAndArgs: jsonArgs,
+		RecreateIfExists:  true,
 	})
 	if err != nil {
 		svm.removeGuestRPC()
